@@ -143,8 +143,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "tool-edit")) {
-        if (args.len < 5) return usage(init.io);
-        return pi.tools.editFile(init.io, init.gpa, args[2], args[3], args[4]);
+        if (args.len < 5 or ((args.len - 3) % 2) != 0) return usage(init.io);
+        var edits: std.ArrayList(pi.tools.EditReplacement) = .empty;
+        defer edits.deinit(init.gpa);
+        var index: usize = 3;
+        while (index < args.len) : (index += 2) {
+            try edits.append(init.gpa, .{
+                .old_text = args[index],
+                .new_text = args[index + 1],
+            });
+        }
+        return pi.tools.editFileMany(init.io, init.gpa, args[2], edits.items);
     }
 
     return pi.cli_runtime.runTopLevel(init, args[1..]);
@@ -188,7 +197,7 @@ fn usage(io: std.Io) !void {
         \\  tool-grep <pattern> [path] [--glob <glob>] [--ignore-case] [--literal] [--context <n>] [--limit <n>]
         \\  tool-find <pattern> [path] [limit]
         \\  tool-write <path> <content>
-        \\  tool-edit <path> <oldText> <newText>
+        \\  tool-edit <path> <oldText> <newText> [<oldText> <newText>...]
         \\  --help, -h
         \\  --version, -v
         \\

@@ -25,6 +25,11 @@ pub const GrepOptions = struct {
     limit: usize = default_grep_limit,
 };
 
+pub const EditReplacement = struct {
+    old_text: []const u8,
+    new_text: []const u8,
+};
+
 pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
 }
@@ -317,24 +322,93 @@ pub fn grep(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path:
 }
 
 pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_text: []const u8, new_text: []const u8) !void {
-    if (old_text.len == 0) return error.EmptyEditTarget;
+    const edits = [_]EditReplacement{.{
+        .old_text = old_text,
+        .new_text = new_text,
+    }};
+    return editFileMany(io, allocator, path, edits[0..]);
+}
+
+pub fn editFileMany(io: std.Io, allocator: std.mem.Allocator, path: []const u8, edits: []const EditReplacement) !void {
+    if (edits.len == 0) return error.EmptyEditTarget;
 
     const bytes = try readFile(io, allocator, path, max_edit_file_bytes);
     defer allocator.free(bytes);
 
-    const matches = std.mem.count(u8, bytes, old_text);
-    if (matches == 0) return error.EditTargetMissing;
-    if (matches > 1) return error.EditTargetNotUnique;
+    const stripped = stripUtf8Bom(bytes);
+    const line_ending = detectLineEnding(stripped.text);
+    const normalized_content = try normalizeToLfAlloc(allocator, stripped.text);
+    defer allocator.free(normalized_content);
 
-    const replaced = try std.mem.replaceOwned(u8, allocator, bytes, old_text, new_text);
-    defer allocator.free(replaced);
+    var normalized_edits: std.ArrayList(NormalizedEdit) = .empty;
+    defer {
+        for (normalized_edits.items) |edit| {
+            allocator.free(edit.old_text);
+            allocator.free(edit.new_text);
+        }
+        normalized_edits.deinit(allocator);
+    }
 
-    try writeFile(io, path, replaced);
+    for (edits, 0..) |edit, index| {
+        const normalized_old = try normalizeToLfAlloc(allocator, edit.old_text);
+        errdefer allocator.free(normalized_old);
+        const normalized_new = try normalizeToLfAlloc(allocator, edit.new_text);
+        errdefer allocator.free(normalized_new);
+        try normalized_edits.append(allocator, .{
+            .old_text = normalized_old,
+            .new_text = normalized_new,
+            .edit_index = index,
+        });
+    }
+
+    var matched_edits: std.ArrayList(MatchedEdit) = .empty;
+    defer matched_edits.deinit(allocator);
+
+    for (normalized_edits.items) |edit| {
+        if (edit.old_text.len == 0) return error.EmptyEditTarget;
+        const occurrences = findOccurrences(normalized_content, edit.old_text);
+        if (occurrences.count == 0) return error.EditTargetMissing;
+        if (occurrences.count > 1) return error.EditTargetNotUnique;
+        try matched_edits.append(allocator, .{
+            .edit_index = edit.edit_index,
+            .match_index = occurrences.first.?,
+            .match_len = edit.old_text.len,
+            .new_text = edit.new_text,
+        });
+    }
+
+    std.mem.sort(MatchedEdit, matched_edits.items, {}, lessThanMatchedEdit);
+    for (matched_edits.items[1..], 1..) |current, index| {
+        const previous = matched_edits.items[index - 1];
+        if (previous.match_index + previous.match_len > current.match_index) return error.EditTargetOverlap;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var cursor: usize = 0;
+    for (matched_edits.items) |edit| {
+        try out.writer.writeAll(normalized_content[cursor..edit.match_index]);
+        try out.writer.writeAll(edit.new_text);
+        cursor = edit.match_index + edit.match_len;
+    }
+    try out.writer.writeAll(normalized_content[cursor..]);
+    const new_content = out.written();
+
+    if (std.mem.eql(u8, normalized_content, new_content)) return error.EditNoChange;
+
+    var final_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer final_writer.deinit();
+    try final_writer.writer.writeAll(stripped.bom);
+    try writeRestoredLineEndings(&final_writer.writer, new_content, line_ending);
+    const final_content = try final_writer.toOwnedSlice();
+    defer allocator.free(final_content);
+
+    try writeFile(io, path, final_content);
 
     var buf: [512]u8 = undefined;
     var writer = std.Io.File.stdout().writer(io, &buf);
     const w = &writer.interface;
-    try w.print("Successfully replaced 1 block in {s}.\n", .{path});
+    try w.print("Successfully replaced {d} block(s) in {s}.\n", .{ edits.len, path });
     try w.flush();
 }
 
@@ -407,6 +481,34 @@ const GrepLineInfo = struct {
     is_match: bool,
 };
 
+const NormalizedEdit = struct {
+    old_text: []u8,
+    new_text: []u8,
+    edit_index: usize,
+};
+
+const MatchedEdit = struct {
+    edit_index: usize,
+    match_index: usize,
+    match_len: usize,
+    new_text: []const u8,
+};
+
+const Occurrences = struct {
+    first: ?usize,
+    count: usize,
+};
+
+const Utf8BomSplit = struct {
+    bom: []const u8,
+    text: []const u8,
+};
+
+const LineEnding = enum {
+    lf,
+    crlf,
+};
+
 fn grepLineInfo(line: []const u8) ?GrepLineInfo {
     var index: usize = 0;
     while (index < line.len) : (index += 1) {
@@ -423,6 +525,68 @@ fn grepLineInfo(line: []const u8) ?GrepLineInfo {
         }
     }
     return null;
+}
+
+fn lessThanMatchedEdit(_: void, left: MatchedEdit, right: MatchedEdit) bool {
+    if (left.match_index == right.match_index) return left.edit_index < right.edit_index;
+    return left.match_index < right.match_index;
+}
+
+fn findOccurrences(haystack: []const u8, needle: []const u8) Occurrences {
+    if (needle.len == 0) return .{ .first = null, .count = 0 };
+
+    var first: ?usize = null;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start <= haystack.len) {
+        const rel = std.mem.indexOf(u8, haystack[start..], needle) orelse break;
+        const absolute = start + rel;
+        if (first == null) first = absolute;
+        count += 1;
+        start = absolute + needle.len;
+    }
+    return .{ .first = first, .count = count };
+}
+
+fn stripUtf8Bom(content: []const u8) Utf8BomSplit {
+    const bom = "\xEF\xBB\xBF";
+    if (std.mem.startsWith(u8, content, bom)) {
+        return .{ .bom = content[0..bom.len], .text = content[bom.len..] };
+    }
+    return .{ .bom = content[0..0], .text = content };
+}
+
+fn detectLineEnding(content: []const u8) LineEnding {
+    if (std.mem.indexOfScalar(u8, content, '\n')) |line_feed| {
+        if (line_feed > 0 and content[line_feed - 1] == '\r') return .crlf;
+    }
+    return .lf;
+}
+
+fn normalizeToLfAlloc(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    var index: usize = 0;
+    while (index < content.len) : (index += 1) {
+        if (content[index] == '\r') {
+            if (index + 1 < content.len and content[index + 1] == '\n') index += 1;
+            try out.writer.writeByte('\n');
+        } else {
+            try out.writer.writeByte(content[index]);
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn writeRestoredLineEndings(w: *std.Io.Writer, content: []const u8, line_ending: LineEnding) !void {
+    for (content) |byte| {
+        if (byte == '\n' and line_ending == .crlf) {
+            try w.writeAll("\r\n");
+        } else {
+            try w.writeByte(byte);
+        }
+    }
 }
 
 fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: usize, max_bytes: usize) !Truncation {

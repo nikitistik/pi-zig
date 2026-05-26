@@ -1536,12 +1536,38 @@ if (written !== 'pi-zig write smoke') {
 
 run(['tool-write', 'zig-out/pi-zig-tool-edit-smoke.txt', 'alpha beta']);
 const edit = run(['tool-edit', 'zig-out/pi-zig-tool-edit-smoke.txt', 'beta', 'gamma']);
-if (!edit.includes('Successfully replaced 1 block')) {
+if (!edit.includes('Successfully replaced 1 block(s)')) {
   throw new Error('tool-edit smoke did not report success');
 }
 const edited = run(['tool-read', 'zig-out/pi-zig-tool-edit-smoke.txt']);
 if (edited !== 'alpha gamma') {
   throw new Error('tool-edit smoke did not update content');
+}
+const editMultiFixture = 'zig-out/pi-zig-tool-edit-multi-smoke.txt';
+fs.writeFileSync(
+  editMultiFixture,
+  Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('alpha\r\nbeta\r\ngamma\r\n')])
+);
+const editMulti = run(['tool-edit', editMultiFixture, 'alpha\nbeta', 'one\ntwo', 'gamma', 'delta']);
+if (!editMulti.includes('Successfully replaced 2 block(s)')) {
+  throw new Error('tool-edit multi-edit smoke did not report two replacements');
+}
+const editMultiBytes = fs.readFileSync(editMultiFixture);
+const hasBom = editMultiBytes[0] === 0xef && editMultiBytes[1] === 0xbb && editMultiBytes[2] === 0xbf;
+if (!hasBom || editMultiBytes.subarray(3).toString('utf8') !== 'one\r\ntwo\r\ndelta\r\n') {
+  throw new Error('tool-edit multi-edit smoke did not preserve BOM and CRLF line endings');
+}
+const editDuplicateFixture = 'zig-out/pi-zig-tool-edit-duplicate-smoke.txt';
+fs.writeFileSync(editDuplicateFixture, 'repeat repeat');
+runFail(['tool-edit', editDuplicateFixture, 'repeat', 'once']);
+if (fs.readFileSync(editDuplicateFixture, 'utf8') !== 'repeat repeat') {
+  throw new Error('tool-edit duplicate-target failure mutated the file');
+}
+const editOverlapFixture = 'zig-out/pi-zig-tool-edit-overlap-smoke.txt';
+fs.writeFileSync(editOverlapFixture, 'abcdef');
+runFail(['tool-edit', editOverlapFixture, 'abc', 'x', 'bcd', 'y']);
+if (fs.readFileSync(editOverlapFixture, 'utf8') !== 'abcdef') {
+  throw new Error('tool-edit overlap failure mutated the file');
 }
 
 const rpcSessionFile = 'zig-out/pi-zig-rpc-smoke.jsonl';
