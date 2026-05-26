@@ -85,7 +85,7 @@ printf '{"type":"switch_session","sessionPath":"zig-out/pi-zig-session.jsonl"}\n
 printf '{"type":"prompt","message":"first"}\n{"type":"prompt","message":"second"}\n{"type":"get_fork_messages"}\n{"type":"fork","entryId":"m-2"}\n{"type":"get_state"}\n' | zig build run -- rpc zig-out/pi-zig-fork-source.jsonl
 printf '{"type":"prompt","message":"clone me"}\n{"type":"clone"}\n{"type":"get_state"}\n' | zig build run -- rpc zig-out/pi-zig-clone-source.jsonl
 zig build run -- parse-args --provider openai --thinking xhigh -p "say ok" @README.md
-zig build run -- tool-read README.md
+zig build run -- tool-read README.md 1 2000
 zig build run -- tool-ls . 500
 zig build run -- tool-grep "Zig + Preact" README.md
 zig build run -- tool-find README.md . 20

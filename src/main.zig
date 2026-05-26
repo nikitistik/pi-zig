@@ -108,9 +108,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "tool-read")) {
         if (args.len < 3) return usage(init.io);
-        const bytes = try pi.tools.readFile(init.io, init.gpa, args[2], 512 * 1024);
-        defer init.gpa.free(bytes);
-        return writeAll(init.io, bytes);
+        const offset = if (args.len >= 4) std.fmt.parseInt(usize, args[3], 10) catch return usage(init.io) else null;
+        const limit = if (args.len >= 5) std.fmt.parseInt(usize, args[4], 10) catch return usage(init.io) else null;
+        return pi.tools.readFileForTool(init.io, init.gpa, args[2], offset, limit);
     }
 
     if (std.mem.eql(u8, command, "tool-bash")) {
@@ -181,7 +181,7 @@ fn usage(io: std.Io) !void {
         \\  rpc [session-file]
         \\  parity
         \\  parse-args [pi CLI args...]
-        \\  tool-read <path>
+        \\  tool-read <path> [offset] [limit]
         \\  tool-bash <command>
         \\  tool-ls [path] [limit]
         \\  tool-grep <pattern> <path>

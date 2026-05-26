@@ -1452,6 +1452,28 @@ const readme = run(['tool-read', 'README.md']);
 if (!readme.includes('Zig + Preact porting workspace')) {
   throw new Error('tool-read smoke did not return README content');
 }
+const readFixture = 'zig-out/pi-zig-read-fixture.txt';
+fs.writeFileSync(readFixture, ['one', 'two', 'three', 'four', 'five'].join('\n'));
+const readWindow = run(['tool-read', readFixture, '2', '2']);
+if (readWindow !== 'two\nthree\n\n[2 more lines in file. Use offset=4 to continue.]') {
+  throw new Error('tool-read offset/limit smoke did not return upstream-style continuation notice');
+}
+const readLongLinesFixture = 'zig-out/pi-zig-read-long-lines-fixture.txt';
+fs.writeFileSync(readLongLinesFixture, Array.from({ length: 2001 }, (_, index) => `line-${index + 1}`).join('\n'));
+const readLongLines = run(['tool-read', readLongLinesFixture]);
+if (
+  !readLongLines.includes('line-2000') ||
+  readLongLines.includes('line-2001') ||
+  !readLongLines.includes('[Showing lines 1-2000 of 2001. Use offset=2001 to continue.]')
+) {
+  throw new Error('tool-read line truncation smoke did not match upstream-style limit notice');
+}
+const readLongLineFixture = 'zig-out/pi-zig-read-long-line-fixture.txt';
+fs.writeFileSync(readLongLineFixture, 'x'.repeat(52 * 1024));
+const readLongLine = run(['tool-read', readLongLineFixture]);
+if (!readLongLine.includes('Line 1 is 52.0KB') || !readLongLine.includes('head -c 51200')) {
+  throw new Error('tool-read long-line smoke did not return bash fallback notice');
+}
 
 const bash = run(['tool-bash', 'printf pi-zig-tool-bash']);
 if (bash !== 'pi-zig-tool-bash') {

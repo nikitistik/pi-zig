@@ -2,6 +2,9 @@ const std = @import("std");
 
 const default_find_limit = 1000;
 const default_ls_limit = 500;
+const default_read_max_lines = 2000;
+const default_read_max_bytes = 50 * 1024;
+const max_read_file_bytes = 16 * 1024 * 1024;
 const max_edit_file_bytes = 4 * 1024 * 1024;
 
 pub const ShellResult = struct {
@@ -14,6 +17,57 @@ pub const ShellResult = struct {
 
 pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
+}
+
+pub fn readFileForTool(io: std.Io, allocator: std.mem.Allocator, path: []const u8, offset: ?usize, limit: ?usize) !void {
+    const bytes = try readFile(io, allocator, path, max_read_file_bytes);
+    defer allocator.free(bytes);
+
+    const total_lines = countReadLines(bytes);
+    const start_line = if (offset) |value| if (value == 0) 0 else value - 1 else 0;
+    if (start_line >= total_lines) return error.OffsetBeyondEnd;
+
+    var selected_out: std.Io.Writer.Allocating = .init(allocator);
+    defer selected_out.deinit();
+    try writeLineWindow(&selected_out.writer, bytes, start_line, limit);
+    const selected = selected_out.written();
+
+    const truncation = try truncateHead(allocator, selected, default_read_max_lines, default_read_max_bytes);
+    defer allocator.free(truncation.content);
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buf);
+    const w = &writer.interface;
+
+    if (truncation.first_line_exceeds_limit) {
+        try w.print("[Line {d} is ", .{start_line + 1});
+        try writeSize(w, bytesForLine(bytes, start_line));
+        try w.writeAll(", exceeds ");
+        try writeSize(w, default_read_max_bytes);
+        try w.print(" limit. Use bash: sed -n '{d}p' {s} | head -c {d}]\n", .{ start_line + 1, path, default_read_max_bytes });
+        try w.flush();
+        return;
+    }
+
+    try w.writeAll(truncation.content);
+    if (truncation.truncated) {
+        const end_line = start_line + truncation.output_lines;
+        const next_offset = end_line + 1;
+        if (truncation.truncated_by == .lines) {
+            try w.print("\n\n[Showing lines {d}-{d} of {d}. Use offset={d} to continue.]", .{ start_line + 1, end_line, total_lines, next_offset });
+        } else {
+            try w.print("\n\n[Showing lines {d}-{d} of {d} (", .{ start_line + 1, end_line, total_lines });
+            try writeSize(w, default_read_max_bytes);
+            try w.print(" limit). Use offset={d} to continue.]", .{next_offset});
+        }
+    } else if (limit) |line_limit| {
+        if (start_line + line_limit < total_lines) {
+            const remaining = total_lines - (start_line + line_limit);
+            const next_offset = start_line + line_limit + 1;
+            try w.print("\n\n[{d} more lines in file. Use offset={d} to continue.]", .{ remaining, next_offset });
+        }
+    }
+    try w.flush();
 }
 
 pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
@@ -195,6 +249,113 @@ fn lessThanAsciiIgnoreCase(left: []const u8, right: []const u8) bool {
         if (a > b) return false;
     }
     return left.len < right.len;
+}
+
+const TruncatedBy = enum {
+    none,
+    lines,
+    bytes,
+};
+
+const Truncation = struct {
+    content: []u8,
+    truncated: bool,
+    truncated_by: TruncatedBy,
+    output_lines: usize,
+    first_line_exceeds_limit: bool = false,
+};
+
+fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: usize, max_bytes: usize) !Truncation {
+    const total_lines = countOutputLines(content);
+    if (total_lines <= max_lines and content.len <= max_bytes) {
+        return .{
+            .content = try allocator.dupe(u8, content),
+            .truncated = false,
+            .truncated_by = .none,
+            .output_lines = total_lines,
+        };
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    var output_lines: usize = 0;
+    var truncated_by: TruncatedBy = .lines;
+    while (iter.next()) |line| {
+        if (output_lines >= max_lines) {
+            truncated_by = .lines;
+            break;
+        }
+        const separator_len: usize = if (output_lines == 0) 0 else 1;
+        if (line.len + separator_len > max_bytes - out.written().len) {
+            if (output_lines == 0) {
+                out.deinit();
+                return .{
+                    .content = try allocator.dupe(u8, ""),
+                    .truncated = true,
+                    .truncated_by = .bytes,
+                    .output_lines = 0,
+                    .first_line_exceeds_limit = true,
+                };
+            }
+            truncated_by = .bytes;
+            break;
+        }
+        if (output_lines != 0) try out.writer.writeByte('\n');
+        try out.writer.writeAll(line);
+        output_lines += 1;
+    }
+
+    return .{
+        .content = try out.toOwnedSlice(),
+        .truncated = true,
+        .truncated_by = truncated_by,
+        .output_lines = output_lines,
+    };
+}
+
+fn writeLineWindow(w: *std.Io.Writer, content: []const u8, start_line: usize, limit: ?usize) !void {
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    var line_index: usize = 0;
+    var emitted: usize = 0;
+    while (iter.next()) |line| : (line_index += 1) {
+        if (line_index < start_line) continue;
+        if (limit) |max_lines| if (emitted >= max_lines) break;
+        if (emitted != 0) try w.writeByte('\n');
+        try w.writeAll(line);
+        emitted += 1;
+    }
+}
+
+fn countReadLines(content: []const u8) usize {
+    if (content.len == 0) return 1;
+    return std.mem.count(u8, content, "\n") + 1;
+}
+
+fn countOutputLines(content: []const u8) usize {
+    if (content.len == 0) return 0;
+    return std.mem.count(u8, content, "\n") + 1;
+}
+
+fn bytesForLine(content: []const u8, target_line: usize) usize {
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    var line_index: usize = 0;
+    while (iter.next()) |line| : (line_index += 1) {
+        if (line_index == target_line) return line.len;
+    }
+    return 0;
+}
+
+fn writeSize(w: *std.Io.Writer, bytes: usize) !void {
+    if (bytes < 1024) {
+        try w.print("{d}B", .{bytes});
+    } else if (bytes < 1024 * 1024) {
+        const tenths = (bytes * 10) / 1024;
+        try w.print("{d}.{d}KB", .{ tenths / 10, tenths % 10 });
+    } else {
+        const tenths = (bytes * 10) / (1024 * 1024);
+        try w.print("{d}.{d}MB", .{ tenths / 10, tenths % 10 });
+    }
 }
 
 fn shouldSkipFindDir(name: []const u8) bool {
