@@ -18,6 +18,7 @@ pub const RunOptions = struct {
     api_key: []const u8,
     prompt: []const u8,
     system_prompt: ?[]const u8 = null,
+    env: ?*const std.process.Environ.Map = null,
     shell_path: ?[]const u8 = null,
     shell_command_prefix: ?[]const u8 = null,
     history: []const ai_client.ChatMessage = &.{},
@@ -846,6 +847,7 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
         .should_cancel = if (options) |run_options| run_options.should_cancel else null,
         .shell_path = if (options) |run_options| run_options.shell_path else null,
         .command_prefix = if (options) |run_options| run_options.shell_command_prefix else null,
+        .env = if (options) |run_options| run_options.env else null,
     }) catch |err| {
         return toolError(try std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)}));
     };

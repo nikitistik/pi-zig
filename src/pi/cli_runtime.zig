@@ -720,6 +720,7 @@ fn buildPrintResponse(
         .prompt = prompt,
         .prompt_content_parts = prompt_content_parts,
         .system_prompt = runtime_system_prompt,
+        .env = env,
         .shell_path = shell_settings.shell_path,
         .shell_command_prefix = shell_settings.shell_command_prefix,
         .tool_set = toolSetFromParsed(parsed),

@@ -66,6 +66,7 @@ pub const ShellCaptureOptions = struct {
     cancellation_poll_ms: i64 = 100,
     shell_path: ?[]const u8 = null,
     command_prefix: ?[]const u8 = null,
+    env: ?*const std.process.Environ.Map = null,
 };
 
 pub const GrepOptions = struct {
@@ -568,10 +569,11 @@ pub fn runShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !
 }
 
 pub fn runShellCapture(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ShellResult {
-    const shell_path = try resolveShellPath(io, null);
+    const resolved_shell = try resolveShellPath(io, allocator, null, null);
+    defer resolved_shell.deinit(allocator);
     const merged_command = try stderrMergedShellCommand(allocator, command);
     defer merged_command.deinit(allocator);
-    const argv = [_][]const u8{ shell_path, "-c", merged_command.command };
+    const argv = [_][]const u8{ resolved_shell.path, "-c", merged_command.command };
     const result = try std.process.run(allocator, io, .{
         .argv = &argv,
         .stdout_limit = .limited(max_bash_capture_bytes),
@@ -608,8 +610,9 @@ pub fn runShellCaptureWithUpdates(
     defer resolved_command.deinit(allocator);
     const merged_command = try stderrMergedShellCommand(allocator, resolved_command.command);
     defer merged_command.deinit(allocator);
-    const shell_path = try resolveShellPath(io, options.shell_path);
-    const argv = [_][]const u8{ shell_path, "-c", merged_command.command };
+    const resolved_shell = try resolveShellPath(io, allocator, options.shell_path, options.env);
+    defer resolved_shell.deinit(allocator);
+    const argv = [_][]const u8{ resolved_shell.path, "-c", merged_command.command };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdin = .ignore,
@@ -1115,6 +1118,15 @@ const ResolvedShellCommand = struct {
     }
 };
 
+const ResolvedShellPath = struct {
+    path: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: ResolvedShellPath, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.path);
+    }
+};
+
 fn prefixedShellCommand(allocator: std.mem.Allocator, command: []const u8, maybe_prefix: ?[]const u8) !ResolvedShellCommand {
     const prefix = std.mem.trim(u8, maybe_prefix orelse return .{ .command = command }, " \t\r\n");
     if (prefix.len == 0) return .{ .command = command };
@@ -1131,22 +1143,63 @@ fn stderrMergedShellCommand(allocator: std.mem.Allocator, command: []const u8) !
     };
 }
 
-fn resolveShellPath(io: std.Io, custom_shell_path: ?[]const u8) ![]const u8 {
+fn resolveShellPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    custom_shell_path: ?[]const u8,
+    env: ?*const std.process.Environ.Map,
+) !ResolvedShellPath {
     if (custom_shell_path) |path| {
         try validateShellPath(io, path);
-        return path;
+        return .{ .path = path };
     }
 
-    if (comptime builtin.os.tag == .windows) return resolveWindowsShellPath(io);
-    if (absolutePathExists(io, "/bin/bash")) return "/bin/bash";
-    return "sh";
+    if (comptime builtin.os.tag == .windows) return resolveWindowsShellPath(io, allocator, env);
+    if (absolutePathExists(io, "/bin/bash")) return .{ .path = "/bin/bash" };
+    return .{ .path = "sh" };
 }
 
-fn resolveWindowsShellPath(io: std.Io) []const u8 {
-    for (windows_git_bash_paths) |path| {
-        if (absolutePathExists(io, path)) return path;
+fn resolveWindowsShellPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: ?*const std.process.Environ.Map,
+) !ResolvedShellPath {
+    var env_candidates = try windowsGitBashPathsFromEnv(allocator, env);
+    defer {
+        for (env_candidates.items) |path| allocator.free(path);
+        env_candidates.deinit(allocator);
     }
-    return "bash.exe";
+
+    for (env_candidates.items) |path| {
+        if (absolutePathExists(io, path)) {
+            const owned = try allocator.dupe(u8, path);
+            return .{ .path = owned, .owned = true };
+        }
+    }
+    for (windows_git_bash_paths) |path| {
+        if (absolutePathExists(io, path)) return .{ .path = path };
+    }
+    return .{ .path = "bash.exe" };
+}
+
+fn windowsGitBashPathsFromEnv(
+    allocator: std.mem.Allocator,
+    env: ?*const std.process.Environ.Map,
+) !std.ArrayList([]u8) {
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    const map = env orelse return paths;
+    if (map.get("ProgramFiles")) |program_files| {
+        try paths.append(allocator, try std.fmt.allocPrint(allocator, "{s}\\Git\\bin\\bash.exe", .{program_files}));
+    }
+    if (map.get("ProgramFiles(x86)")) |program_files_x86| {
+        try paths.append(allocator, try std.fmt.allocPrint(allocator, "{s}\\Git\\bin\\bash.exe", .{program_files_x86}));
+    }
+    return paths;
 }
 
 fn validateShellPath(io: std.Io, path: []const u8) !void {
@@ -1657,7 +1710,9 @@ test "shell path resolution validates custom paths and prefers bash on unix" {
 
     if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
         if (absolutePathExists(std.testing.io, "/bin/bash")) {
-            try std.testing.expectEqualStrings("/bin/bash", try resolveShellPath(std.testing.io, null));
+            const resolved = try resolveShellPath(std.testing.io, std.testing.allocator, null, null);
+            defer resolved.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("/bin/bash", resolved.path);
         }
     }
 }
@@ -1666,6 +1721,24 @@ test "windows shell path candidates include Git Bash before PATH fallback" {
     try std.testing.expectEqualStrings("C:\\Program Files\\Git\\bin\\bash.exe", windows_git_bash_paths[0]);
     try std.testing.expectEqualStrings("C:\\Program Files (x86)\\Git\\bin\\bash.exe", windows_git_bash_paths[1]);
     if (comptime builtin.os.tag == .windows) {
-        _ = resolveWindowsShellPath(std.testing.io);
+        const resolved = try resolveWindowsShellPath(std.testing.io, std.testing.allocator, null);
+        defer resolved.deinit(std.testing.allocator);
     }
+}
+
+test "windows shell path candidates use environment-specific ProgramFiles roots first" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ProgramFiles", "D:\\Apps");
+    try env.put("ProgramFiles(x86)", "E:\\LegacyApps");
+
+    var paths = try windowsGitBashPathsFromEnv(std.testing.allocator, &env);
+    defer {
+        for (paths.items) |path| std.testing.allocator.free(path);
+        paths.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    try std.testing.expectEqualStrings("D:\\Apps\\Git\\bin\\bash.exe", paths.items[0]);
+    try std.testing.expectEqualStrings("E:\\LegacyApps\\Git\\bin\\bash.exe", paths.items[1]);
 }

@@ -526,6 +526,7 @@ const Runtime = struct {
             .timeout_ms = timeout_ms,
             .shell_path = shell_settings.shell_path,
             .command_prefix = shell_settings.shell_command_prefix,
+            .env = self.env,
         });
         errdefer allocator.free(result.output);
         const entry_id = try self.store.appendBashExecution(io, allocator, shell_command, result);
@@ -646,6 +647,7 @@ const Runtime = struct {
             .api_key = api_key,
             .prompt = prompt,
             .system_prompt = runtime_system_prompt,
+            .env = env,
             .shell_path = shell_settings.shell_path,
             .shell_command_prefix = shell_settings.shell_command_prefix,
             .history = history.items,
