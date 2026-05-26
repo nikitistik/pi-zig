@@ -1179,7 +1179,41 @@ fn resolveWindowsShellPath(
     for (windows_git_bash_paths) |path| {
         if (absolutePathExists(io, path)) return .{ .path = path };
     }
+    if (try findWindowsBashOnPath(io, allocator)) |path| {
+        return .{ .path = path, .owned = true };
+    }
     return .{ .path = "bash.exe" };
+}
+
+fn findWindowsBashOnPath(io: std.Io, allocator: std.mem.Allocator) !?[]u8 {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "where", "bash.exe" },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    }) catch return null;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+
+    const first_match = firstWhereMatch(result.stdout) orelse return null;
+    if (!absolutePathExists(io, first_match)) return null;
+    return try allocator.dupe(u8, first_match);
+}
+
+fn firstWhereMatch(output: []const u8) ?[]const u8 {
+    var rest = output;
+    while (rest.len > 0) {
+        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const line = std.mem.trim(u8, rest[0..line_end], " \t\r\n");
+        if (line.len > 0) return line;
+        if (line_end == rest.len) break;
+        rest = rest[line_end + 1 ..];
+    }
+    return null;
 }
 
 fn windowsGitBashPathsFromEnv(
@@ -1741,4 +1775,10 @@ test "windows shell path candidates use environment-specific ProgramFiles roots 
     try std.testing.expectEqual(@as(usize, 2), paths.items.len);
     try std.testing.expectEqualStrings("D:\\Apps\\Git\\bin\\bash.exe", paths.items[0]);
     try std.testing.expectEqualStrings("E:\\LegacyApps\\Git\\bin\\bash.exe", paths.items[1]);
+}
+
+test "windows where parser keeps the first non-empty bash path" {
+    const match = firstWhereMatch("\r\nC:\\Users\\me\\bin\\bash.exe\r\nC:\\Windows\\bash.exe\r\n").?;
+    try std.testing.expectEqualStrings("C:\\Users\\me\\bin\\bash.exe", match);
+    try std.testing.expect(firstWhereMatch("\r\n \t\r\n") == null);
 }
