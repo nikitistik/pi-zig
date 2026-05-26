@@ -597,6 +597,7 @@ const packageCommandManagedPackageDir = path.join(
   'lib/node_modules/@earendil-works/pi-coding-agent'
 );
 const packageCommandManagedBin = path.join(packageCommandManagedPackageDir, 'bin/pi-zig');
+const packageCommandGlobalBin = path.join(packageCommandGlobalPrefix, 'bin/pi-zig');
 const packageCommandPnpmRoot = path.join(packageCommandRoot, 'pnpm/global/node_modules');
 const packageCommandPnpmBin = path.join(packageCommandPnpmRoot, '@earendil-works/pi-coding-agent/bin/pi-zig');
 const packageCommandYarnDir = path.join(packageCommandRoot, '.yarn/global');
@@ -641,12 +642,16 @@ fs.mkdirSync(packageCommandGlobalPackage, { recursive: true });
 fs.mkdirSync(packageCommandProjectPackage, { recursive: true });
 fs.mkdirSync(packageCommandFakeBin, { recursive: true });
 fs.mkdirSync(path.dirname(packageCommandManagedBin), { recursive: true });
+fs.mkdirSync(path.dirname(packageCommandGlobalBin), { recursive: true });
 fs.writeFileSync(path.join(packageCommandManagedPackageDir, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent' }));
-fs.symlinkSync(bin, packageCommandManagedBin);
+fs.copyFileSync(bin, packageCommandManagedBin);
+fs.chmodSync(packageCommandManagedBin, 0o755);
+fs.symlinkSync(packageCommandManagedBin, packageCommandGlobalBin);
 for (const managedBin of [packageCommandPnpmBin, packageCommandYarnBin, packageCommandBunBin]) {
   fs.mkdirSync(path.dirname(managedBin), { recursive: true });
   fs.writeFileSync(path.join(path.dirname(path.dirname(managedBin)), 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent' }));
-  fs.symlinkSync(bin, managedBin);
+  fs.copyFileSync(bin, managedBin);
+  fs.chmodSync(managedBin, 0o755);
 }
 fs.writeFileSync(
   path.join(packageCommandFakeBin, 'npm'),
@@ -889,6 +894,25 @@ if (
   )
 ) {
   throw new Error('package self-update smoke did not run upstream-shaped package-manager command');
+}
+const packageSelfSymlinkRecordCount = readPackageCommandRecords().length;
+const packageSelfSymlinkOutput = runPackageBinary(packageCommandGlobalBin, ['update', '--self', '--force'], undefined, {
+  cwd: packageCommandProject,
+  env: packageCommandEnv
+});
+const packageSelfSymlinkRecords = readPackageCommandRecords().slice(packageSelfSymlinkRecordCount);
+if (
+  !packageSelfSymlinkOutput.includes('Updated pi-zig') ||
+  !packageSelfSymlinkRecords.some((record) => record.command === 'npm' && record.args[0] === 'root' && record.args[1] === '-g') ||
+  !packageSelfSymlinkRecords.some((record) =>
+    record.command === 'npm' &&
+    record.args.includes('install') &&
+    record.args.includes('-g') &&
+    record.args.includes('--ignore-scripts') &&
+    record.args.includes('@earendil-works/pi-coding-agent')
+  )
+) {
+  throw new Error('package self-update smoke did not follow a global bin symlink back to the managed npm package');
 }
 for (const [manager, managedBin, rootArgs, installArgs] of [
   ['pnpm', packageCommandPnpmBin, ['root', '-g'], ['install', '-g', '--ignore-scripts', '@earendil-works/pi-coding-agent']],

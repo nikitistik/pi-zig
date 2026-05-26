@@ -1239,7 +1239,7 @@ fn selfUpdateArgv(
     exe_path: []const u8,
     update_package_name: []const u8,
 ) !std.ArrayList([]const u8) {
-    const method = detectInstallMethod(exe_path);
+    const method = try detectInstallMethod(io, allocator, cwd, exe_path);
     if (method == .unknown) {
         try writeSelfUpdateUnavailable(io, method, null, false, false, exe_path, update_package_name);
         return error.PackageCommandFailed;
@@ -1312,7 +1312,22 @@ fn selfUpdateArgvForMethod(
     return argv;
 }
 
-fn detectInstallMethod(exe_path: []const u8) InstallMethod {
+fn detectInstallMethod(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8, exe_path: []const u8) !InstallMethod {
+    const resolved = try resolveLocalPath(allocator, cwd, exe_path);
+    defer allocator.free(resolved);
+
+    const direct = detectInstallMethodFromPath(resolved);
+    if (direct != .unknown) return direct;
+
+    if (try realPathIfExists(io, allocator, resolved)) |real_path| {
+        defer allocator.free(real_path);
+        return detectInstallMethodFromPath(real_path);
+    }
+
+    return .unknown;
+}
+
+fn detectInstallMethodFromPath(exe_path: []const u8) InstallMethod {
     if (containsPathFragment(exe_path, "/pnpm/") or containsPathFragment(exe_path, "/.pnpm/")) return .pnpm;
     if (containsPathFragment(exe_path, "/yarn/") or containsPathFragment(exe_path, "/.yarn/")) return .yarn;
     if (containsPathFragment(exe_path, "/install/global/node_modules/")) return .bun;
@@ -1327,8 +1342,20 @@ fn containsPathFragment(path: []const u8, needle: []const u8) bool {
 fn entrypointPackageDir(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8, exe_path: []const u8) !?[]u8 {
     const resolved = try resolveLocalPath(allocator, cwd, exe_path);
     defer allocator.free(resolved);
-    var dir = std.fs.path.dirname(resolved) orelse return null;
+    if (try realPathIfExists(io, allocator, resolved)) |real_path| {
+        defer allocator.free(real_path);
+        if (!std.mem.eql(u8, real_path, resolved)) {
+            if (try packageDirForExecutablePath(io, allocator, real_path)) |dir| return dir;
+        }
+    }
 
+    if (try packageDirForExecutablePath(io, allocator, resolved)) |dir| return dir;
+
+    return null;
+}
+
+fn packageDirForExecutablePath(io: std.Io, allocator: std.mem.Allocator, exe_path: []const u8) !?[]u8 {
+    var dir = std.fs.path.dirname(exe_path) orelse return null;
     while (true) {
         const package_json = try std.fs.path.join(allocator, &.{ dir, "package.json" });
         defer allocator.free(package_json);
@@ -1354,8 +1381,22 @@ fn isManagedByGlobalPackageManager(
         roots.deinit(allocator);
     }
     try appendGlobalPackageRoots(io, allocator, env, agent_dir, method, package_dir, &roots);
+    var package_candidates = try pathComparisonCandidates(io, allocator, package_dir);
+    defer {
+        for (package_candidates.items) |candidate| allocator.free(candidate);
+        package_candidates.deinit(allocator);
+    }
     for (roots.items) |root| {
-        if (isPathInsideRoot(package_dir, root)) return true;
+        var root_candidates = try pathComparisonCandidates(io, allocator, root);
+        defer {
+            for (root_candidates.items) |candidate| allocator.free(candidate);
+            root_candidates.deinit(allocator);
+        }
+        for (root_candidates.items) |root_candidate| {
+            for (package_candidates.items) |package_candidate| {
+                if (isPathInsideRoot(package_candidate, root_candidate)) return true;
+            }
+        }
     }
     return false;
 }
@@ -1422,6 +1463,38 @@ fn commandOutputTrimmed(io: std.Io, allocator: std.mem.Allocator, argv: []const 
     const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
     if (trimmed.len == 0) return null;
     return try allocator.dupe(u8, trimmed);
+}
+
+fn pathComparisonCandidates(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.ArrayList([]u8) {
+    var candidates: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (candidates.items) |candidate| allocator.free(candidate);
+        candidates.deinit(allocator);
+    }
+
+    const resolved = try std.fs.path.resolve(allocator, &.{path});
+    try appendUniqueOwnedPath(allocator, &candidates, resolved);
+
+    if (try realPathIfExists(io, allocator, resolved)) |real_path| {
+        try appendUniqueOwnedPath(allocator, &candidates, real_path);
+    }
+
+    return candidates;
+}
+
+fn appendUniqueOwnedPath(allocator: std.mem.Allocator, paths: *std.ArrayList([]u8), path: []u8) !void {
+    for (paths.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) {
+            allocator.free(path);
+            return;
+        }
+    }
+    try paths.append(allocator, path);
+}
+
+fn realPathIfExists(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const real_path = std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator) catch return null;
+    return real_path;
 }
 
 fn inferredNpmRoot(allocator: std.mem.Allocator, package_dir: []const u8) !?[]u8 {
