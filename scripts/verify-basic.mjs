@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -20,6 +20,72 @@ function runFail(args, input, options = {}) {
       stderr: error.stderr ?? ''
     };
   }
+}
+
+async function startFakeProviderServer() {
+  const child = spawn(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `
+import http from 'node:http';
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+      return;
+    }
+    if (req.headers.authorization !== 'Bearer fake-provider-key') {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing auth' }));
+      return;
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const user = [...body.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+    const system = body.messages.find((message) => message.role === 'system')?.content ?? '';
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      choices: [{
+        message: {
+          content: 'mock provider response for ' + body.model + ': ' + user + (system ? ' [system=' + system + ']' : '')
+        }
+      }]
+    }));
+  });
+});
+server.listen(0, '127.0.0.1', () => {
+  const address = server.address();
+  console.log('http://127.0.0.1:' + address.port + '/v1');
+});
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`
+    ],
+    { stdio: ['ignore', 'pipe', 'inherit'] }
+  );
+
+  const baseUrl = await new Promise((resolve, reject) => {
+    let text = '';
+    child.stdout.on('data', (chunk) => {
+      text += chunk.toString('utf8');
+      const newline = text.indexOf('\n');
+      if (newline >= 0) resolve(text.slice(0, newline).trim());
+    });
+    child.once('error', reject);
+    child.once('exit', (code) => {
+      if (code !== 0) reject(new Error(`fake provider exited early with ${code}`));
+    });
+  });
+
+  return {
+    baseUrl,
+    stop() {
+      child.kill('SIGTERM');
+    }
+  };
 }
 
 const status = run(['status']);
@@ -1564,6 +1630,47 @@ if (
   !topLevelPrint.includes('Prompt:\nhello top-level print')
 ) {
   throw new Error('top-level print mode smoke did not accept an inline prompt');
+}
+
+const fakeProvider = await startFakeProviderServer();
+try {
+  const providerEnv = {
+    ...process.env,
+    OPENAI_API_KEY: 'fake-provider-key',
+    PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl
+  };
+  const providerPrint = run(
+    [
+      '--provider', 'openai',
+      '--model', 'mock-chat-model',
+      '--system-prompt', 'system base',
+      '--append-system-prompt', 'extra system',
+      '-p', 'hello provider print'
+    ],
+    undefined,
+    { env: providerEnv }
+  );
+  if (!providerPrint.includes('mock provider response for mock-chat-model: hello provider print [system=system base')) {
+    throw new Error('top-level print mode smoke did not execute the OpenAI-compatible provider path');
+  }
+
+  const providerJsonLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-model', '-p', 'hello provider json'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('mock provider response for mock-json-model: hello provider json')) ||
+    !providerJsonLines.some((line) => line.type === 'agent_end')
+  ) {
+    throw new Error('top-level JSON mode smoke did not include provider-backed assistant output');
+  }
+} finally {
+  fakeProvider.stop();
 }
 
 const topLevelJsonSessionFile = 'zig-out/pi-zig-top-level-json-smoke.jsonl';

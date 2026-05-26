@@ -1,4 +1,5 @@
 pub const auth = @import("auth.zig");
+pub const ai_client = @import("ai_client.zig");
 pub const cli = @import("cli.zig");
 pub const cli_runtime = @import("cli_runtime.zig");
 pub const commands = @import("commands.zig");
@@ -19,6 +20,7 @@ pub const upstream = @import("upstream.zig");
 
 test {
     _ = auth;
+    _ = ai_client;
     _ = cli;
     _ = cli_runtime;
     _ = commands;

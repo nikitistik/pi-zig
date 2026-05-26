@@ -1,4 +1,6 @@
 const std = @import("std");
+const ai_client = @import("ai_client.zig");
+const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const commands = @import("commands.zig");
 const config = @import("config.zig");
@@ -136,7 +138,7 @@ fn runTextPrintFoundation(
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildFoundationResponse(allocator, parsed, prompt);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt);
     defer allocator.free(response);
 
     if (store) |*persistent| {
@@ -159,7 +161,7 @@ fn runJsonPrintFoundation(
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildFoundationResponse(allocator, parsed, prompt);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt);
     defer allocator.free(response);
 
     if (store) |*persistent| {
@@ -402,7 +404,63 @@ fn buildFoundationResponse(allocator: std.mem.Allocator, parsed: cli.ParsedArgs,
         try w.writeAll("\n\nPrompt:\n");
         try w.writeAll(trimmed);
     }
-    return out.toOwnedSlice();
+    return try out.toOwnedSlice();
+}
+
+fn buildPrintResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+    prompt: []const u8,
+) ![]const u8 {
+    if (parsed.provider == null or parsed.model == null) {
+        return buildFoundationResponse(allocator, parsed, prompt);
+    }
+
+    const provider = parsed.provider.?;
+    const model = parsed.model.?;
+    const api_key = if (parsed.api_key) |key|
+        try allocator.dupe(u8, key)
+    else
+        try auth.resolveProviderApiKey(io, allocator, env, provider) orelse {
+            try writeStderr(io, "No API key found for ");
+            try writeStderr(io, provider);
+            try writeStderr(io, ".\n");
+            return error.ProviderAuthMissing;
+        };
+    defer allocator.free(api_key);
+
+    const system_override = try buildSystemOverride(allocator, parsed);
+    defer if (system_override) |value| allocator.free(value);
+
+    return ai_client.runChatCompletion(io, allocator, env, .{
+        .provider = provider,
+        .model = model,
+        .api_key = api_key,
+        .prompt = prompt,
+        .system_prompt = system_override,
+    }) catch |err| {
+        try writeStderr(io, "Provider request failed: ");
+        try writeStderr(io, @errorName(err));
+        try writeStderr(io, "\n");
+        return err;
+    };
+}
+
+fn buildSystemOverride(allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !?[]u8 {
+    if (parsed.system_prompt == null and parsed.append_system_prompts_len == 0) return null;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    if (parsed.system_prompt) |system_prompt| {
+        try out.writer.writeAll(system_prompt);
+    }
+    for (parsed.append_system_prompts[0..parsed.append_system_prompts_len]) |append_prompt| {
+        if (out.written().len != 0) try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(append_prompt);
+    }
+    return try out.toOwnedSlice();
 }
 
 fn writeAssistantMessageJson(w: *std.Io.Writer, text: []const u8) !void {

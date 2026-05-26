@@ -35,6 +35,17 @@ const AuthStatus = struct {
     credential_type: ?[]const u8 = null,
 };
 
+pub fn resolveProviderApiKey(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    provider: []const u8,
+) !?[]u8 {
+    var parsed = try loadAuth(io, allocator, env);
+    defer parsed.deinit();
+    return resolveApiKey(io, allocator, env, parsed.value, provider);
+}
+
 pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, args: []const []const u8) !bool {
     if (args.len == 0 or !std.mem.eql(u8, args[0], "auth")) return false;
 
