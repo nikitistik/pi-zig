@@ -8,6 +8,7 @@ pub const ToolEndCallback = *const fn (ctx: *anyopaque, result: ToolResult) anye
 pub const TextDeltaCallback = ai_client.StreamTextCallback;
 pub const BeforeToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!BeforeToolCallResult;
 pub const AfterToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall, result: ToolResult) anyerror!AfterToolCallResult;
+pub const CustomToolCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!ToolExecutionResult;
 pub const PrepareNextTurnCallback = *const fn (ctx: *anyopaque, turn: TurnContext) anyerror!PrepareNextTurnResult;
 pub const ShouldStopAfterTurnCallback = *const fn (ctx: *anyopaque, turn: TurnContext) anyerror!bool;
 pub const CancellationCallback = *const fn (ctx: *anyopaque) bool;
@@ -25,6 +26,9 @@ pub const RunOptions = struct {
     prompt_content_parts: []const ai_client.ChatContentPart = &.{},
     max_turns: usize = 8,
     tool_set: ToolSet = .all,
+    custom_tools: []const ai_client.ChatToolDefinition = &.{},
+    custom_tool_context: ?*anyopaque = null,
+    execute_custom_tool: ?CustomToolCallback = null,
     stream_turns: bool = false,
     tool_event_context: ?*anyopaque = null,
     on_tool_start: ?ToolStartCallback = null,
@@ -174,7 +178,7 @@ pub const ToolUpdate = struct {
     truncation: ?tools.ShellTruncationDetails = null,
 };
 
-const ToolExecutionResult = struct {
+pub const ToolExecutionResult = struct {
     content: []u8,
     is_error: bool = false,
     terminate: bool = false,
@@ -316,8 +320,12 @@ pub fn runPrompt(
         tool_call_batches.deinit(allocator);
     }
 
-    var tool_definitions_buf: [all_tool_definitions.len]ai_client.ChatToolDefinition = undefined;
-    const tool_definitions = enabledToolDefinitions(options.tool_set, &tool_definitions_buf);
+    var built_in_tool_definitions_buf: [all_tool_definitions.len]ai_client.ChatToolDefinition = undefined;
+    const built_in_tool_definitions = enabledToolDefinitions(options.tool_set, &built_in_tool_definitions_buf);
+    var tool_definitions_list: std.ArrayList(ai_client.ChatToolDefinition) = .empty;
+    defer tool_definitions_list.deinit(allocator);
+    try tool_definitions_list.appendSlice(allocator, built_in_tool_definitions);
+    try tool_definitions_list.appendSlice(allocator, options.custom_tools);
     var active_provider: ?[]u8 = null;
     defer if (active_provider) |provider| allocator.free(provider);
     var active_model: ?[]u8 = null;
@@ -335,7 +343,7 @@ pub fn runPrompt(
             .model = active_model orelse options.model,
             .api_key = active_api_key orelse options.api_key,
             .messages = borrowed,
-            .tools = tool_definitions,
+            .tools = tool_definitions_list.items,
         };
         var response = if (options.stream_turns)
             try ai_client.streamChatTurnWithTextCallback(io, allocator, env, request, options.text_event_context, options.on_text_delta)
@@ -800,7 +808,22 @@ fn executeToolCallWithUpdates(
     if (std.mem.eql(u8, call.name, "grep")) return executeGrepTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "find")) return executeFindTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "ls")) return executeLsTool(io, allocator, call.arguments_json);
+    if (options) |run_options| {
+        if (run_options.execute_custom_tool) |callback| {
+            if (customToolEnabled(run_options.custom_tools, call.name)) {
+                const context = run_options.custom_tool_context orelse return toolError(try std.fmt.allocPrint(allocator, "Tool {s} is registered but has no executor context.", .{call.name}));
+                return callback(context, call);
+            }
+        }
+    }
     return toolError(try std.fmt.allocPrint(allocator, "Tool {s} is not implemented in pi-zig yet.", .{call.name}));
+}
+
+fn customToolEnabled(custom_tools: []const ai_client.ChatToolDefinition, name: []const u8) bool {
+    for (custom_tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return true;
+    }
+    return false;
 }
 
 fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {

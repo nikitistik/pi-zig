@@ -24,6 +24,63 @@ pub const Runner = struct {
         return self.runAfterToolCall(call, result);
     }
 
+    pub fn executeRegisteredTool(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall) anyerror!agent.ToolExecutionResult {
+        const self: *Runner = @ptrCast(@alignCast(ctx_ptr));
+        return self.runRegisteredTool(call);
+    }
+
+    pub fn discoverToolDefinitions(self: *Runner) ![]ai_client.ChatToolDefinition {
+        if (!self.hasExtensions()) return &.{};
+
+        const payload = try self.buildDiscoverToolsPayload();
+        defer self.allocator.free(payload);
+        const output = try self.runNodeHook(payload);
+        defer if (output) |bytes| self.allocator.free(bytes);
+        const bytes = output orelse return &.{};
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch return error.ExtensionHookInvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ExtensionHookInvalidResponse;
+        const tools = parsed.value.object.get("tools") orelse return &.{};
+        if (tools != .array) return error.ExtensionHookInvalidResponse;
+
+        var definitions: std.ArrayList(ai_client.ChatToolDefinition) = .empty;
+        errdefer {
+            for (definitions.items) |definition| {
+                self.allocator.free(definition.name);
+                self.allocator.free(definition.description);
+                self.allocator.free(definition.parameters_json);
+            }
+            definitions.deinit(self.allocator);
+        }
+
+        for (tools.array.items) |item| {
+            if (item != .object) return error.ExtensionHookInvalidResponse;
+            const name = item.object.get("name") orelse return error.ExtensionHookInvalidResponse;
+            if (name != .string or name.string.len == 0) return error.ExtensionHookInvalidResponse;
+            const description = item.object.get("description") orelse return error.ExtensionHookInvalidResponse;
+            if (description != .string) return error.ExtensionHookInvalidResponse;
+            const parameters = item.object.get("parameters") orelse return error.ExtensionHookInvalidResponse;
+
+            try definitions.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, name.string),
+                .description = try self.allocator.dupe(u8, description.string),
+                .parameters_json = try jsonValueToOwnedString(self.allocator, parameters),
+            });
+        }
+        if (definitions.items.len == 0) return &.{};
+        return definitions.toOwnedSlice(self.allocator);
+    }
+
+    pub fn deinitToolDefinitions(self: *Runner, definitions: []ai_client.ChatToolDefinition) void {
+        for (definitions) |definition| {
+            self.allocator.free(definition.name);
+            self.allocator.free(definition.description);
+            self.allocator.free(definition.parameters_json);
+        }
+        self.allocator.free(definitions);
+    }
+
     fn runBeforeToolCall(self: *Runner, call: ai_client.ChatToolCall) !agent.BeforeToolCallResult {
         if (!self.hasExtensions()) return .{};
 
@@ -92,6 +149,78 @@ pub const Runner = struct {
             patch.terminate = terminate.bool;
         }
         return patch;
+    }
+
+    fn runRegisteredTool(self: *Runner, call: ai_client.ChatToolCall) !agent.ToolExecutionResult {
+        if (!self.hasExtensions()) return agent.ToolExecutionResult{
+            .content = try std.fmt.allocPrint(self.allocator, "Tool {s} is not implemented in pi-zig yet.", .{call.name}),
+            .is_error = true,
+        };
+
+        const payload = try self.buildExecuteToolPayload(call);
+        defer self.allocator.free(payload);
+        const output = try self.runNodeHook(payload);
+        defer if (output) |bytes| self.allocator.free(bytes);
+        const bytes = output orelse return .{ .content = try self.allocator.dupe(u8, "") };
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch return error.ExtensionHookInvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ExtensionHookInvalidResponse;
+
+        var content: ?[]u8 = null;
+        errdefer if (content) |value| self.allocator.free(value);
+        if (parsed.value.object.get("contentText")) |content_text| {
+            if (content_text != .string) return error.ExtensionHookInvalidResponse;
+            content = try self.allocator.dupe(u8, content_text.string);
+        } else if (parsed.value.object.get("content")) |result_content| {
+            content = if (result_content == .string)
+                try self.allocator.dupe(u8, result_content.string)
+            else
+                try textContentToOwnedString(self.allocator, result_content);
+        } else {
+            content = try self.allocator.dupe(u8, "");
+        }
+
+        var is_error = false;
+        if (parsed.value.object.get("isError")) |value| {
+            if (value != .bool) return error.ExtensionHookInvalidResponse;
+            is_error = value.bool;
+        }
+        var terminate = false;
+        if (parsed.value.object.get("terminate")) |value| {
+            if (value != .bool) return error.ExtensionHookInvalidResponse;
+            terminate = value.bool;
+        }
+
+        return .{
+            .content = content.?,
+            .is_error = is_error,
+            .terminate = terminate,
+        };
+    }
+
+    fn buildDiscoverToolsPayload(self: *Runner) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try self.writePayloadHead(w);
+        try w.writeAll(",\"event\":{\"type\":\"discover_tools\"}}");
+        return out.toOwnedSlice();
+    }
+
+    fn buildExecuteToolPayload(self: *Runner, call: ai_client.ChatToolCall) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try self.writePayloadHead(w);
+        try w.writeAll(",\"event\":{\"type\":\"execute_tool\",\"toolCallId\":");
+        try writeJsonString(w, call.id);
+        try w.writeAll(",\"toolName\":");
+        try writeJsonString(w, call.name);
+        try w.writeAll(",\"input\":");
+        try writeJsonObjectOrEmpty(self.allocator, w, call.arguments_json);
+        try w.writeAll("}}");
+        return out.toOwnedSlice();
     }
 
     fn buildToolCallPayload(self: *Runner, call: ai_client.ChatToolCall) ![]u8 {
@@ -217,13 +346,16 @@ const hook_runner_script =
     \\const { pathToFileURL } = require("node:url");
     \\const payload = JSON.parse(process.argv[1] || "{}");
     \\const handlers = new Map();
+    \\const registeredTools = [];
     \\const diagnostics = [];
     \\const api = {
     \\  on(type, handler) {
     \\    if (!handlers.has(type)) handlers.set(type, []);
     \\    handlers.get(type).push(handler);
     \\  },
-    \\  registerTool() {},
+    \\  registerTool(tool) {
+    \\    if (tool && typeof tool.name === "string") registeredTools.push(tool);
+    \\  },
     \\  registerCommand() {},
     \\  registerFlag() {},
     \\  events: { on() {}, emit() {} },
@@ -247,9 +379,35 @@ const hook_runner_script =
     \\  if (!Array.isArray(content)) return undefined;
     \\  return content.filter((part) => part && part.type === "text").map((part) => String(part.text ?? "")).join("\n");
     \\}
+    \\function toolParameters(tool) {
+    \\  return tool.parameters ?? tool.parametersJsonSchema ?? tool.schema ?? { type: "object", properties: {}, additionalProperties: true };
+    \\}
+    \\function toolSummary(tool) {
+    \\  return {
+    \\    name: String(tool.name),
+    \\    description: String(tool.description ?? tool.label ?? tool.name),
+    \\    parameters: toolParameters(tool),
+    \\  };
+    \\}
+    \\function normalizeToolResult(result) {
+    \\  if (result === undefined || result === null) return { content: [{ type: "text", text: "" }], contentText: "", isError: false, terminate: false };
+    \\  const content = result.content !== undefined ? result.content : [{ type: "text", text: String(result) }];
+    \\  const text = Array.isArray(content) ? contentText(content) : String(content ?? "");
+    \\  return { content, contentText: text, isError: Boolean(result.isError), terminate: Boolean(result.terminate) };
+    \\}
     \\(async () => {
     \\  for (const extensionPath of payload.extensions || []) await loadExtension(extensionPath);
     \\  const event = payload.event;
+    \\  if (event?.type === "discover_tools") {
+    \\    process.stdout.write(JSON.stringify({ tools: registeredTools.map(toolSummary) }) + "\n");
+    \\    return;
+    \\  }
+    \\  if (event?.type === "execute_tool") {
+    \\    const tool = registeredTools.slice().reverse().find((candidate) => candidate.name === event.toolName);
+    \\    if (!tool || typeof tool.execute !== "function") throw new Error(`Extension tool not found: ${event.toolName}`);
+    \\    process.stdout.write(JSON.stringify(normalizeToolResult(await tool.execute(event.toolCallId, event.input ?? {}, undefined, undefined, ctx))) + "\n");
+    \\    return;
+    \\  }
     \\  const eventHandlers = handlers.get(event?.type) || [];
     \\  if (eventHandlers.length === 0) {
     \\    process.stdout.write("null\n");
@@ -345,4 +503,50 @@ test "extension hook runner blocks and rewrites tool calls" {
     try std.testing.expectEqualStrings("patched result", after.content.?);
     try std.testing.expect(after.is_error.?);
     try std.testing.expect(after.terminate.?);
+}
+
+test "extension runner discovers and executes registered tools" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-tool-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const extension_path = fixture_dir ++ "/tool.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerTool({
+        \\    name: "hello_ext",
+        \\    label: "Hello Ext",
+        \\    description: "Greet through an extension tool",
+        \\    parameters: {
+        \\      type: "object",
+        \\      properties: { name: { type: "string" } },
+        \\      required: ["name"],
+        \\      additionalProperties: false
+        \\    },
+        \\    execute: async (_toolCallId, params) => ({
+        \\      content: [{ type: "text", text: `hello ${params.name}` }],
+        \\      isError: false
+        \\    })
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const definitions = try runner.discoverToolDefinitions();
+    defer runner.deinitToolDefinitions(definitions);
+    try std.testing.expectEqual(@as(usize, 1), definitions.len);
+    try std.testing.expectEqualStrings("hello_ext", definitions[0].name);
+    try std.testing.expectEqualStrings("Greet through an extension tool", definitions[0].description);
+    try std.testing.expect(std.mem.indexOf(u8, definitions[0].parameters_json, "\"required\":[\"name\"]") != null);
+
+    var call = ai_client.ChatToolCall{
+        .id = try allocator.dupe(u8, "call_ext_1"),
+        .name = try allocator.dupe(u8, "hello_ext"),
+        .arguments_json = try allocator.dupe(u8, "{\"name\":\"world\"}"),
+    };
+    defer call.deinit(allocator);
+    const result = try runner.runRegisteredTool(call);
+    defer allocator.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("hello world", result.content);
 }

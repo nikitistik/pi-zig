@@ -719,6 +719,12 @@ fn buildPrintResponse(
         .extension_paths = if (parsed.no_extensions) &.{} else parsed.extensions[0..parsed.extensions_len],
     };
     const has_extension_hooks = hooks.hasExtensions();
+    var extension_tool_definitions: []ai_client.ChatToolDefinition = if (has_extension_hooks)
+        try hooks.discoverToolDefinitions()
+    else
+        &.{};
+    extension_tool_definitions = try filterExtensionToolDefinitions(allocator, parsed, extension_tool_definitions);
+    defer if (extension_tool_definitions.len > 0) hooks.deinitToolDefinitions(extension_tool_definitions);
 
     return agent.runPrompt(io, allocator, env, .{
         .provider = provider,
@@ -731,6 +737,9 @@ fn buildPrintResponse(
         .shell_path = shell_settings.shell_path,
         .shell_command_prefix = shell_settings.shell_command_prefix,
         .tool_set = toolSetFromParsed(parsed),
+        .custom_tools = extension_tool_definitions,
+        .custom_tool_context = if (extension_tool_definitions.len > 0) &hooks else null,
+        .execute_custom_tool = if (extension_tool_definitions.len > 0) extension_runner.Runner.executeRegisteredTool else null,
         .stream_turns = stream_turns,
         .tool_event_context = tool_event_context,
         .on_tool_start = on_tool_start,
@@ -764,6 +773,42 @@ fn toolSetFromParsed(parsed: cli.ParsedArgs) agent.ToolSet {
         };
     }
     return .all;
+}
+
+fn filterExtensionToolDefinitions(
+    allocator: std.mem.Allocator,
+    parsed: cli.ParsedArgs,
+    definitions: []ai_client.ChatToolDefinition,
+) ![]ai_client.ChatToolDefinition {
+    if (definitions.len == 0) return &.{};
+    var kept: std.ArrayList(ai_client.ChatToolDefinition) = .empty;
+    errdefer {
+        for (kept.items) |definition| {
+            allocator.free(definition.name);
+            allocator.free(definition.description);
+            allocator.free(definition.parameters_json);
+        }
+        kept.deinit(allocator);
+    }
+    for (definitions) |definition| {
+        if (extensionToolAllowed(parsed, definition.name)) {
+            try kept.append(allocator, definition);
+        } else {
+            allocator.free(definition.name);
+            allocator.free(definition.description);
+            allocator.free(definition.parameters_json);
+        }
+    }
+    allocator.free(definitions);
+    if (kept.items.len == 0) return &.{};
+    return kept.toOwnedSlice(allocator);
+}
+
+fn extensionToolAllowed(parsed: cli.ParsedArgs, name: []const u8) bool {
+    if (parsed.no_tools) return false;
+    const raw = parsed.tools orelse return true;
+    if (toolListContains(raw, "*") or toolListContains(raw, "all")) return true;
+    return toolListContains(raw, name);
 }
 
 fn buildPromptContentParts(

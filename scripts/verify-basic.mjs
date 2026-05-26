@@ -693,6 +693,35 @@ const server = http.createServer((req, res) => {
       ]);
       return;
     }
+    if (user.includes('extension registered tool')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected extension registered tool stream request' }));
+        return;
+      }
+      if (!hasTool('ext_echo')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing extension tool definition', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_extension_tool_1', type: 'function', function: { name: 'ext_echo', arguments: JSON.stringify({ value: 'registered-ok' }) } }] } }] }
+        ]);
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_extension_tool_1' || toolOutput !== 'ext-echo: registered-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'extension registered tool did not execute', toolMessages }));
+        return;
+      }
+      writeStreamEvents([
+        { choices: [{ delta: { content: 'extension tool ' } }] },
+        { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
+      ]);
+      return;
+    }
     if (user.includes('multi tool loop')) {
       const requiredTools = ['read', 'ls', 'grep', 'find', 'write', 'edit'];
       const missingTools = requiredTools.filter((name) => !hasTool(name));
@@ -2835,6 +2864,26 @@ export default function(pi) {
   });
 }
 `);
+  const extensionToolPath = path.join(extensionHookFixture, 'tool.mjs');
+  fs.writeFileSync(extensionToolPath, `
+export default function(pi) {
+  pi.registerTool({
+    name: "ext_echo",
+    label: "Extension Echo",
+    description: "Echo a value through an explicit extension tool",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false
+    },
+    execute: async (_toolCallId, params) => ({
+      content: [{ type: "text", text: "ext-echo: " + params.value }],
+      isError: false
+    })
+  });
+}
+`);
   const providerPrint = run(
     [
       '--provider', 'openai',
@@ -3106,6 +3155,25 @@ export default function(pi) {
     !providerJsonExtensionHookLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension hook complete: extension-result-patched'))
   ) {
     throw new Error('top-level JSON mode smoke did not bind explicit extension tool_call/tool_result hooks');
+  }
+
+  const providerJsonExtensionToolLines = run(
+    ['--mode', 'json', '--no-session', '--extension', extensionToolPath, '--provider', 'openai', '--model', 'mock-json-extension-tool-model', '-p', 'please run extension registered tool'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonExtensionToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'ext_echo' && line.toolCallId === 'call_extension_tool_1') ||
+    !providerJsonExtensionToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_echo' && JSON.stringify(line.result).includes('ext-echo: registered-ok')) ||
+    !providerJsonExtensionToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_tool_1' && JSON.stringify(result).includes('ext-echo: registered-ok'))) ||
+    !providerJsonExtensionToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'extension tool ') ||
+    !providerJsonExtensionToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension tool complete: ext-echo: registered-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not expose and execute an explicit registered extension tool');
   }
 
   const providerJsonResponsesToolLines = run(
