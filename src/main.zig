@@ -139,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "tool-write")) {
         if (args.len < 4) return usage(init.io);
-        return pi.tools.writeFile(init.io, args[2], args[3]);
+        return pi.tools.writeFileForTool(init.io, args[2], args[3]);
     }
 
     if (std.mem.eql(u8, command, "tool-edit")) {

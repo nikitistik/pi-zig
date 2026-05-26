@@ -1573,10 +1573,13 @@ if (!findLarge.includes('50.0KB limit reached')) {
   throw new Error('tool-find smoke did not report byte truncation notice');
 }
 
-run(['tool-write', 'zig-out/pi-zig-tool-write-smoke.txt', 'pi-zig write smoke']);
-const written = run(['tool-read', 'zig-out/pi-zig-tool-write-smoke.txt']);
+const writeOutput = run(['tool-write', 'zig-out/pi-zig-tool-write-smoke/nested/write.txt', 'pi-zig write smoke']);
+if (!writeOutput.includes('Successfully wrote 18 bytes to zig-out/pi-zig-tool-write-smoke/nested/write.txt')) {
+  throw new Error('tool-write smoke did not report bytes written');
+}
+const written = run(['tool-read', 'zig-out/pi-zig-tool-write-smoke/nested/write.txt']);
 if (written !== 'pi-zig write smoke') {
-  throw new Error('tool-write smoke did not round-trip content');
+  throw new Error('tool-write smoke did not create parent directories and round-trip content');
 }
 
 run(['tool-write', 'zig-out/pi-zig-tool-edit-smoke.txt', 'alpha beta']);

@@ -86,7 +86,18 @@ pub fn readFileForTool(io: std.Io, allocator: std.mem.Allocator, path: []const u
 }
 
 pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
+}
+
+pub fn writeFileForTool(io: std.Io, path: []const u8, content: []const u8) !void {
+    try writeFile(io, path, content);
+
+    var buf: [512]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buf);
+    const w = &writer.interface;
+    try w.print("Successfully wrote {d} bytes to {s}\n", .{ content.len, path });
+    try w.flush();
 }
 
 const ListEntry = struct {
