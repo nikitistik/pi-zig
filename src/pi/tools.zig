@@ -94,6 +94,11 @@ const ListEntry = struct {
     is_dir: bool,
 };
 
+const FindEntry = struct {
+    path: []u8,
+    is_dir: bool,
+};
+
 pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit: usize) !void {
     const effective_limit = if (limit == 0) default_ls_limit else limit;
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
@@ -145,33 +150,67 @@ pub fn findFiles(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, 
     var walker = try dir.walk(allocator);
     defer walker.deinit();
 
-    var buf: [4096]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io, &buf);
-    const w = &writer.interface;
+    var entries: std.ArrayList(FindEntry) = .empty;
+    defer {
+        for (entries.items) |entry| allocator.free(entry.path);
+        entries.deinit(allocator);
+    }
 
-    var matched: usize = 0;
     var limit_reached = false;
     while (try walker.next(io)) |entry| {
         if (entry.kind == .directory and shouldSkipFindDir(entry.basename)) {
             walker.leave(io);
             continue;
         }
-        if (entry.kind != .file) continue;
+        if (entry.kind != .file and entry.kind != .directory) continue;
         if (!matchesGlob(pattern, entry.path)) continue;
 
-        if (matched >= effective_limit) {
+        if (entries.items.len >= effective_limit) {
             limit_reached = true;
             break;
         }
-        try writePosixPath(w, entry.path);
-        try w.writeByte('\n');
-        matched += 1;
+        try entries.append(allocator, .{
+            .path = try allocator.dupe(u8, entry.path),
+            .is_dir = entry.kind == .directory,
+        });
+    }
+    if (entries.items.len >= effective_limit) limit_reached = true;
+
+    if (entries.items.len == 0) {
+        try std.Io.File.stdout().writeStreamingAll(io, "No files found matching pattern\n");
+        return;
     }
 
-    if (matched == 0) {
-        try w.writeAll("No files found matching pattern\n");
-    } else if (limit_reached) {
-        try w.print("\n[{d} results limit reached. Increase the limit or refine pattern]\n", .{effective_limit});
+    std.mem.sort(FindEntry, entries.items, {}, lessThanFindEntry);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    for (entries.items, 0..) |entry, index| {
+        if (index != 0) try out.writer.writeByte('\n');
+        try writePosixPath(&out.writer, entry.path);
+        if (entry.is_dir) try out.writer.writeByte('/');
+    }
+
+    const truncation = try truncateHead(allocator, out.written(), std.math.maxInt(usize), default_read_max_bytes);
+    defer allocator.free(truncation.content);
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buf);
+    const w = &writer.interface;
+    try w.writeAll(truncation.content);
+    if (limit_reached or truncation.truncated) {
+        var notice_count: usize = 0;
+        try w.writeAll("\n\n[");
+        if (limit_reached) {
+            try w.print("{d} results limit reached. Use limit={d} for more, or refine pattern", .{ effective_limit, effective_limit * 2 });
+            notice_count += 1;
+        }
+        if (truncation.truncated) {
+            if (notice_count != 0) try w.writeAll(". ");
+            try writeSize(w, default_read_max_bytes);
+            try w.writeAll(" limit reached");
+        }
+        try w.writeByte(']');
     }
     try w.flush();
 }
@@ -451,6 +490,10 @@ fn lessThanListEntry(_: void, left: ListEntry, right: ListEntry) bool {
     return std.mem.lessThan(u8, left.name, right.name);
 }
 
+fn lessThanFindEntry(_: void, left: FindEntry, right: FindEntry) bool {
+    return std.mem.lessThan(u8, left.path, right.path);
+}
+
 fn lessThanAsciiIgnoreCase(left: []const u8, right: []const u8) bool {
     var index: usize = 0;
     while (index < left.len and index < right.len) : (index += 1) {
@@ -722,31 +765,46 @@ fn basename(path: []const u8) []const u8 {
 }
 
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
-    var p: usize = 0;
-    var t: usize = 0;
-    var star: ?usize = null;
-    var star_match: usize = 0;
+    if (pattern.len == 0) return text.len == 0;
 
-    while (t < text.len) {
-        if (p < pattern.len and (pattern[p] == '?' or pattern[p] == text[t])) {
-            p += 1;
-            t += 1;
-        } else if (p < pattern.len and pattern[p] == '*') {
-            while (p < pattern.len and pattern[p] == '*') p += 1;
-            if (p == pattern.len) return true;
-            star = p - 1;
-            star_match = t;
-        } else if (star) |star_index| {
-            p = star_index + 1;
-            star_match += 1;
-            t = star_match;
-        } else {
-            return false;
+    if (std.mem.startsWith(u8, pattern, "**/")) {
+        const rest = pattern[3..];
+        if (wildcardMatch(rest, text)) return true;
+        for (text, 0..) |byte, index| {
+            if (byte == '/' and wildcardMatch(rest, text[index + 1 ..])) return true;
         }
+        return false;
     }
 
-    while (p < pattern.len and pattern[p] == '*') p += 1;
-    return p == pattern.len;
+    if (std.mem.startsWith(u8, pattern, "**")) {
+        var rest_start: usize = 2;
+        while (rest_start < pattern.len and pattern[rest_start] == '*') rest_start += 1;
+        const rest = pattern[rest_start..];
+        if (rest.len == 0) return true;
+        var index: usize = 0;
+        while (index <= text.len) : (index += 1) {
+            if (wildcardMatch(rest, text[index..])) return true;
+        }
+        return false;
+    }
+
+    if (pattern[0] == '*') {
+        var rest_start: usize = 1;
+        while (rest_start < pattern.len and pattern[rest_start] == '*') rest_start += 1;
+        const rest = pattern[rest_start..];
+        if (rest.len == 0) return std.mem.indexOfScalar(u8, text, '/') == null;
+
+        var index: usize = 0;
+        while (index <= text.len) : (index += 1) {
+            if (index > 0 and text[index - 1] == '/') break;
+            if (wildcardMatch(rest, text[index..])) return true;
+        }
+        return false;
+    }
+
+    if (text.len == 0) return false;
+    if (pattern[0] == '?' or pattern[0] == text[0]) return wildcardMatch(pattern[1..], text[1..]);
+    return false;
 }
 
 fn writePosixPath(w: *std.Io.Writer, value: []const u8) !void {
@@ -758,6 +816,9 @@ fn writePosixPath(w: *std.Io.Writer, value: []const u8) !void {
 test "glob matching supports basename and path suffix patterns" {
     try std.testing.expect(matchesGlob("*.zig", "src/pi/tools.zig"));
     try std.testing.expect(matchesGlob("src/*.tsx", "frontend/src/main.tsx"));
+    try std.testing.expect(matchesGlob("src/**/*.tsx", "frontend/src/main.tsx"));
+    try std.testing.expect(matchesGlob("src/**/*.tsx", "frontend/src/routes/main.tsx"));
+    try std.testing.expect(!matchesGlob("src/*.tsx", "frontend/src/routes/main.tsx"));
     try std.testing.expect(!matchesGlob("*.md", "src/main.zig"));
 }
 

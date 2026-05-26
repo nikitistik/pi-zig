@@ -1527,6 +1527,51 @@ const find = run(['tool-find', 'README.md', '.', '20']);
 if (!find.split('\n').includes('README.md')) {
   throw new Error('tool-find smoke did not find README.md');
 }
+const findFixture = 'zig-out/pi-zig-find-fixture';
+fs.rmSync(findFixture, { recursive: true, force: true });
+fs.mkdirSync(path.join(findFixture, 'src/nested'), { recursive: true });
+fs.mkdirSync(path.join(findFixture, 'docs'), { recursive: true });
+fs.writeFileSync(path.join(findFixture, 'src/a.ts'), '');
+fs.writeFileSync(path.join(findFixture, 'src/nested/b.ts'), '');
+fs.writeFileSync(path.join(findFixture, 'src/nested/c.js'), '');
+fs.writeFileSync(path.join(findFixture, 'docs/a.ts'), '');
+const findPathPattern = run(['tool-find', 'src/**/*.ts', findFixture, '10']);
+if (
+  !findPathPattern.split('\n').includes('src/a.ts') ||
+  !findPathPattern.split('\n').includes('src/nested/b.ts') ||
+  findPathPattern.includes('docs/a.ts') ||
+  findPathPattern.includes('src/nested/c.js')
+) {
+  throw new Error('tool-find path glob smoke did not match upstream-style path-containing patterns');
+}
+const findDirectory = run(['tool-find', 'nested', findFixture, '10']);
+if (!findDirectory.split('\n').includes('src/nested/')) {
+  throw new Error('tool-find smoke did not include matching directories with trailing slash');
+}
+fs.writeFileSync(path.join(findFixture, 'one.txt'), '');
+fs.writeFileSync(path.join(findFixture, 'two.txt'), '');
+fs.writeFileSync(path.join(findFixture, 'three.txt'), '');
+const findLimit = run(['tool-find', '*.txt', findFixture, '2']);
+if (!findLimit.includes('[2 results limit reached. Use limit=4 for more, or refine pattern]')) {
+  throw new Error('tool-find smoke did not report upstream-style result limit notice');
+}
+const findLargeFixture = 'zig-out/pi-zig-find-large-fixture';
+fs.rmSync(findLargeFixture, { recursive: true, force: true });
+fs.mkdirSync(path.join(findLargeFixture, 'very-long-directory-name-for-byte-truncation'), { recursive: true });
+for (let index = 0; index < 760; index += 1) {
+  fs.writeFileSync(
+    path.join(
+      findLargeFixture,
+      'very-long-directory-name-for-byte-truncation',
+      `entry-${String(index).padStart(4, '0')}-find-byte-truncation-smoke.log`
+    ),
+    ''
+  );
+}
+const findLarge = run(['tool-find', '*.log', findLargeFixture, '1000']);
+if (!findLarge.includes('50.0KB limit reached')) {
+  throw new Error('tool-find smoke did not report byte truncation notice');
+}
 
 run(['tool-write', 'zig-out/pi-zig-tool-write-smoke.txt', 'pi-zig write smoke']);
 const written = run(['tool-read', 'zig-out/pi-zig-tool-write-smoke.txt']);
