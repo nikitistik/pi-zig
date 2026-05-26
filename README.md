@@ -75,6 +75,9 @@ printf '{"type":"get_commands"}\n' | zig build run -- --mode rpc --session zig-o
 zig build run -- -p "hello top-level print"
 zig build run -- --mode json --session zig-out/pi-zig-json-session.jsonl -p "hello json"
 printf '{"type":"get_state"}\n' | zig build run -- --mode rpc --session zig-out/pi-zig-rpc-mode-session.jsonl
+zig build run -- --session-dir zig-out/pi-zig-sessions -p "session first"
+zig build run -- --session-dir zig-out/pi-zig-sessions --continue -p "session second"
+zig build run -- --session-dir zig-out/pi-zig-forks --fork zig-out/pi-zig-sessions/<session>.jsonl -p "fork prompt"
 printf '{"type":"bash","command":"printf rpc-bash"}\n{"type":"get_messages"}\n' | zig build run -- rpc zig-out/pi-zig-session.jsonl
 printf '{"type":"get_state"}\n{"type":"get_messages"}\n' | zig build run -- rpc zig-out/pi-zig-session.jsonl
 printf '{"type":"switch_session","sessionPath":"zig-out/pi-zig-session.jsonl"}\n{"type":"get_state"}\n' | zig build run -- rpc zig-out/pi-zig-switch-driver.jsonl

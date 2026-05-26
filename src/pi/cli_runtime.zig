@@ -52,13 +52,15 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         return;
     }
 
+    try validateSessionFlags(init.io, parsed);
+
     const mode = parsed.mode orelse cli.Mode.text;
     if (mode == .rpc) {
         if (parsed.file_args_len > 0) {
             try writeStderr(init.io, "Error: @file arguments are not supported in RPC mode.\n");
             return error.InvalidCliArguments;
         }
-        const path = try resolveSessionPath(init.gpa, parsed);
+        const path = try resolveSessionPath(init.io, init.gpa, init.environ_map, parsed);
         defer path.deinit(init.gpa);
         return rpc.run(init.io, init.gpa, path.path, commandOptionsFromParsed(init, &parsed));
     }
@@ -72,8 +74,8 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     }
 
     return switch (mode) {
-        .json => runJsonPrintFoundation(init.io, init.gpa, parsed, prompt.text),
-        .text => runTextPrintFoundation(init.io, init.gpa, parsed, prompt.text),
+        .json => runJsonPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text),
+        .text => runTextPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text),
         .rpc => unreachable,
     };
 }
@@ -88,8 +90,11 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
         \\Top-level options:
         \\  --mode <text|json|rpc>        Output mode; rpc reads JSONL commands from stdin
         \\  --print, -p [prompt]          Non-interactive text mode
-        \\  --session <path>              Use a specific session JSONL file
-        \\  --session-dir <dir>           Store the default foundation session under a directory
+        \\  --session <path|id>           Use a session JSONL file or id prefix
+        \\  --session-dir <dir>           Store and look up sessions under a directory
+        \\  --continue, -c                Continue the newest session in the session directory
+        \\  --resume, -r                  Foundation alias for newest session lookup
+        \\  --fork <path|id>              Fork a session into the current session directory
         \\  --no-session                  Do not persist prompt-mode messages
         \\  --provider <name>             Provider name parsed for upstream CLI parity
         \\  --model <pattern>             Model pattern parsed for upstream CLI parity
@@ -119,8 +124,14 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
     );
 }
 
-fn runTextPrintFoundation(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs, prompt: []const u8) !void {
-    var store = try maybeOpenStore(io, allocator, parsed);
+fn runTextPrintFoundation(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+    prompt: []const u8,
+) !void {
+    var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
@@ -136,8 +147,14 @@ fn runTextPrintFoundation(io: std.Io, allocator: std.mem.Allocator, parsed: cli.
     try writeStdout(io, "\n");
 }
 
-fn runJsonPrintFoundation(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs, prompt: []const u8) !void {
-    var store = try maybeOpenStore(io, allocator, parsed);
+fn runJsonPrintFoundation(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+    prompt: []const u8,
+) !void {
+    var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
@@ -180,21 +197,157 @@ fn runJsonPrintFoundation(io: std.Io, allocator: std.mem.Allocator, parsed: cli.
     try w.flush();
 }
 
-fn maybeOpenStore(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !?session.PersistentStore {
+fn maybeOpenStore(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+) !?session.PersistentStore {
     if (parsed.no_session) return null;
-    const path = try resolveSessionPath(allocator, parsed);
+    const path = try resolveSessionPath(io, allocator, env, parsed);
     defer path.deinit(allocator);
     const store = try session.PersistentStore.init(io, allocator, path.path);
     return store;
 }
 
-fn resolveSessionPath(allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !PathResult {
-    if (parsed.session) |path| return .{ .path = path };
-    if (parsed.session_dir) |dir| {
-        const path = try std.fs.path.join(allocator, &.{ dir, "pi-zig-session.jsonl" });
+fn resolveSessionPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+) !PathResult {
+    const cwd = try currentPathOwned(io, allocator);
+    defer allocator.free(cwd);
+
+    const session_dir = try resolveSessionDir(io, allocator, env, cwd, parsed.session_dir);
+    defer allocator.free(session_dir);
+
+    if (parsed.fork) |source| {
+        const source_path = try resolveSessionArg(io, allocator, env, cwd, session_dir, source) orelse {
+            try writeStderr(io, "No session found matching '");
+            try writeStderr(io, source);
+            try writeStderr(io, "'.\n");
+            std.process.exit(1);
+        };
+        defer allocator.free(source_path);
+        const forked_path = session.forkFromFile(io, allocator, source_path, session_dir, cwd) catch |err| {
+            try writeStderr(io, "Error: ");
+            try writeStderr(io, @errorName(err));
+            try writeStderr(io, "\n");
+            std.process.exit(1);
+        };
+        return .{ .path = forked_path, .owned = true };
+    }
+
+    if (parsed.session) |arg| {
+        const path = try resolveSessionArg(io, allocator, env, cwd, session_dir, arg) orelse {
+            try writeStderr(io, "No session found matching '");
+            try writeStderr(io, arg);
+            try writeStderr(io, "'.\n");
+            std.process.exit(1);
+        };
+        return .{ .path = path, .owned = true };
+    }
+
+    if (parsed.continue_session or parsed.resume_session) {
+        if (try session.findMostRecentSession(io, allocator, session_dir)) |path| {
+            return .{ .path = path, .owned = true };
+        }
+        const path = try session.newSessionPath(io, allocator, session_dir);
+        return .{ .path = path, .owned = true };
+    }
+
+    if (parsed.session_dir != null) {
+        const path = try session.newSessionPath(io, allocator, session_dir);
         return .{ .path = path, .owned = true };
     }
     return .{ .path = session.default_session_file };
+}
+
+fn validateSessionFlags(io: std.Io, parsed: cli.ParsedArgs) !void {
+    if (parsed.fork == null) return;
+    var conflicts: [4][]const u8 = undefined;
+    var len: usize = 0;
+    if (parsed.session != null) {
+        conflicts[len] = "--session";
+        len += 1;
+    }
+    if (parsed.continue_session) {
+        conflicts[len] = "--continue";
+        len += 1;
+    }
+    if (parsed.resume_session) {
+        conflicts[len] = "--resume";
+        len += 1;
+    }
+    if (parsed.no_session) {
+        conflicts[len] = "--no-session";
+        len += 1;
+    }
+    if (len == 0) return;
+    try writeStderr(io, "Error: --fork cannot be combined with ");
+    for (conflicts[0..len], 0..) |flag, index| {
+        if (index != 0) try writeStderr(io, ", ");
+        try writeStderr(io, flag);
+    }
+    try writeStderr(io, "\n");
+    std.process.exit(1);
+}
+
+fn resolveSessionDir(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    explicit_dir: ?[]const u8,
+) ![]u8 {
+    if (explicit_dir) |dir| return resolveLocalPath(allocator, env, cwd, dir);
+    return session.defaultSessionDir(io, allocator, env, cwd);
+}
+
+fn resolveSessionArg(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    session_dir: []const u8,
+    arg: []const u8,
+) !?[]u8 {
+    if (looksLikeSessionPath(arg)) {
+        const path = try resolveLocalPath(allocator, env, cwd, arg);
+        return path;
+    }
+    return session.findSessionByIdPrefix(io, allocator, session_dir, arg);
+}
+
+fn looksLikeSessionPath(value: []const u8) bool {
+    return std.mem.indexOfScalar(u8, value, '/') != null or
+        std.mem.indexOfScalar(u8, value, '\\') != null or
+        std.mem.endsWith(u8, value, ".jsonl");
+}
+
+fn resolveLocalPath(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    path: []const u8,
+) ![]u8 {
+    const expanded = try expandMaybeTilde(allocator, env, path);
+    defer allocator.free(expanded);
+    if (std.fs.path.isAbsolute(expanded)) return std.fs.path.resolve(allocator, &.{expanded});
+    return std.fs.path.resolve(allocator, &.{ cwd, expanded });
+}
+
+fn expandMaybeTilde(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8) ![]u8 {
+    if (std.mem.eql(u8, path, "~")) return allocator.dupe(u8, env.get("HOME") orelse ".");
+    if (std.mem.startsWith(u8, path, "~/")) return std.fs.path.join(allocator, &.{ env.get("HOME") orelse ".", path[2..] });
+    return allocator.dupe(u8, path);
+}
+
+fn currentPathOwned(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try std.process.currentPath(io, &buf);
+    return allocator.dupe(u8, buf[0..len]);
 }
 
 fn buildPrompt(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !PromptResult {

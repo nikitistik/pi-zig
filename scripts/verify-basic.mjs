@@ -1310,6 +1310,40 @@ const topLevelJsonSession = fs.readFileSync(topLevelJsonSessionFile, 'utf8');
 if (!topLevelJsonSession.includes('"role":"user","content":"hello json mode"') || !topLevelJsonSession.includes('"role":"assistant"')) {
   throw new Error('top-level --mode json smoke did not persist user and assistant foundation messages');
 }
+const topLevelSessionFixture = path.resolve('zig-out/pi-zig-top-level-session-fixture');
+const topLevelSessionDir = path.join(topLevelSessionFixture, 'sessions');
+const topLevelForkDir = path.join(topLevelSessionFixture, 'forks');
+fs.rmSync(topLevelSessionFixture, { recursive: true, force: true });
+run(['--session-dir', topLevelSessionDir, '-p', 'session first']);
+let sessionFiles = fs.readdirSync(topLevelSessionDir).filter((file) => file.endsWith('.jsonl')).sort();
+if (sessionFiles.length !== 1) {
+  throw new Error('top-level --session-dir smoke did not create one timestamped session file');
+}
+const firstSessionFile = path.join(topLevelSessionDir, sessionFiles[0]);
+const firstSessionId = JSON.parse(fs.readFileSync(firstSessionFile, 'utf8').split('\n')[0]).id;
+run(['--session-dir', topLevelSessionDir, '--continue', '-p', 'session second']);
+sessionFiles = fs.readdirSync(topLevelSessionDir).filter((file) => file.endsWith('.jsonl')).sort();
+if (sessionFiles.length !== 1) {
+  throw new Error('top-level --continue smoke did not reuse the most recent session file');
+}
+run(['--session-dir', topLevelSessionDir, '--session', firstSessionId.slice(0, 14), '-p', 'session third']);
+const continuedSession = fs.readFileSync(firstSessionFile, 'utf8');
+if (!continuedSession.includes('session first') || !continuedSession.includes('session second') || !continuedSession.includes('session third')) {
+  throw new Error('top-level session lookup smoke did not append through --continue and --session id prefix');
+}
+run(['--session-dir', topLevelForkDir, '--fork', firstSessionFile, '-p', 'fork prompt']);
+const forkFiles = fs.readdirSync(topLevelForkDir).filter((file) => file.endsWith('.jsonl'));
+if (forkFiles.length !== 1) {
+  throw new Error('top-level --fork smoke did not create one forked session file');
+}
+const forkedSession = fs.readFileSync(path.join(topLevelForkDir, forkFiles[0]), 'utf8');
+if (!forkedSession.includes(`"parentSession":"${firstSessionFile}"`) || !forkedSession.includes('session first') || !forkedSession.includes('session third') || !forkedSession.includes('fork prompt')) {
+  throw new Error('top-level --fork smoke did not copy source history and parentSession into the fork');
+}
+const forkConflict = runFail(['--fork', firstSessionFile, '--session', firstSessionFile, '-p', 'bad fork']);
+if (!forkConflict.stderr.includes('--fork cannot be combined with --session')) {
+  throw new Error('top-level --fork conflict smoke did not reject incompatible session flags');
+}
 const topLevelExportFile = 'zig-out/pi-zig-top-level-export.html';
 fs.rmSync(topLevelExportFile, { force: true });
 const topLevelExportOutput = run(['--export', topLevelJsonSessionFile, topLevelExportFile]);
@@ -1322,6 +1356,7 @@ if (!topLevelExportHtml.includes('pi-zig session') || !topLevelExportHtml.includ
 }
 
 const topLevelRpcSessionFile = 'zig-out/pi-zig-top-level-rpc-smoke.jsonl';
+const topLevelRpcSessionPath = path.resolve(topLevelRpcSessionFile);
 fs.rmSync(topLevelRpcSessionFile, { force: true });
 const topLevelRpcOutput = run(
   ['--mode', 'rpc', '--session', topLevelRpcSessionFile],
@@ -1331,7 +1366,7 @@ const topLevelRpcResponse = topLevelRpcOutput.trim().split('\n').filter(Boolean)
 if (
   topLevelRpcResponse?.id !== 'top-rpc' ||
   topLevelRpcResponse?.command !== 'get_state' ||
-  topLevelRpcResponse?.data?.sessionFile !== topLevelRpcSessionFile
+  topLevelRpcResponse?.data?.sessionFile !== topLevelRpcSessionPath
 ) {
   throw new Error('top-level --mode rpc smoke did not route to RPC runtime with --session');
 }

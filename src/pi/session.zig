@@ -6,6 +6,7 @@ pub const default_session_file = "zig-out/pi-zig-session.jsonl";
 const max_path_bytes = std.Io.Dir.max_path_bytes;
 const max_session_id_bytes = 96;
 const max_entry_id_bytes = 32;
+const max_header_bytes = 4096;
 
 pub const SessionState = struct {
     id: []const u8,
@@ -455,6 +456,173 @@ pub fn exportHtmlFromFile(
     return output_path;
 }
 
+pub fn defaultSessionDir(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+) ![]u8 {
+    _ = io;
+    const agent_dir = try agentDir(allocator, env);
+    defer allocator.free(agent_dir);
+
+    var safe: std.Io.Writer.Allocating = .init(allocator);
+    defer safe.deinit();
+    const w = &safe.writer;
+    try w.writeAll("--");
+    var start: usize = 0;
+    while (start < cwd.len and (cwd[start] == '/' or cwd[start] == '\\')) : (start += 1) {}
+    for (cwd[start..]) |byte| {
+        switch (byte) {
+            '/', '\\', ':' => try w.writeByte('-'),
+            else => try w.writeByte(byte),
+        }
+    }
+    try w.writeAll("--");
+
+    return std.fs.path.join(allocator, &.{ agent_dir, "sessions", safe.written() });
+}
+
+pub fn newSessionPath(io: std.Io, allocator: std.mem.Allocator, session_dir: []const u8) ![]u8 {
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+    const now = std.Io.Clock.real.now(io).nanoseconds;
+    return std.fmt.allocPrint(allocator, "{s}/{d}_pi-zig-{d}.jsonl", .{ session_dir, now, now });
+}
+
+pub fn findMostRecentSession(io: std.Io, allocator: std.mem.Allocator, session_dir: []const u8) !?[]u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, session_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.NotDir => return null,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var best_path: ?[]u8 = null;
+    var best_mtime: i128 = std.math.minInt(i128);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const path = try std.fs.path.join(allocator, &.{ session_dir, entry.name });
+        errdefer allocator.free(path);
+        if (!try isValidSessionFile(io, allocator, path)) {
+            allocator.free(path);
+            continue;
+        }
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        const mtime = stat.mtime.nanoseconds;
+        if (mtime > best_mtime) {
+            if (best_path) |old| allocator.free(old);
+            best_path = path;
+            best_mtime = mtime;
+        } else {
+            allocator.free(path);
+        }
+    }
+    return best_path;
+}
+
+pub fn findSessionByIdPrefix(io: std.Io, allocator: std.mem.Allocator, session_dir: []const u8, prefix: []const u8) !?[]u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, session_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.NotDir => return null,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var best_path: ?[]u8 = null;
+    var best_mtime: i128 = std.math.minInt(i128);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const path = try std.fs.path.join(allocator, &.{ session_dir, entry.name });
+        errdefer allocator.free(path);
+        const id = (try readSessionHeaderId(io, allocator, path)) orelse {
+            allocator.free(path);
+            continue;
+        };
+        defer allocator.free(id);
+        if (!std.mem.startsWith(u8, id, prefix)) {
+            allocator.free(path);
+            continue;
+        }
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        const mtime = stat.mtime.nanoseconds;
+        if (mtime > best_mtime) {
+            if (best_path) |old| allocator.free(old);
+            best_path = path;
+            best_mtime = mtime;
+        } else {
+            allocator.free(path);
+        }
+    }
+    return best_path;
+}
+
+pub fn forkFromFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    target_session_dir: []const u8,
+    cwd: []const u8,
+) ![]u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, source_path, allocator, .limited(16 * 1024 * 1024));
+    defer allocator.free(bytes);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var saw_header = false;
+    while (lines.next()) |raw_line| {
+        const line = stripTrailingCarriageReturn(raw_line);
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return error.InvalidSessionJson;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSessionJson;
+        const entry_type = getStringFieldObject(parsed.value.object, "type") orelse return error.InvalidSessionEntry;
+        if (!std.mem.eql(u8, entry_type, "session")) return error.InvalidSessionHeader;
+        saw_header = true;
+        break;
+    }
+    if (!saw_header) return error.InvalidSessionHeader;
+
+    const output_path = try newSessionPath(io, allocator, target_session_dir);
+    errdefer allocator.free(output_path);
+    const now = std.Io.Clock.real.now(io).nanoseconds;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"type\":\"session\",\"version\":3,\"id\":");
+    try w.print("\"pi-zig-{d}\"", .{now});
+    try w.writeAll(",\"timestamp\":");
+    try writeJsonString(w, timestampString(io));
+    try w.writeAll(",\"cwd\":");
+    try writeJsonString(w, cwd);
+    try w.writeAll(",\"parentSession\":");
+    try writeJsonString(w, source_path);
+    try w.writeAll("}\n");
+
+    var copy_lines = std.mem.splitScalar(u8, bytes, '\n');
+    var skipped_header = false;
+    while (copy_lines.next()) |raw_line| {
+        const line = stripTrailingCarriageReturn(raw_line);
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        if (!skipped_header) {
+            skipped_header = true;
+            continue;
+        }
+        try w.writeAll(line);
+        try w.writeByte('\n');
+    }
+
+    try ensureParentDir(io, output_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = out.written() });
+    return output_path;
+}
+
 fn timestampString(io: std.Io) []const u8 {
     _ = io;
     return "local-foundation";
@@ -466,6 +634,45 @@ fn defaultExportPath(allocator: std.mem.Allocator, input_path: []const u8) ![]u8
         base = base[0 .. base.len - ".jsonl".len];
     }
     return std.fmt.allocPrint(allocator, "pi-zig-session-{s}.html", .{base});
+}
+
+fn agentDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
+    if (env.get("PI_CODING_AGENT_DIR")) |value| return expandMaybeTilde(allocator, env, value);
+    return std.fs.path.join(allocator, &.{ env.get("HOME") orelse ".", ".pi", "agent" });
+}
+
+fn expandMaybeTilde(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8) ![]u8 {
+    if (std.mem.eql(u8, path, "~")) return allocator.dupe(u8, env.get("HOME") orelse ".");
+    if (std.mem.startsWith(u8, path, "~/")) return std.fs.path.join(allocator, &.{ env.get("HOME") orelse ".", path[2..] });
+    return allocator.dupe(u8, path);
+}
+
+fn isValidSessionFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !bool {
+    const id = try readSessionHeaderId(io, allocator, path);
+    if (id) |value| {
+        allocator.free(value);
+        return true;
+    }
+    return false;
+}
+
+fn readSessionHeaderId(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_header_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    const newline = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
+    const first_line = stripTrailingCarriageReturn(bytes[0..newline]);
+    if (std.mem.trim(u8, first_line, " \t").len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, first_line, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const entry_type = getStringFieldObject(parsed.value.object, "type") orelse return null;
+    if (!std.mem.eql(u8, entry_type, "session")) return null;
+    const id = getStringFieldObject(parsed.value.object, "id") orelse return null;
+    const owned = try allocator.dupe(u8, id);
+    return owned;
 }
 
 fn ensureParentDir(io: std.Io, path: []const u8) !void {

@@ -50,7 +50,7 @@ const packages: PackageRow[] = [
 
 const parity: ParityRow[] = [
   { area: 'Package map', status: 'foundation', target: '4 upstream packages represented' },
-  { area: 'CLI and commands', status: 'in_progress', target: '46 flags plus top-level --list-models, -p, --mode json/rpc foundations' },
+  { area: 'CLI and commands', status: 'in_progress', target: '46 flags plus top-level --list-models, sessions, -p, json/rpc foundations' },
   { area: 'Package commands', status: 'in_progress', target: 'Local/npm/git install/list/remove plus extension update; self-update missing' },
   { area: 'Settings manager', status: 'in_progress', target: 'Global/project read, migrations, merge defaults, scoped writes, invalid JSON safety' },
   { area: 'Print and JSON modes', status: 'foundation', target: 'Top-level prompt acceptance, session persistence, JSONL event skeleton' },
@@ -60,7 +60,7 @@ const parity: ParityRow[] = [
   { area: 'Extensions', status: 'foundation', target: 'Discovery paths, manifests, filters, packages; JS/TS runner missing' },
   { area: 'Models', status: 'in_progress', target: '924 generated upstream models, fuzzy resolver, thinking suffixes' },
   { area: 'Built-in tools', status: 'in_progress', target: 'read, bash, ls, grep, find, write, edit, RPC bash smokes' },
-  { area: 'Sessions', status: 'in_progress', target: 'Durable JSONL resume, stats, names, compact, fork, clone' },
+  { area: 'Sessions', status: 'in_progress', target: 'Durable JSONL resume, id lookup, stats, names, compact, fork, clone' },
   { area: 'Resources', status: 'in_progress', target: 'Prompt/skill commands, themes, context files, system prompt assembly' },
   { area: 'HTML export', status: 'in_progress', target: 'Top-level --export plus RPC export_html local renderer' },
   { area: 'TUI renderer', status: 'not_started', target: 'Differential terminal rendering and editor' },
@@ -118,6 +118,9 @@ const commands = [
   'zig-out/bin/pi-zig -p "hello top-level print"',
   'zig-out/bin/pi-zig --mode json --session zig-out/pi-zig-json-session.jsonl -p "hello json"',
   'printf \'{"type":"get_state"}\\n\' | zig-out/bin/pi-zig --mode rpc --session zig-out/pi-zig-rpc-mode-session.jsonl',
+  'zig-out/bin/pi-zig --session-dir zig-out/pi-zig-sessions -p "session first"',
+  'zig-out/bin/pi-zig --session-dir zig-out/pi-zig-sessions --continue -p "session second"',
+  'zig-out/bin/pi-zig --session-dir zig-out/pi-zig-forks --fork zig-out/pi-zig-sessions/<session>.jsonl -p "fork prompt"',
   'zig build run -- parse-args --provider openai -p ok',
   'zig build run -- tool-read README.md',
   'zig build run -- tool-grep pi-zig README.md',
