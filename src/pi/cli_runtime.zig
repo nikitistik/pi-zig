@@ -158,7 +158,7 @@ fn runTextPrintFoundation(
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, false);
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -185,7 +185,7 @@ fn runJsonPrintFoundation(
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, true);
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -567,6 +567,7 @@ fn buildPrintResponse(
     env: *const std.process.Environ.Map,
     parsed: cli.ParsedArgs,
     prompt: []const u8,
+    stream_turns: bool,
 ) !agent.RunResult {
     if (parsed.provider == null or parsed.model == null) {
         return .{ .final_text = try buildFoundationResponse(allocator, parsed, prompt) };
@@ -595,6 +596,7 @@ fn buildPrintResponse(
         .prompt = prompt,
         .system_prompt = runtime_system_prompt,
         .tool_set = toolSetFromParsed(parsed),
+        .stream_turns = stream_turns,
     }) catch |err| {
         try writeStderr(io, "Provider request failed: ");
         try writeStderr(io, @errorName(err));

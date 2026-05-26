@@ -11,6 +11,7 @@ pub const RunOptions = struct {
     history: []const ai_client.ChatMessage = &.{},
     max_turns: usize = 8,
     tool_set: ToolSet = .all,
+    stream_turns: bool = false,
 };
 
 pub const ToolSet = struct {
@@ -205,13 +206,17 @@ pub fn runPrompt(
         const borrowed = try borrowMessages(allocator, messages.items);
         defer allocator.free(borrowed);
 
-        var response = try ai_client.runChatTurn(io, allocator, env, .{
+        const request: ai_client.ChatTurnRequest = .{
             .provider = options.provider,
             .model = options.model,
             .api_key = options.api_key,
             .messages = borrowed,
             .tools = tool_definitions,
-        });
+        };
+        var response = if (options.stream_turns)
+            try ai_client.streamChatTurn(io, allocator, env, request)
+        else
+            try ai_client.runChatTurn(io, allocator, env, request);
         defer response.deinit(allocator);
 
         if (response.tool_calls.len == 0) {

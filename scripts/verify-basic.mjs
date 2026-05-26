@@ -58,6 +58,17 @@ const server = http.createServer((req, res) => {
     const toolMessages = body.messages.filter((message) => message.role === 'tool');
     const hasTool = (name) => body.tools?.some((tool) => tool?.function?.name === name) ?? false;
     const hasBashTool = hasTool('bash');
+    const writeStreamEvents = (events) => {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'close'
+      });
+      for (const event of events) {
+        res.write('data: ' + JSON.stringify(event) + '\\n\\n');
+      }
+      res.end('data: [DONE]\\n\\n');
+    };
     if (user.includes('streaming provider json')) {
       if (body.stream !== true) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -107,6 +118,38 @@ const server = http.createServer((req, res) => {
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: 'selected tools observed' } }] }));
+      return;
+    }
+    if (user.includes('streaming tool loop')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected streaming tool request' }));
+        return;
+      }
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_stream_tool_1', type: 'function', function: { name: 'bash', arguments: '{"command":"printf ' } }] } }] },
+          { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'stream-tool-ok"}' } }] } }] }
+        ]);
+        return;
+      }
+      if (toolMessages.at(-1).tool_call_id !== 'call_stream_tool_1') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'streaming tool result did not preserve tool_call_id' }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolOutput !== 'stream-tool-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unexpected streaming tool output', toolOutput }));
+        return;
+      }
+      writeStreamEvents([{ choices: [{ delta: { content: 'streaming tool loop complete: ' + toolOutput } }] }]);
       return;
     }
     if (user.includes('multi tool loop')) {
@@ -185,6 +228,13 @@ const server = http.createServer((req, res) => {
         return;
       }
       if (toolMessages.length === 0) {
+        if (body.stream === true) {
+          writeStreamEvents([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_tool_loop_1', type: 'function', function: { name: 'bash', arguments: '{"command":"printf ' } }] } }] },
+            { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'tool-loop-ok"}' } }] } }] }
+          ]);
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
           choices: [{
@@ -215,6 +265,10 @@ const server = http.createServer((req, res) => {
         return;
       }
       const toolOutput = toolMessages.at(-1).content.trim();
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content: 'tool loop complete: ' + toolOutput } }] }]);
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         choices: [{
@@ -232,6 +286,13 @@ const server = http.createServer((req, res) => {
         return;
       }
       if (toolMessages.length === 0) {
+        if (body.stream === true) {
+          writeStreamEvents([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_failing_read_1', type: 'function', function: { name: 'read', arguments: '{"path":"zig-out/pi-zig-missing-' } }] } }] },
+            { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'provider-read.txt"}' } }] } }] }
+          ]);
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
           choices: [{
@@ -256,6 +317,10 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'expected read failure tool output', toolOutput }));
         return;
       }
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content: 'failing read loop complete: ' + toolOutput } }] }]);
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         choices: [{
@@ -278,11 +343,16 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc history observed' } }] }));
       return;
     }
+    const defaultContent = 'mock provider response for ' + body.model + ': ' + user + (system ? ' [system=' + system + ']' : '');
+    if (body.stream === true) {
+      writeStreamEvents([{ choices: [{ delta: { content: defaultContent } }] }]);
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       choices: [{
         message: {
-          content: 'mock provider response for ' + body.model + ': ' + user + (system ? ' [system=' + system + ']' : '')
+          content: defaultContent
         }
       }]
     }));
@@ -1987,6 +2057,24 @@ try {
     !providerJsonToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('tool loop complete: tool-loop-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not emit provider-backed tool execution events');
+  }
+
+  const providerJsonStreamingToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-stream-tool-model', '-p', 'please run the streaming tool loop'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonStreamingToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_stream_tool_1') ||
+    !providerJsonStreamingToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('stream-tool-ok')) ||
+    !providerJsonStreamingToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_stream_tool_1')) ||
+    !providerJsonStreamingToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('streaming tool loop complete: stream-tool-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not assemble streamed provider tool calls');
   }
 
   const providerJsonToolErrorLines = run(
