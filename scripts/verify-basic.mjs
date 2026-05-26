@@ -721,9 +721,19 @@ run(['remove', 'git:github.com/example/fake-extension', '--local'], undefined, {
 if (fs.existsSync(npmInstallPath) || fs.existsSync(gitInstallPath)) {
   throw new Error('package remove smoke did not remove managed npm and git installs');
 }
-const packageSelfUpdateFailure = runFail(['update', '--self', '--force'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
-if (packageSelfUpdateFailure.status === 0 || !packageSelfUpdateFailure.stderr.includes('self-update is not implemented yet')) {
-  throw new Error('package self-update smoke did not fail visibly for the unimplemented self updater');
+const packageSelfUpdateOutput = run(['update', '--self', '--force'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+const packageSelfUpdateRecords = fs.readFileSync(packageCommandRecord, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+if (
+  !packageSelfUpdateOutput.includes('Updated pi-zig') ||
+  !packageSelfUpdateRecords.some((record) =>
+    record.command === 'npm' &&
+    record.args[0] === 'install' &&
+    record.args.includes('-g') &&
+    record.args.includes('--ignore-scripts') &&
+    record.args.includes('@earendil-works/pi-coding-agent')
+  )
+) {
+  throw new Error('package self-update smoke did not run upstream-shaped package-manager command');
 }
 
 const authFixtureRoot = path.resolve('zig-out/pi-zig-auth-fixture');

@@ -1,7 +1,9 @@
 const std = @import("std");
+const config = @import("config.zig");
 
 const max_settings_bytes = 1024 * 1024;
 const project_settings_file = ".pi/settings.json";
+const upstream_package_name = "@earendil-works/pi-coding-agent";
 
 const Command = enum {
     install,
@@ -137,8 +139,10 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
                 try writeStdout(io, "\n");
             }
             if (options.self) {
-                try writeStderr(io, "pi-zig self-update is not implemented yet.\n");
-                std.process.exit(1);
+                try runSelfUpdate(io, allocator, env, agent_dir);
+                try writeStdout(io, "Updated ");
+                try writeStdout(io, config.app_name);
+                try writeStdout(io, "\n");
             }
             return true;
         },
@@ -923,6 +927,41 @@ fn npmBaseArgv(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
     _ = env;
     try argv.append(allocator, "npm");
     return argv;
+}
+
+fn runSelfUpdate(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+) !void {
+    var argv = try npmBaseArgv(io, allocator, env, agent_dir);
+    defer argv.deinit(allocator);
+    const manager = packageManagerName(argv.items);
+
+    if (std.mem.eql(u8, manager, "pnpm")) {
+        try argv.append(allocator, "install");
+        try argv.append(allocator, "-g");
+        try argv.append(allocator, "--ignore-scripts");
+        try argv.append(allocator, upstream_package_name);
+    } else if (std.mem.eql(u8, manager, "yarn")) {
+        try argv.append(allocator, "global");
+        try argv.append(allocator, "add");
+        try argv.append(allocator, "--ignore-scripts");
+        try argv.append(allocator, upstream_package_name);
+    } else if (std.mem.eql(u8, manager, "bun")) {
+        try argv.append(allocator, "install");
+        try argv.append(allocator, "-g");
+        try argv.append(allocator, "--ignore-scripts");
+        try argv.append(allocator, upstream_package_name);
+    } else {
+        try argv.append(allocator, "install");
+        try argv.append(allocator, "-g");
+        try argv.append(allocator, "--ignore-scripts");
+        try argv.append(allocator, upstream_package_name);
+    }
+
+    try runCommand(io, allocator, argv.items, null);
 }
 
 fn appendNpmCommandFromSettings(io: std.Io, allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), path: []const u8) !bool {

@@ -44,6 +44,7 @@ zig build run -- install --help
 zig build run -- install npm:example-package
 zig build run -- install git:github.com/user/repo --local
 zig build run -- update --extensions
+zig build run -- update --self --force
 zig build run -- auth list --json
 zig build run -- auth providers --json
 zig build run -- auth status openai --json
