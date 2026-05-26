@@ -135,6 +135,9 @@ pub fn runChatTurn(
     if (isGoogleGenerativeProvider(request.provider)) {
         return runGoogleGenerateContentTurn(io, allocator, env, request);
     }
+    if (isMistralProvider(request.provider)) {
+        return runMistralChatTurn(io, allocator, env, request);
+    }
 
     const endpoint = try endpointForProvider(allocator, env, request.provider);
     defer allocator.free(endpoint);
@@ -235,6 +238,9 @@ fn streamChatTurnData(
     if (isGoogleGenerativeProvider(request.provider)) {
         return streamGoogleGenerateContentData(io, allocator, env, request, callback_context, callback);
     }
+    if (isMistralProvider(request.provider)) {
+        return streamMistralChatData(io, allocator, env, request, callback_context, callback);
+    }
 
     const endpoint = try endpointForProvider(allocator, env, request.provider);
     defer allocator.free(endpoint);
@@ -281,10 +287,18 @@ fn streamChatTurnData(
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
+    try readDoneTerminatedSseStream(reader, callback_context, callback);
+}
+
+fn readDoneTerminatedSseStream(
+    reader: *std.Io.Reader,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
     var saw_done = false;
     while (true) {
         const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr() orelse error.ProviderResponseInvalid,
+            error.ReadFailed => return error.ProviderResponseInvalid,
             else => return err,
         };
         const line_with_cr = raw_line orelse break;
@@ -331,6 +345,10 @@ fn isAnthropicMessagesProvider(provider: []const u8) bool {
 
 fn isGoogleGenerativeProvider(provider: []const u8) bool {
     return std.mem.eql(u8, provider, "google");
+}
+
+fn isMistralProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "mistral");
 }
 
 fn runAnthropicMessagesTurn(
@@ -545,6 +563,108 @@ fn streamGoogleGenerateContentData(
     try readGoogleSseStream(reader, callback_context, callback);
 }
 
+fn runMistralChatTurn(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+) ChatCompletionError!ChatCompletionResult {
+    const endpoint = try mistralChatEndpointForProvider(allocator, env);
+    defer allocator.free(endpoint);
+
+    const payload = try buildMistralChatPayload(allocator, request, false);
+    defer allocator.free(payload);
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
+    defer allocator.free(authorization);
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const result = try client.fetch(.{
+        .location = .{ .url = endpoint },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .authorization = .{ .override = authorization },
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+        },
+    });
+
+    const body = response_body.written();
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        return error.ProviderRequestFailed;
+    }
+
+    return parseOpenAICompatibleResult(allocator, body);
+}
+
+fn streamMistralChatData(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    const endpoint = try mistralChatEndpointForProvider(allocator, env);
+    defer allocator.free(endpoint);
+
+    const payload = try buildMistralChatPayload(allocator, request, true);
+    defer allocator.free(payload);
+
+    const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
+    defer allocator.free(authorization);
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    var request_handle = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .authorization = .{ .override = authorization },
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+            .accept_encoding = .{ .override = "identity" },
+        },
+    });
+    defer request_handle.deinit();
+
+    request_handle.transfer_encoding = .{ .content_length = payload.len };
+    var body_writer = try request_handle.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try request_handle.connection.?.flush();
+
+    var response = try request_handle.receiveHead(&.{});
+    if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
+        var transfer_buffer: [1024]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        _ = reader.discardRemaining() catch {};
+        return error.ProviderRequestFailed;
+    }
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    try readDoneTerminatedSseStream(reader, callback_context, callback);
+}
+
 const AnthropicAuthHeader = struct {
     authorization: ?[]u8 = null,
     oauth: bool = false,
@@ -612,6 +732,11 @@ fn googleGenerateContentEndpointForProvider(
     const trimmed = base_url[0..end];
     const action = if (stream) "streamGenerateContent?alt=sse" else "generateContent";
     return std.fmt.allocPrint(allocator, "{s}/models/{s}:{s}", .{ trimmed, model, action });
+}
+
+fn mistralChatEndpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
+    const base_url = env.get("PI_ZIG_PROVIDER_BASE_URL") orelse "https://api.mistral.ai/v1";
+    return endpointFromBaseUrlWithPath(allocator, base_url, "/chat/completions");
 }
 
 fn endpointFromBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
@@ -733,6 +858,33 @@ fn buildGoogleGenerateContentPayload(allocator: std.mem.Allocator, request: Chat
             try writeGoogleToolDefinition(w, tool);
         }
         try w.writeAll("]}],\"toolConfig\":{\"functionCallingConfig\":{\"mode\":\"AUTO\"}}");
+    }
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn buildMistralChatPayload(allocator: std.mem.Allocator, request: ChatTurnRequest, stream: bool) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    try w.writeAll("{\"model\":");
+    try writeJsonString(w, request.model);
+    try w.writeAll(",\"stream\":");
+    try w.writeAll(if (stream) "true" else "false");
+    try w.writeAll(",\"messages\":[");
+    for (request.messages, 0..) |message, index| {
+        if (index != 0) try w.writeByte(',');
+        try writeMistralMessage(w, request.messages, index, message);
+    }
+    try w.writeByte(']');
+    if (request.tools.len > 0) {
+        try w.writeAll(",\"tools\":[");
+        for (request.tools, 0..) |tool, tool_index| {
+            if (tool_index != 0) try w.writeByte(',');
+            try writeMistralToolDefinition(w, tool);
+        }
+        try w.writeAll("],\"tool_choice\":\"auto\"");
     }
     try w.writeByte('}');
     return out.toOwnedSlice();
@@ -960,6 +1112,87 @@ fn writeGoogleToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void 
     try w.writeAll(",\"parametersJsonSchema\":");
     try w.writeAll(tool.parameters_json);
     try w.writeByte('}');
+}
+
+fn writeMistralMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: usize, message: ChatMessage) !void {
+    try w.writeAll("{\"role\":");
+    try writeJsonString(w, message.role.label());
+    if (message.role == .assistant and message.tool_calls.len > 0) {
+        try w.writeAll(",\"content\":");
+        if (message.content.len > 0) {
+            try writeJsonString(w, message.content);
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"tool_calls\":[");
+        for (message.tool_calls, 0..) |call, call_index| {
+            if (call_index != 0) try w.writeByte(',');
+            try writeMistralToolCall(w, call);
+        }
+        try w.writeByte(']');
+    } else if (message.role == .tool) {
+        const tool_call_id = message.tool_call_id orelse return error.ProviderResponseInvalid;
+        const tool_name = findToolNameForToolResult(messages, index, tool_call_id) orelse "";
+        try w.writeAll(",\"tool_call_id\":");
+        try writeJsonString(w, tool_call_id);
+        if (tool_name.len > 0) {
+            try w.writeAll(",\"name\":");
+            try writeJsonString(w, tool_name);
+        }
+        try w.writeAll(",\"content\":[{\"type\":\"text\",\"text\":");
+        try writeJsonString(w, if (message.content.len > 0) message.content else "(no tool output)");
+        try w.writeAll("}]");
+    } else {
+        try w.writeAll(",\"content\":");
+        if (message.content_parts.len > 0) {
+            try writeMistralContentParts(w, message.content_parts);
+        } else {
+            try writeJsonString(w, message.content);
+        }
+    }
+    try w.writeByte('}');
+}
+
+fn writeMistralContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
+    try w.writeByte('[');
+    for (parts, 0..) |part, index| {
+        if (index != 0) try w.writeByte(',');
+        switch (part) {
+            .text => |text| {
+                try w.writeAll("{\"type\":\"text\",\"text\":");
+                try writeJsonString(w, text);
+                try w.writeByte('}');
+            },
+            .image => |image| {
+                try w.writeAll("{\"type\":\"image_url\",\"image_url\":\"data:");
+                try writeJsonStringFragment(w, image.mime_type);
+                try w.writeAll(";base64,");
+                try writeJsonStringFragment(w, image.data);
+                try w.writeAll("\"}");
+            },
+        }
+    }
+    try w.writeByte(']');
+}
+
+fn writeMistralToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void {
+    try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
+    try writeJsonString(w, tool.name);
+    try w.writeAll(",\"description\":");
+    try writeJsonString(w, tool.description);
+    try w.writeAll(",\"parameters\":");
+    try w.writeAll(tool.parameters_json);
+    try w.writeAll(",\"strict\":false}}");
+}
+
+fn writeMistralToolCall(w: *std.Io.Writer, call: ChatToolCall) !void {
+    try w.writeAll("{\"id\":");
+    try writeJsonString(w, call.id);
+    try w.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+    try writeJsonString(w, call.name);
+    try w.writeAll(",\"arguments\":");
+    try writeJsonString(w, call.arguments_json);
+    try w.writeAll("}}");
 }
 
 fn readAnthropicSseStream(
@@ -1193,6 +1426,10 @@ fn parseOpenAICompatibleStreamData(
         try parseGoogleStreamTextDeltas(parsed.value, callback_context, callback);
         return;
     }
+    if (isMistralStreamChunk(parsed.value)) {
+        try parseMistralStreamTextDeltas(parsed.value, callback_context, callback);
+        return;
+    }
     const delta = try firstStreamDelta(parsed.value) orelse return;
     const content = delta.object.get("content") orelse return;
     if (content == .null) return;
@@ -1219,6 +1456,10 @@ fn parseOpenAICompatibleStreamResultData(
     }
     if (isGoogleStreamChunk(parsed.value)) {
         try accumulator.appendGoogleStreamChunk(parsed.value, text_callback_context, text_callback);
+        return;
+    }
+    if (isMistralStreamChunk(parsed.value)) {
+        try accumulator.appendMistralStreamChunk(parsed.value, text_callback_context, text_callback);
         return;
     }
     const delta = try firstStreamDelta(parsed.value) orelse return;
@@ -1282,6 +1523,52 @@ fn parseGoogleStreamTextDeltas(
             if (text != .string) return error.ProviderResponseInvalid;
             if (text.string.len > 0) try callback(callback_context, text.string);
         }
+    }
+}
+
+fn isMistralStreamChunk(value: std.json.Value) bool {
+    const delta = firstStreamDelta(value) catch return false;
+    const actual_delta = delta orelse return false;
+    if (actual_delta.object.get("toolCalls")) |_| return true;
+    if (actual_delta.object.get("content")) |content| {
+        return content == .array;
+    }
+    return false;
+}
+
+fn parseMistralStreamTextDeltas(
+    value: std.json.Value,
+    callback_context: *anyopaque,
+    callback: StreamTextCallback,
+) !void {
+    const delta = try firstStreamDelta(value) orelse return;
+    try parseMistralContentDelta(delta, callback_context, callback);
+}
+
+fn parseMistralContentDelta(
+    delta: std.json.Value,
+    callback_context: *anyopaque,
+    callback: StreamTextCallback,
+) !void {
+    const content = delta.object.get("content") orelse return;
+    switch (content) {
+        .null => return,
+        .string => |text| if (text.len > 0) try callback(callback_context, text),
+        .array => |items| {
+            for (items.items) |item| {
+                if (item == .string) {
+                    if (item.string.len > 0) try callback(callback_context, item.string);
+                    continue;
+                }
+                if (item != .object) return error.ProviderResponseInvalid;
+                const item_type = try optionalObjectString(item, "type") orelse continue;
+                if (std.mem.eql(u8, item_type, "text")) {
+                    const text = try requiredObjectString(item, "text");
+                    if (text.len > 0) try callback(callback_context, text);
+                }
+            }
+        },
+        else => return error.ProviderResponseInvalid,
     }
 }
 
@@ -1451,6 +1738,50 @@ const StreamChatAccumulator = struct {
         }
     }
 
+    fn appendMistralStreamChunk(
+        self: *StreamChatAccumulator,
+        value: std.json.Value,
+        text_callback_context: ?*anyopaque,
+        text_callback: ?StreamTextCallback,
+    ) !void {
+        const delta = try firstStreamDelta(value) orelse return;
+        if (delta.object.get("content")) |_| {
+            try self.appendMistralContentDelta(delta, text_callback_context, text_callback);
+        }
+        if (delta.object.get("toolCalls")) |tool_calls| {
+            try self.appendMistralToolCallDeltas(tool_calls);
+        } else if (delta.object.get("tool_calls")) |tool_calls| {
+            try self.appendToolCallDeltas(tool_calls);
+        }
+    }
+
+    fn appendMistralContentDelta(
+        self: *StreamChatAccumulator,
+        delta: std.json.Value,
+        text_callback_context: ?*anyopaque,
+        text_callback: ?StreamTextCallback,
+    ) !void {
+        const content = delta.object.get("content") orelse return;
+        switch (content) {
+            .null => return,
+            .string => |text| try self.appendTextDelta(text, text_callback_context, text_callback),
+            .array => |items| {
+                for (items.items) |item| {
+                    if (item == .string) {
+                        try self.appendTextDelta(item.string, text_callback_context, text_callback);
+                        continue;
+                    }
+                    if (item != .object) return error.ProviderResponseInvalid;
+                    const item_type = try optionalObjectString(item, "type") orelse continue;
+                    if (std.mem.eql(u8, item_type, "text")) {
+                        try self.appendTextDelta(try requiredObjectString(item, "text"), text_callback_context, text_callback);
+                    }
+                }
+            },
+            else => return error.ProviderResponseInvalid,
+        }
+    }
+
     fn appendTextDelta(
         self: *StreamChatAccumulator,
         delta: []const u8,
@@ -1493,6 +1824,50 @@ const StreamChatAccumulator = struct {
                         if (arguments != .string) return error.ProviderResponseInvalid;
                         try call.arguments_json.writer.writeAll(arguments.string);
                     }
+                }
+            }
+        }
+    }
+
+    fn appendMistralToolCallDeltas(self: *StreamChatAccumulator, value: std.json.Value) !void {
+        if (value != .array) return error.ProviderResponseInvalid;
+        for (value.array.items, 0..) |item, fallback_index| {
+            if (item != .object) return error.ProviderResponseInvalid;
+            const index = if (item.object.get("index")) |index_value|
+                try streamToolCallIndex(index_value)
+            else
+                fallback_index;
+            const call = try self.ensureToolCall(index);
+            call.seen = true;
+
+            if (item.object.get("id")) |id| {
+                if (id != .null) {
+                    if (id != .string) return error.ProviderResponseInvalid;
+                    if (call.id.written().len == 0 and !std.mem.eql(u8, id.string, "null")) {
+                        try call.id.writer.writeAll(id.string);
+                    }
+                }
+            }
+            if (call.id.written().len == 0) {
+                try call.id.writer.print("mistral_tool_{d}", .{index + 1});
+            }
+
+            const function = item.object.get("function") orelse continue;
+            if (function != .object) return error.ProviderResponseInvalid;
+            if (function.object.get("name")) |name| {
+                if (name != .null) {
+                    if (name != .string) return error.ProviderResponseInvalid;
+                    if (call.name.written().len == 0) try call.name.writer.writeAll(name.string);
+                }
+            }
+            if (function.object.get("arguments")) |arguments| {
+                if (arguments == .null) continue;
+                if (arguments == .string) {
+                    try call.arguments_json.writer.writeAll(arguments.string);
+                } else {
+                    const arguments_json = try jsonValueToOwnedString(self.allocator, arguments);
+                    defer self.allocator.free(arguments_json);
+                    try call.arguments_json.writer.writeAll(arguments_json);
                 }
             }
         }
@@ -1822,6 +2197,8 @@ fn parseOpenAICompatibleResult(allocator: std.mem.Allocator, body: []const u8) !
         }
         if (message.object.get("tool_calls")) |tool_calls| {
             result.tool_calls = try parseToolCalls(allocator, tool_calls);
+        } else if (message.object.get("toolCalls")) |tool_calls| {
+            result.tool_calls = try parseToolCalls(allocator, tool_calls);
         }
         if (result.text == null and result.tool_calls.len == 0) return error.ProviderResponseInvalid;
         return result;
@@ -2004,6 +2381,40 @@ test "serializes Google generate content payload with images tools and tool resu
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"functionDeclarations\":[{\"name\":\"bash\",\"description\":\"run shell\",\"parametersJsonSchema\":{\"type\":\"object\"}}]}]") != null);
 }
 
+test "serializes Mistral chat payload with images tools and tool results" {
+    const parts = [_]ChatContentPart{
+        .{ .text = "inspect this" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const tool_calls = [_]ChatToolCall{
+        .{ .id = @constCast("call_1"), .name = @constCast("bash"), .arguments_json = @constCast("{\"command\":\"printf ok\"}") },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "be terse" },
+        .{ .role = .user, .content_parts = parts[0..] },
+        .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
+        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1" },
+    };
+    const tools = [_]ChatToolDefinition{
+        .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
+    };
+    const payload = try buildMistralChatPayload(std.testing.allocator, .{
+        .provider = "mistral",
+        .model = "devstral-test",
+        .api_key = "mistral-test",
+        .messages = messages[0..],
+        .tools = tools[0..],
+    }, true);
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"role\":\"system\",\"content\":\"be terse\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,aGVsbG8=\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf ok\\\"}\"}}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tool_call_id\":\"call_1\",\"name\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"run shell\",\"parameters\":{\"type\":\"object\"},\"strict\":false}}]") != null);
+}
+
 test "parses OpenAI-compatible tool calls" {
     const body =
         \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf ok\"}"}}]}}]}
@@ -2176,6 +2587,36 @@ test "parses native Google SSE frames without done sentinel" {
     try std.testing.expectEqualStrings("native google", result.text.?);
 }
 
+test "parses Mistral camelCase stream tool calls and content arrays" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    var context = StreamResultContext{
+        .allocator = std.testing.allocator,
+        .accumulator = &accumulator,
+        .text_callback_context = null,
+        .text_callback = null,
+    };
+    try handleStreamResultData(
+        &context,
+        "{\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"mistral \"}]}}]}",
+    );
+    try handleStreamResultData(
+        &context,
+        "{\"choices\":[{\"delta\":{\"toolCalls\":[{\"index\":0,\"id\":\"call_mistral\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf \"}}]}}]}",
+    );
+    try handleStreamResultData(
+        &context,
+        "{\"choices\":[{\"delta\":{\"toolCalls\":[{\"index\":0,\"function\":{\"arguments\":\"mistral-ok\\\"}\"}}]}}]}",
+    );
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("mistral ", result.text.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_mistral", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf mistral-ok\"}", result.tool_calls[0].arguments_json);
+}
+
 test "assembles Anthropic tool use stream events" {
     var accumulator = StreamChatAccumulator.init(std.testing.allocator);
     errdefer accumulator.deinit();
@@ -2266,4 +2707,19 @@ test "Google provider base URL appends stream generate content endpoint" {
     const non_stream_endpoint = try googleGenerateContentEndpointForProvider(std.testing.allocator, &env, "gemini-test", false);
     defer std.testing.allocator.free(non_stream_endpoint);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/models/gemini-test:generateContent", non_stream_endpoint);
+}
+
+test "Mistral provider base URL appends chat completions endpoint once" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put("PI_ZIG_PROVIDER_BASE_URL", "http://127.0.0.1:43123/v1");
+    const endpoint_from_root = try mistralChatEndpointForProvider(std.testing.allocator, &env);
+    defer std.testing.allocator.free(endpoint_from_root);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/chat/completions", endpoint_from_root);
+
+    try env.put("PI_ZIG_PROVIDER_BASE_URL", "http://127.0.0.1:43123/v1/chat/completions");
+    const endpoint_from_full = try mistralChatEndpointForProvider(std.testing.allocator, &env);
+    defer std.testing.allocator.free(endpoint_from_full);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/chat/completions", endpoint_from_full);
 }

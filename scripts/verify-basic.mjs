@@ -199,6 +199,39 @@ const server = http.createServer((req, res) => {
       }
       res.end('data: [DONE]\\n\\n');
     };
+    if (user.includes('native mistral stream tool events')) {
+      if (
+        body.stream !== true ||
+        body.model !== 'devstral-medium-latest' ||
+        !hasBashTool ||
+        !body.tools?.some((tool) => tool?.function?.strict === false && tool?.function?.parameters?.type === 'object')
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'native mistral request shape mismatch', body }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { toolCalls: [{ index: 0, id: 'callmistr1', type: 'function', function: { name: 'bash', arguments: '{"command":"printf ' } }] } }] },
+          { choices: [{ delta: { toolCalls: [{ index: 0, function: { arguments: 'native-mistral-ok"}' } }] }, finishReason: 'tool_calls' }] }
+        ]);
+        return;
+      }
+      const lastTool = toolMessages.at(-1);
+      const toolText = Array.isArray(lastTool?.content)
+        ? lastTool.content.map((part) => part?.text ?? '').join('\\n')
+        : String(lastTool?.content ?? '');
+      if (lastTool?.tool_call_id !== 'callmistr1' || lastTool?.name !== 'bash' || toolText.trim() !== 'native-mistral-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'native Mistral tool result mismatch', lastTool }));
+        return;
+      }
+      writeStreamEvents([
+        { choices: [{ delta: { content: [{ type: 'text', text: 'native mistral ' }] } }] },
+        { choices: [{ delta: { content: [{ type: 'text', text: 'tool complete: native-mistral-ok' }] }, finishReason: 'stop' }] }
+      ]);
+      return;
+    }
     if (user.includes('streaming provider json')) {
       if (body.stream !== true) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2945,6 +2978,32 @@ try {
     !providerJsonNativeGoogleToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('native google tool complete: native-google-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not run native Google streamed tool calls');
+  }
+
+  const nativeMistralEnv = {
+    ...envWithoutAnthropicAuth(),
+    MISTRAL_API_KEY: 'fake-provider-key',
+    PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl
+  };
+  const providerJsonNativeMistralToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'mistral', '--model', 'devstral-medium-latest', '-p', 'please run native mistral stream tool events'],
+    undefined,
+    { env: nativeMistralEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonNativeMistralToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'callmistr1') ||
+    !providerJsonNativeMistralToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'callmistr1' && JSON.stringify(line.partialResult).includes('native-mistral-ok')) ||
+    !providerJsonNativeMistralToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('native-mistral-ok')) ||
+    !providerJsonNativeMistralToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'callmistr1')) ||
+    !providerJsonNativeMistralToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'native mistral ') ||
+    !providerJsonNativeMistralToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'tool complete: native-mistral-ok') ||
+    !providerJsonNativeMistralToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('native mistral tool complete: native-mistral-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not run native Mistral streamed tool calls');
   }
 
   const providerJsonToolErrorLines = run(
