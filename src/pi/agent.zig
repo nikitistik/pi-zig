@@ -4,6 +4,7 @@ const tools = @import("tools.zig");
 
 pub const ToolStartCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!void;
 pub const ToolEndCallback = *const fn (ctx: *anyopaque, result: ToolResult) anyerror!void;
+pub const TextDeltaCallback = ai_client.StreamTextCallback;
 
 pub const RunOptions = struct {
     provider: []const u8,
@@ -18,6 +19,8 @@ pub const RunOptions = struct {
     tool_event_context: ?*anyopaque = null,
     on_tool_start: ?ToolStartCallback = null,
     on_tool_end: ?ToolEndCallback = null,
+    text_event_context: ?*anyopaque = null,
+    on_text_delta: ?TextDeltaCallback = null,
 };
 
 pub const ToolSet = struct {
@@ -220,7 +223,7 @@ pub fn runPrompt(
             .tools = tool_definitions,
         };
         var response = if (options.stream_turns)
-            try ai_client.streamChatTurn(io, allocator, env, request)
+            try ai_client.streamChatTurnWithTextCallback(io, allocator, env, request, options.text_event_context, options.on_text_delta)
         else
             try ai_client.runChatTurn(io, allocator, env, request);
         defer response.deinit(allocator);

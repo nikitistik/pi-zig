@@ -149,7 +149,10 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'unexpected streaming tool output', toolOutput }));
         return;
       }
-      writeStreamEvents([{ choices: [{ delta: { content: 'streaming tool loop complete: ' + toolOutput } }] }]);
+      writeStreamEvents([
+        { choices: [{ delta: { content: 'streaming tool ' } }] },
+        { choices: [{ delta: { content: 'loop complete: ' + toolOutput } }] }
+      ]);
       return;
     }
     if (user.includes('multi tool loop')) {
@@ -2077,6 +2080,8 @@ try {
     !providerJsonStreamingToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_stream_tool_1') ||
     !providerJsonStreamingToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('stream-tool-ok')) ||
     !providerJsonStreamingToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_stream_tool_1')) ||
+    !providerJsonStreamingToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'streaming tool ') ||
+    !providerJsonStreamingToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'loop complete: stream-tool-ok') ||
     !providerJsonStreamingToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('streaming tool loop complete: stream-tool-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not assemble streamed provider tool calls');

@@ -180,9 +180,26 @@ pub fn streamChatTurn(
     env: *const std.process.Environ.Map,
     request: ChatTurnRequest,
 ) !ChatCompletionResult {
+    return streamChatTurnWithTextCallback(io, allocator, env, request, null, null);
+}
+
+pub fn streamChatTurnWithTextCallback(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    text_callback_context: ?*anyopaque,
+    text_callback: ?StreamTextCallback,
+) !ChatCompletionResult {
     var accumulator = StreamChatAccumulator.init(allocator);
     errdefer accumulator.deinit();
-    try streamChatTurnData(io, allocator, env, request, &accumulator, handleStreamResultData);
+    var result_context = StreamResultContext{
+        .allocator = allocator,
+        .accumulator = &accumulator,
+        .text_callback_context = text_callback_context,
+        .text_callback = text_callback,
+    };
+    try streamChatTurnData(io, allocator, env, request, &result_context, handleStreamResultData);
     return try accumulator.toResult();
 }
 
@@ -272,9 +289,16 @@ fn handleStreamTextData(ctx_ptr: *anyopaque, data: []const u8) anyerror!void {
 }
 
 fn handleStreamResultData(ctx_ptr: *anyopaque, data: []const u8) anyerror!void {
-    const accumulator: *StreamChatAccumulator = @ptrCast(@alignCast(ctx_ptr));
-    try parseOpenAICompatibleStreamResultData(accumulator.allocator, data, accumulator);
+    const ctx: *StreamResultContext = @ptrCast(@alignCast(ctx_ptr));
+    try parseOpenAICompatibleStreamResultData(ctx.allocator, data, ctx.accumulator, ctx.text_callback_context, ctx.text_callback);
 }
+
+const StreamResultContext = struct {
+    allocator: std.mem.Allocator,
+    accumulator: *StreamChatAccumulator,
+    text_callback_context: ?*anyopaque,
+    text_callback: ?StreamTextCallback,
+};
 
 fn endpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, provider: []const u8) ![]u8 {
     if (env.get("PI_ZIG_PROVIDER_BASE_URL")) |base_url| {
@@ -346,11 +370,13 @@ fn parseOpenAICompatibleStreamResultData(
     allocator: std.mem.Allocator,
     data: []const u8,
     accumulator: *StreamChatAccumulator,
+    text_callback_context: ?*anyopaque,
+    text_callback: ?StreamTextCallback,
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return error.ProviderResponseInvalid;
     defer parsed.deinit();
     const delta = try firstStreamDelta(parsed.value) orelse return;
-    try accumulator.appendDelta(delta);
+    try accumulator.appendDelta(delta, text_callback_context, text_callback);
 }
 
 fn firstStreamDelta(value: std.json.Value) !?std.json.Value {
@@ -404,11 +430,21 @@ const StreamChatAccumulator = struct {
         self.tool_calls.deinit(self.allocator);
     }
 
-    fn appendDelta(self: *StreamChatAccumulator, delta: std.json.Value) !void {
+    fn appendDelta(
+        self: *StreamChatAccumulator,
+        delta: std.json.Value,
+        text_callback_context: ?*anyopaque,
+        text_callback: ?StreamTextCallback,
+    ) !void {
         const content = delta.object.get("content") orelse .null;
         if (content != .null) {
             if (content != .string) return error.ProviderResponseInvalid;
             try self.text.writer.writeAll(content.string);
+            if (content.string.len > 0) {
+                if (text_callback) |callback| {
+                    if (text_callback_context) |context| try callback(context, content.string);
+                }
+            }
         }
 
         if (delta.object.get("tool_calls")) |tool_calls| {
@@ -695,10 +731,10 @@ test "assembles streamed OpenAI-compatible tool call deltas" {
     errdefer accumulator.deinit();
     try parseOpenAICompatibleStreamResultData(std.testing.allocator,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_stream","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf "}}]}}]}
-    , &accumulator);
+    , &accumulator, null, null);
     try parseOpenAICompatibleStreamResultData(std.testing.allocator,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"stream-ok\"}"}}]}}]}
-    , &accumulator);
+    , &accumulator, null, null);
     const result = try accumulator.toResult();
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.text == null);

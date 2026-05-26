@@ -49,6 +49,8 @@ const JsonStreamContext = struct {
 const JsonToolEventContext = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
+    final_text: *std.Io.Writer.Allocating,
+    assistant_started: bool = false,
 };
 
 pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
@@ -163,7 +165,7 @@ fn runTextPrintFoundation(
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, false, null, null, null);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, false, null, null, null, null, null);
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -193,9 +195,12 @@ fn runJsonPrintFoundation(
     const session_id = if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral";
     try emitJsonPrelude(io, allocator, session_id);
 
+    var streamed_final_text: std.Io.Writer.Allocating = .init(allocator);
+    defer streamed_final_text.deinit();
     var tool_event_context = JsonToolEventContext{
         .io = io,
         .allocator = allocator,
+        .final_text = &streamed_final_text,
     };
 
     const response = try buildPrintResponse(
@@ -208,6 +213,8 @@ fn runJsonPrintFoundation(
         &tool_event_context,
         handleJsonToolStart,
         handleJsonToolEnd,
+        &tool_event_context,
+        handleJsonAgentTextDelta,
     );
     defer response.deinit(allocator);
 
@@ -219,12 +226,14 @@ fn runJsonPrintFoundation(
     var writer = std.Io.File.stdout().writer(io, &buf);
     const w = &writer.interface;
 
-    try w.writeAll("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
-    try w.writeAll("{\"type\":\"message_update\",\"message\":");
-    try writeAssistantMessageJson(w, response.final_text);
-    try w.writeAll(",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":");
-    try writeJsonString(w, response.final_text);
-    try w.writeAll("}}\n");
+    if (!tool_event_context.assistant_started) {
+        try w.writeAll("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
+        try w.writeAll("{\"type\":\"message_update\",\"message\":");
+        try writeAssistantMessageJson(w, response.final_text);
+        try w.writeAll(",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":");
+        try writeJsonString(w, response.final_text);
+        try w.writeAll("}}\n");
+    }
     try w.writeAll("{\"type\":\"message_end\",\"message\":");
     try writeAssistantMessageJson(w, response.final_text);
     try w.writeAll("}\n");
@@ -372,6 +381,24 @@ fn handleJsonToolEnd(ctx_ptr: *anyopaque, tool_result: agent.ToolResult) anyerro
     try w.writeAll("{\"type\":\"message_end\",\"message\":");
     try writeToolResultMessageJson(w, tool_result);
     try w.writeAll("}\n");
+    try writeStreamingJsonLine(ctx.io, ctx.allocator, line.written());
+}
+
+fn handleJsonAgentTextDelta(ctx_ptr: *anyopaque, delta: []const u8) anyerror!void {
+    const ctx: *JsonToolEventContext = @ptrCast(@alignCast(ctx_ptr));
+    var line: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    if (!ctx.assistant_started) {
+        ctx.assistant_started = true;
+        try w.writeAll("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
+    }
+    try ctx.final_text.writer.writeAll(delta);
+    try w.writeAll("{\"type\":\"message_update\",\"message\":");
+    try writeAssistantMessageJson(w, ctx.final_text.written());
+    try w.writeAll(",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":");
+    try writeJsonString(w, delta);
+    try w.writeAll("}}\n");
     try writeStreamingJsonLine(ctx.io, ctx.allocator, line.written());
 }
 
@@ -598,6 +625,8 @@ fn buildPrintResponse(
     tool_event_context: ?*anyopaque,
     on_tool_start: ?agent.ToolStartCallback,
     on_tool_end: ?agent.ToolEndCallback,
+    text_event_context: ?*anyopaque,
+    on_text_delta: ?agent.TextDeltaCallback,
 ) !agent.RunResult {
     if (parsed.provider == null or parsed.model == null) {
         return .{ .final_text = try buildFoundationResponse(allocator, parsed, prompt) };
@@ -630,6 +659,8 @@ fn buildPrintResponse(
         .tool_event_context = tool_event_context,
         .on_tool_start = on_tool_start,
         .on_tool_end = on_tool_end,
+        .text_event_context = text_event_context,
+        .on_text_delta = on_text_delta,
     }) catch |err| {
         try writeStderr(io, "Provider request failed: ");
         try writeStderr(io, @errorName(err));
