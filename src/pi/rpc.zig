@@ -228,15 +228,13 @@ const Runtime = struct {
         const role = parseStoredRole(role_label) orelse return;
 
         if (role == .bash_execution) {
-            var output_buf: [max_message_bytes]u8 = undefined;
             const output = getStringFieldObject(message.object, "output") orelse "";
-            if (output.len > output_buf.len) return error.MessageTooLarge;
-            @memcpy(output_buf[0..output.len], output);
             const result: tools.ShellResult = .{
-                .output = output_buf[0..output.len],
+                .output = @constCast(output),
                 .exit_code = getOptionalExitCode(message.object),
                 .cancelled = getBoolFieldObject(message.object, "cancelled") orelse false,
                 .truncated = getBoolFieldObject(message.object, "truncated") orelse false,
+                .full_output_path = getStringFieldObject(message.object, "fullOutputPath"),
             };
             try self.addLoadedBash(id, getStringFieldObject(message.object, "command") orelse "", result);
         } else {
@@ -279,9 +277,9 @@ const Runtime = struct {
 
     fn addLoadedBash(self: *Runtime, entry_id: []const u8, command: []const u8, result: tools.ShellResult) !void {
         if (command.len > max_command_bytes) return error.CommandTooLarge;
-        if (result.output.len > max_message_bytes) return error.MessageTooLarge;
         if (entry_id.len > 32) return error.ValueTooLong;
         if (self.message_count >= max_messages) return error.MessageLimitReached;
+        const output = boundedStoredOutput(result.output);
 
         var slot = &self.messages[self.message_count];
         slot.role = .bash_execution;
@@ -289,11 +287,11 @@ const Runtime = struct {
         @memcpy(slot.id[0..entry_id.len], entry_id);
         slot.command_len = command.len;
         @memcpy(slot.command[0..command.len], command);
-        slot.len = result.output.len;
-        @memcpy(slot.content[0..result.output.len], result.output);
+        slot.len = output.len;
+        @memcpy(slot.content[0..output.len], output);
         slot.exit_code = result.exit_code;
         slot.cancelled = result.cancelled;
-        slot.truncated = result.truncated;
+        slot.truncated = result.truncated or output.len < result.output.len;
         self.message_count += 1;
     }
 
@@ -1010,6 +1008,13 @@ fn extractMessageText(object: std.json.ObjectMap, buffer: []u8) !usize {
 
 fn appendBoundedText(w: *std.Io.Writer, text: []const u8) !void {
     w.writeAll(text) catch return error.MessageTooLarge;
+}
+
+fn boundedStoredOutput(output: []const u8) []const u8 {
+    if (output.len <= max_message_bytes) return output;
+    var start = output.len - max_message_bytes;
+    while (start < output.len and (output[start] & 0xc0) == 0x80) : (start += 1) {}
+    return output[start..];
 }
 
 fn appendSummarySnippet(w: *std.Io.Writer, text: []const u8) !void {

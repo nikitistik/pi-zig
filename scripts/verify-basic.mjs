@@ -1660,6 +1660,7 @@ const rpcOutput = run(
     JSON.stringify({ id: 'forks-1', type: 'get_fork_messages' }),
     JSON.stringify({ id: 'export-1', type: 'export_html', outputPath: rpcExportFile }),
     JSON.stringify({ id: 'state-2', type: 'get_state' }),
+    JSON.stringify({ id: 'bash-long-1', type: 'bash', command: "node -e \"for (let i = 0; i < 2105; i++) console.log('rpc-bash-line-' + String(i).padStart(4, '0'))\"" }),
     ''
   ].join('\n')
 );
@@ -1700,6 +1701,20 @@ if (
   bashResponse?.data?.truncated !== false
 ) {
   throw new Error('rpc bash smoke did not return upstream-shaped BashResult');
+}
+const bashLongResponse = rpcResponses.find((response) => response.id === 'bash-long-1');
+if (
+  !bashLongResponse?.success ||
+  bashLongResponse?.data?.truncated !== true ||
+  bashLongResponse?.data?.fullOutputPath !== 'zig-out/pi-zig-bash-full-output.log' ||
+  bashLongResponse?.data?.output?.includes('rpc-bash-line-0000') ||
+  !bashLongResponse?.data?.output?.includes('rpc-bash-line-2104')
+) {
+  throw new Error('rpc long bash smoke did not return truncated output with full-output path');
+}
+const rpcBashFullOutput = fs.readFileSync('zig-out/pi-zig-bash-full-output.log', 'utf8');
+if (!rpcBashFullOutput.includes('rpc-bash-line-0000') || !rpcBashFullOutput.includes('rpc-bash-line-2104')) {
+  throw new Error('rpc long bash smoke did not persist complete full output');
 }
 const compactResponse = rpcResponses.find((response) => response.id === 'compact-1');
 if (
@@ -1782,7 +1797,7 @@ const resumeOutput = run(
 );
 const resumeResponses = resumeOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 const resumeState = resumeResponses.find((response) => response.id === 'resume-state');
-if (resumeState?.data?.messageCount !== 2 || resumeState?.data?.sessionName !== 'smoke session') {
+if (resumeState?.data?.messageCount !== 3 || resumeState?.data?.sessionName !== 'smoke session') {
   throw new Error('rpc resume smoke did not load message count and session name from JSONL');
 }
 if (resumeState?.data?.model?.provider !== 'anthropic' || resumeState?.data?.model?.id !== 'claude-haiku-4-5') {
@@ -1792,12 +1807,15 @@ const resumeMessages = resumeResponses.find((response) => response.id === 'resum
 if (
   resumeMessages?.data?.messages?.[0]?.content !== 'hello rpc' ||
   resumeMessages?.data?.messages?.[1]?.role !== 'bashExecution' ||
-  resumeMessages?.data?.messages?.[1]?.output !== 'rpc-bash'
+  resumeMessages?.data?.messages?.[1]?.output !== 'rpc-bash' ||
+  resumeMessages?.data?.messages?.[2]?.role !== 'bashExecution' ||
+  resumeMessages?.data?.messages?.[2]?.output?.includes('rpc-bash-line-0000') ||
+  !resumeMessages?.data?.messages?.[2]?.output?.includes('rpc-bash-line-2104')
 ) {
   throw new Error('rpc resume smoke did not reconstruct messages from JSONL');
 }
 const resumeStats = resumeResponses.find((response) => response.id === 'resume-stats');
-if (resumeStats?.data?.userMessages !== 1 || resumeStats?.data?.totalMessages !== 2) {
+if (resumeStats?.data?.userMessages !== 1 || resumeStats?.data?.totalMessages !== 3) {
   throw new Error('rpc resume smoke did not reconstruct durable stats');
 }
 
