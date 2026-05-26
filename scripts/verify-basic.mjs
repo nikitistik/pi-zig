@@ -58,6 +58,27 @@ const server = http.createServer((req, res) => {
     const toolMessages = body.messages.filter((message) => message.role === 'tool');
     const hasTool = (name) => body.tools?.some((tool) => tool?.function?.name === name) ?? false;
     const hasBashTool = hasTool('bash');
+    if (user.includes('streaming provider json')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected streaming request' }));
+        return;
+      }
+      if ((body.tools?.length ?? 0) !== 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'streaming text smoke expected no tools' }));
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'close'
+      });
+      res.write('data: {"choices":[{"delta":{"content":"stream "}}]}\\n\\n');
+      res.write('data: {"choices":[{"delta":{"content":"delta"}}]}\\n\\n');
+      res.end('data: [DONE]\\n\\n');
+      return;
+    }
     if (user.includes('expect no tools')) {
       if ((body.tools?.length ?? 0) !== 0) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -1916,6 +1937,25 @@ try {
     !providerJsonLines.some((line) => line.type === 'agent_end')
   ) {
     throw new Error('top-level JSON mode smoke did not include provider-backed assistant output');
+  }
+
+  const providerJsonStreamLines = run(
+    ['--mode', 'json', '--no-session', '--no-tools', '--provider', 'openai', '--model', 'mock-json-stream-model', '-p', 'hello streaming provider json'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonStreamLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'stream ') ||
+    !providerJsonStreamLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'delta') ||
+    !providerJsonStreamLines.some((line) => line.type === 'message_end' && JSON.stringify(line.message).includes('stream delta')) ||
+    !providerJsonStreamLines.some((line) => line.type === 'turn_end' && line.toolResults?.length === 0) ||
+    !providerJsonStreamLines.some((line) => line.type === 'agent_end' && JSON.stringify(line.messages).includes('stream delta'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not stream provider text deltas');
   }
 
   const providerJsonToolLines = run(

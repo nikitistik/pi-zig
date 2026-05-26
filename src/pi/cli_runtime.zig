@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("agent.zig");
+const ai_client = @import("ai_client.zig");
 const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const commands = @import("commands.zig");
@@ -37,6 +38,12 @@ const SelectedToolNames = struct {
     fn deinit(self: SelectedToolNames, allocator: std.mem.Allocator) void {
         if (self.owned) allocator.free(self.names);
     }
+};
+
+const JsonStreamContext = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    final_text: *std.Io.Writer.Allocating,
 };
 
 pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
@@ -134,7 +141,7 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
         \\  system-prompt                   Build the effective system prompt text
         \\
         \\Current top-level scope: print/json/rpc entry-point foundation. Interactive TUI,
-        \\extension execution, live streaming, and full upstream agent parity remain incomplete.
+        \\extension execution, streamed tool calls, and full upstream agent parity remain incomplete.
         \\
     );
 }
@@ -169,6 +176,10 @@ fn runJsonPrintFoundation(
     parsed: cli.ParsedArgs,
     prompt: []const u8,
 ) !void {
+    if (shouldUseProviderTextStream(parsed)) {
+        return runJsonProviderTextStream(io, allocator, env, parsed, prompt);
+    }
+
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
@@ -227,6 +238,119 @@ fn runJsonPrintFoundation(
     try writeAssistantMessageJson(w, response.final_text);
     try w.writeAll("]}\n");
     try w.flush();
+}
+
+fn shouldUseProviderTextStream(parsed: cli.ParsedArgs) bool {
+    return parsed.provider != null and parsed.model != null and (parsed.no_tools or parsed.no_builtin_tools);
+}
+
+fn runJsonProviderTextStream(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+    prompt: []const u8,
+) !void {
+    var store = try maybeOpenStore(io, allocator, env, parsed);
+    if (store) |*persistent| {
+        if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
+    }
+
+    const provider = parsed.provider.?;
+    const model = parsed.model.?;
+    const api_key = if (parsed.api_key) |key|
+        try allocator.dupe(u8, key)
+    else
+        try auth.resolveProviderApiKey(io, allocator, env, provider) orelse {
+            try writeStderr(io, "No API key found for ");
+            try writeStderr(io, provider);
+            try writeStderr(io, ".\n");
+            return error.ProviderAuthMissing;
+        };
+    defer allocator.free(api_key);
+
+    const runtime_system_prompt = try buildRuntimeSystemPrompt(io, allocator, env, parsed);
+    defer allocator.free(runtime_system_prompt);
+
+    var messages_buf: [2]ai_client.ChatMessage = undefined;
+    var messages_len: usize = 0;
+    const trimmed_system = std.mem.trim(u8, runtime_system_prompt, " \t\r\n");
+    if (trimmed_system.len > 0) {
+        messages_buf[messages_len] = .{ .role = .system, .content = trimmed_system };
+        messages_len += 1;
+    }
+    messages_buf[messages_len] = .{ .role = .user, .content = prompt };
+    messages_len += 1;
+
+    try emitJsonPrelude(io, allocator, if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral");
+    try writeStreamingJsonLine(io, allocator, "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
+
+    var final_text: std.Io.Writer.Allocating = .init(allocator);
+    defer final_text.deinit();
+    var stream_context = JsonStreamContext{
+        .io = io,
+        .allocator = allocator,
+        .final_text = &final_text,
+    };
+
+    try ai_client.streamChatTurnText(io, allocator, env, .{
+        .provider = provider,
+        .model = model,
+        .api_key = api_key,
+        .messages = messages_buf[0..messages_len],
+        .tools = &.{},
+    }, &stream_context, handleJsonStreamTextDelta);
+
+    if (final_text.written().len == 0) return error.ProviderResponseInvalid;
+    if (store) |*persistent| {
+        _ = try persistent.appendMessage(io, allocator, .assistant, final_text.written());
+    }
+
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    try w.writeAll("{\"type\":\"message_end\",\"message\":");
+    try writeAssistantMessageJson(w, final_text.written());
+    try w.writeAll("}\n");
+    try w.writeAll("{\"type\":\"turn_end\",\"message\":");
+    try writeAssistantMessageJson(w, final_text.written());
+    try w.writeAll(",\"toolResults\":[]}\n");
+    try w.writeAll("{\"type\":\"agent_end\",\"messages\":[");
+    try writeAssistantMessageJson(w, final_text.written());
+    try w.writeAll("]}\n");
+    try writeStreamingJsonLine(io, allocator, line.written());
+}
+
+fn emitJsonPrelude(io: std.Io, allocator: std.mem.Allocator, session_id: []const u8) !void {
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    try w.writeAll("{\"type\":\"session\",\"version\":3,\"id\":");
+    try writeJsonString(w, session_id);
+    try w.writeAll(",\"timestamp\":\"local-foundation\",\"cwd\":\".\"}\n");
+    try w.writeAll("{\"type\":\"agent_start\"}\n");
+    try w.writeAll("{\"type\":\"turn_start\"}\n");
+    try writeStreamingJsonLine(io, allocator, line.written());
+}
+
+fn handleJsonStreamTextDelta(ctx_ptr: *anyopaque, delta: []const u8) anyerror!void {
+    const ctx: *JsonStreamContext = @ptrCast(@alignCast(ctx_ptr));
+    try ctx.final_text.writer.writeAll(delta);
+
+    var line: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    try w.writeAll("{\"type\":\"message_update\",\"message\":");
+    try writeAssistantMessageJson(w, ctx.final_text.written());
+    try w.writeAll(",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":");
+    try writeJsonString(w, delta);
+    try w.writeAll("}}\n");
+    try writeStreamingJsonLine(ctx.io, ctx.allocator, line.written());
+}
+
+fn writeStreamingJsonLine(io: std.Io, allocator: std.mem.Allocator, bytes: []const u8) !void {
+    _ = allocator;
+    try std.Io.File.stdout().writeStreamingAll(io, bytes);
 }
 
 fn maybeOpenStore(

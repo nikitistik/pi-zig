@@ -76,6 +76,8 @@ pub const ChatCompletionError = error{
     EmptyPrompt,
 } || std.mem.Allocator.Error || std.http.Client.FetchError;
 
+pub const StreamTextCallback = *const fn (ctx: *anyopaque, delta: []const u8) anyerror!void;
+
 pub fn runChatCompletion(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -155,6 +157,80 @@ pub fn runChatTurn(
     return parseOpenAICompatibleResult(allocator, body);
 }
 
+pub fn streamChatTurnText(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    callback_context: *anyopaque,
+    callback: StreamTextCallback,
+) !void {
+    const endpoint = try endpointForProvider(allocator, env, request.provider);
+    defer allocator.free(endpoint);
+
+    const payload = try buildPayloadWithStream(allocator, request, true);
+    defer allocator.free(payload);
+
+    const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
+    defer allocator.free(authorization);
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    var request_handle = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .authorization = .{ .override = authorization },
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+            .accept_encoding = .{ .override = "identity" },
+        },
+    });
+    defer request_handle.deinit();
+
+    request_handle.transfer_encoding = .{ .content_length = payload.len };
+    var body_writer = try request_handle.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try request_handle.connection.?.flush();
+
+    var response = try request_handle.receiveHead(&.{});
+    if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
+        var transfer_buffer: [1024]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        _ = reader.discardRemaining() catch {};
+        return error.ProviderRequestFailed;
+    }
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    var saw_done = false;
+    while (true) {
+        const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr() orelse error.ProviderResponseInvalid,
+            else => return err,
+        };
+        const line_with_cr = raw_line orelse break;
+        const line = stripTrailingCarriageReturn(line_with_cr);
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+        const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
+        if (std.mem.eql(u8, data, "[DONE]")) {
+            saw_done = true;
+            break;
+        }
+        try parseOpenAICompatibleStreamData(allocator, data, callback_context, callback);
+    }
+    if (!saw_done) return error.ProviderResponseInvalid;
+}
+
 fn endpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, provider: []const u8) ![]u8 {
     if (env.get("PI_ZIG_PROVIDER_BASE_URL")) |base_url| {
         return endpointFromBaseUrl(allocator, base_url);
@@ -177,6 +253,10 @@ fn endpointFromBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8
 }
 
 fn buildPayload(allocator: std.mem.Allocator, request: ChatTurnRequest) ![]u8 {
+    return buildPayloadWithStream(allocator, request, false);
+}
+
+fn buildPayloadWithStream(allocator: std.mem.Allocator, request: ChatTurnRequest, stream: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -188,7 +268,8 @@ fn buildPayload(allocator: std.mem.Allocator, request: ChatTurnRequest) ![]u8 {
         if (index != 0) try w.writeByte(',');
         try writeMessage(w, message);
     }
-    try w.writeAll("],\"stream\":false");
+    try w.writeAll("],\"stream\":");
+    try w.writeAll(if (stream) "true" else "false");
     if (request.tools.len > 0) {
         try w.writeAll(",\"tools\":[");
         for (request.tools, 0..) |tool, index| {
@@ -199,6 +280,27 @@ fn buildPayload(allocator: std.mem.Allocator, request: ChatTurnRequest) ![]u8 {
     }
     try w.writeByte('}');
     return out.toOwnedSlice();
+}
+
+fn parseOpenAICompatibleStreamData(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    callback_context: *anyopaque,
+    callback: StreamTextCallback,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return error.ProviderResponseInvalid;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ProviderResponseInvalid;
+    const choices = parsed.value.object.get("choices") orelse return;
+    if (choices != .array or choices.array.items.len == 0) return error.ProviderResponseInvalid;
+    const first = choices.array.items[0];
+    if (first != .object) return error.ProviderResponseInvalid;
+    const delta = first.object.get("delta") orelse return;
+    if (delta != .object) return error.ProviderResponseInvalid;
+    const content = delta.object.get("content") orelse return;
+    if (content == .null) return;
+    if (content != .string) return error.ProviderResponseInvalid;
+    if (content.string.len > 0) try callback(callback_context, content.string);
 }
 
 fn writeMessage(w: *std.Io.Writer, message: ChatMessage) !void {
@@ -342,6 +444,11 @@ fn parseContentParts(allocator: std.mem.Allocator, parts: []const std.json.Value
 
 fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.encodeJsonString(value, .{}, w);
+}
+
+fn stripTrailingCarriageReturn(value: []const u8) []const u8 {
+    if (value.len > 0 and value[value.len - 1] == '\r') return value[0 .. value.len - 1];
+    return value;
 }
 
 test "parses OpenAI-compatible chat completion text" {
