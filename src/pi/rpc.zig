@@ -18,6 +18,7 @@ const max_session_name_bytes = 256;
 const max_session_file_bytes = 16 * 1024 * 1024;
 const max_session_path_bytes = std.Io.Dir.max_path_bytes;
 const max_pending_messages = 32;
+const max_auto_retry_attempts = 3;
 
 const StoredRole = enum {
     system,
@@ -460,7 +461,7 @@ const Runtime = struct {
         return null;
     }
 
-    fn runAgentIfAuthenticated(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, prompt: []const u8) !?agent.RunResult {
+    fn runAgentIfAuthenticatedOnce(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, prompt: []const u8) !?agent.RunResult {
         const model = self.selected_model orelse return null;
         const env = self.env orelse return null;
         const api_key = try auth.resolveProviderApiKey(io, allocator, env, model.provider) orelse return null;
@@ -479,6 +480,17 @@ const Runtime = struct {
             .history = history.items,
             .tool_set = .all,
         });
+    }
+
+    fn runAgentIfAuthenticated(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, prompt: []const u8) !?agent.RunResult {
+        var retry_attempts: usize = 0;
+        while (true) {
+            return self.runAgentIfAuthenticatedOnce(io, allocator, prompt) catch |err| {
+                if (!self.auto_retry_enabled or !isRetryableAgentError(err) or retry_attempts >= max_auto_retry_attempts) return err;
+                retry_attempts += 1;
+                continue;
+            };
+        }
     }
 
     fn buildAgentHistory(self: *Runtime, allocator: std.mem.Allocator) !std.ArrayList(ai_client.ChatMessage) {
@@ -1100,6 +1112,13 @@ fn getBoolFieldObject(object: std.json.ObjectMap, name: []const u8) ?bool {
     const field = object.get(name) orelse return null;
     if (field != .bool) return null;
     return field.bool;
+}
+
+fn isRetryableAgentError(err: anyerror) bool {
+    return switch (err) {
+        error.ProviderRequestFailed => true,
+        else => false,
+    };
 }
 
 fn getOptionalExitCode(object: std.json.ObjectMap) ?u8 {

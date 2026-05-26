@@ -38,6 +38,7 @@ async function startFakeProviderServer() {
       '-e',
       `
 import http from 'node:http';
+const requestCounts = new Map();
 const server = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (chunk) => chunks.push(chunk));
@@ -353,6 +354,23 @@ const server = http.createServer((req, res) => {
       const content = userMessages.includes('rpc follow two')
         ? 'batched rpc follow response'
         : 'rpc follow base complete';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
+    if (user.includes('rpc retry transient')) {
+      const count = (requestCounts.get(user) ?? 0) + 1;
+      requestCounts.set(user, count);
+      if (count === 1) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'temporary provider failure' }));
+        return;
+      }
+      const content = 'rpc retry recovered';
       if (body.stream === true) {
         writeStreamEvents([{ choices: [{ delta: { content } }] }]);
         return;
@@ -2647,6 +2665,31 @@ try {
     JSON.stringify(rpcFollowAssistantTexts) !== JSON.stringify(['rpc follow base complete', 'batched rpc follow response'])
   ) {
     throw new Error('rpc provider queue smoke did not preserve queued follow-up batch order');
+  }
+
+  const rpcProviderRetrySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-retry-smoke.jsonl');
+  fs.rmSync(rpcProviderRetrySessionFile, { force: true });
+  const rpcProviderRetryOutput = run(
+    ['rpc', rpcProviderRetrySessionFile],
+    [
+      JSON.stringify({ id: 'rpc-retry-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-retry-enable', type: 'set_auto_retry', enabled: true }),
+      JSON.stringify({ id: 'rpc-retry-prompt', type: 'prompt', message: 'rpc retry transient' }),
+      JSON.stringify({ id: 'rpc-retry-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderRetryResponses = rpcProviderRetryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderRetryPrompt = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-prompt');
+  const rpcProviderRetryMessages = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-messages');
+  if (
+    !rpcProviderRetryPrompt?.success ||
+    rpcProviderRetryPrompt?.data?.text !== 'rpc retry recovered' ||
+    rpcProviderRetryMessages?.data?.messages?.filter((message) => message.role === 'user').length !== 1 ||
+    rpcProviderRetryMessages?.data?.messages?.filter((message) => message.role === 'assistant').length !== 1
+  ) {
+    throw new Error('rpc provider retry smoke did not recover from a transient provider failure');
   }
 
   const rpcProviderOutput = run(
