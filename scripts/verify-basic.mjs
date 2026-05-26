@@ -595,8 +595,13 @@ const packageCommandEnv = {
   ...process.env,
   HOME: packageCommandHome,
   PATH: `${packageCommandFakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
-  PI_ZIG_FAKE_COMMAND_RECORD: packageCommandRecord
+  PI_ZIG_FAKE_COMMAND_RECORD: packageCommandRecord,
+  PI_ZIG_FAKE_LATEST_RESPONSE: JSON.stringify({ version: '0.1.0' })
 };
+function readPackageCommandRecords() {
+  const text = fs.existsSync(packageCommandRecord) ? fs.readFileSync(packageCommandRecord, 'utf8').trim() : '';
+  return text ? text.split('\n').map((line) => JSON.parse(line)) : [];
+}
 fs.rmSync(packageCommandRoot, { recursive: true, force: true });
 fs.mkdirSync(packageCommandGlobalPackage, { recursive: true });
 fs.mkdirSync(packageCommandProjectPackage, { recursive: true });
@@ -644,6 +649,16 @@ process.exit(0);
 `
 );
 fs.chmodSync(path.join(packageCommandFakeBin, 'npm'), 0o755);
+fs.writeFileSync(
+  path.join(packageCommandFakeBin, 'curl'),
+  `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.PI_ZIG_FAKE_COMMAND_RECORD, JSON.stringify({ command: 'curl', args, cwd: process.cwd() }) + '\\n');
+console.log(process.env.PI_ZIG_FAKE_LATEST_RESPONSE || JSON.stringify({ version: '0.1.0' }));
+`
+);
+fs.chmodSync(path.join(packageCommandFakeBin, 'curl'), 0o755);
 fs.writeFileSync(
   path.join(packageCommandFakeBin, 'git'),
   `#!/usr/bin/env node
@@ -722,7 +737,7 @@ if (
 }
 run(['update', '--extension', 'git:github.com/example/fake-extension'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
 run(['update', '--extensions'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
-const packageCommandRecords = fs.readFileSync(packageCommandRecord, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+const packageCommandRecords = readPackageCommandRecords();
 if (
   !packageCommandRecords.some((record) => record.command === 'npm' && record.args.includes('fake-extension@latest')) ||
   packageCommandRecords.some((record) => record.command === 'npm' && record.args.includes('current-extension@latest')) ||
@@ -739,10 +754,22 @@ run(['remove', 'git:github.com/example/fake-extension', '--local'], undefined, {
 if (fs.existsSync(npmInstallPath) || fs.existsSync(currentNpmInstallPath) || fs.existsSync(gitInstallPath)) {
   throw new Error('package remove smoke did not remove managed npm and git installs');
 }
+const packageSelfNoUpdateRecordCount = readPackageCommandRecords().length;
+const packageSelfNoUpdateOutput = run(['update', '--self'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+const packageSelfNoUpdateRecords = readPackageCommandRecords().slice(packageSelfNoUpdateRecordCount);
+if (
+  !packageSelfNoUpdateOutput.includes('pi-zig is already up to date (v0.1.0)') ||
+  !packageSelfNoUpdateRecords.some((record) => record.command === 'curl' && record.args.includes('https://pi.dev/api/latest-version')) ||
+  packageSelfNoUpdateRecords.some((record) => record.command === 'npm' && record.args.includes('-g'))
+) {
+  throw new Error('package self-update smoke did not check latest release and skip current version');
+}
+const packageSelfForceRecordCount = readPackageCommandRecords().length;
 const packageSelfUpdateOutput = run(['update', '--self', '--force'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
-const packageSelfUpdateRecords = fs.readFileSync(packageCommandRecord, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+const packageSelfUpdateRecords = readPackageCommandRecords().slice(packageSelfForceRecordCount);
 if (
   !packageSelfUpdateOutput.includes('Updated pi-zig') ||
+  packageSelfUpdateRecords.some((record) => record.command === 'curl') ||
   !packageSelfUpdateRecords.some((record) =>
     record.command === 'npm' &&
     record.args[0] === 'install' &&

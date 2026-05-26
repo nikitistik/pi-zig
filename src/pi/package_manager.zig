@@ -4,6 +4,7 @@ const config = @import("config.zig");
 const max_settings_bytes = 1024 * 1024;
 const project_settings_file = ".pi/settings.json";
 const upstream_package_name = "@earendil-works/pi-coding-agent";
+const latest_version_url = "https://pi.dev/api/latest-version";
 
 const Command = enum {
     install,
@@ -27,6 +28,25 @@ const ParsedSource = struct {
     host: []const u8 = "",
     path: []const u8 = "",
     ref: ?[]const u8 = null,
+};
+
+const LatestSelfRelease = struct {
+    version: []u8,
+    package_name: []u8,
+    note: ?[]u8 = null,
+
+    fn deinit(self: LatestSelfRelease, allocator: std.mem.Allocator) void {
+        allocator.free(self.version);
+        allocator.free(self.package_name);
+        if (self.note) |note| allocator.free(note);
+    }
+};
+
+const ParsedPackageVersion = struct {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: ?[]const u8 = null,
 };
 
 const PackageOptions = struct {
@@ -137,10 +157,11 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
                 try writeStdout(io, "\n");
             }
             if (options.self) {
-                try runSelfUpdate(io, allocator, env, agent_dir);
-                try writeStdout(io, "Updated ");
-                try writeStdout(io, config.app_name);
-                try writeStdout(io, "\n");
+                if (try runSelfUpdate(io, allocator, env, agent_dir, options.force)) {
+                    try writeStdout(io, "Updated ");
+                    try writeStdout(io, config.app_name);
+                    try writeStdout(io, "\n");
+                }
             }
             return true;
         },
@@ -1067,12 +1088,151 @@ fn npmBaseArgv(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
     return argv;
 }
 
+fn selfUpdatePackageName(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    force: bool,
+) ![]u8 {
+    if (force) return allocator.dupe(u8, upstream_package_name);
+
+    const release = latestSelfRelease(io, allocator, env) catch return allocator.dupe(u8, upstream_package_name);
+    if (release) |latest| {
+        defer latest.deinit(allocator);
+        if (!std.mem.eql(u8, latest.package_name, upstream_package_name) or isNewerPackageVersion(latest.version, config.version)) {
+            if (latest.note) |note| {
+                try writeStdout(io, "\nUpdate note\n");
+                try writeStdout(io, note);
+                try writeStdout(io, "\n\n");
+            }
+            return allocator.dupe(u8, latest.package_name);
+        }
+        try writeStdout(io, config.app_name);
+        try writeStdout(io, " is already up to date (v");
+        try writeStdout(io, config.version);
+        try writeStdout(io, ")\n");
+        return allocator.dupe(u8, "");
+    }
+
+    return allocator.dupe(u8, upstream_package_name);
+}
+
+fn latestSelfRelease(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?LatestSelfRelease {
+    if (isOfflineMode(env) or isVersionCheckSkipped(env)) return null;
+    const user_agent = try std.fmt.allocPrint(allocator, "User-Agent: {s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+    const argv = [_][]const u8{
+        "curl",
+        "-fsSL",
+        "--max-time",
+        "10",
+        "-H",
+        "accept: application/json",
+        "-H",
+        user_agent,
+        latest_version_url,
+    };
+    const stdout = try runCommandCaptureQuiet(io, allocator, &argv, null);
+    defer allocator.free(stdout);
+    return parseLatestSelfRelease(allocator, stdout);
+}
+
+fn parseLatestSelfRelease(allocator: std.mem.Allocator, stdout: []const u8) !?LatestSelfRelease {
+    const raw = std.mem.trim(u8, stdout, " \t\r\n");
+    if (raw.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const version_value = parsed.value.object.get("version") orelse return null;
+    if (version_value != .string) return null;
+    const version = std.mem.trim(u8, version_value.string, " \t\r\n");
+    if (version.len == 0) return null;
+
+    const package_name = if (parsed.value.object.get("packageName")) |value|
+        if (value == .string and std.mem.trim(u8, value.string, " \t\r\n").len > 0)
+            std.mem.trim(u8, value.string, " \t\r\n")
+        else
+            upstream_package_name
+    else
+        upstream_package_name;
+
+    const note = if (parsed.value.object.get("note")) |value|
+        if (value == .string and std.mem.trim(u8, value.string, " \t\r\n").len > 0)
+            try allocator.dupe(u8, std.mem.trim(u8, value.string, " \t\r\n"))
+        else
+            null
+    else
+        null;
+    errdefer if (note) |owned_note| allocator.free(owned_note);
+
+    const owned_version = try allocator.dupe(u8, version);
+    errdefer allocator.free(owned_version);
+    const owned_package_name = try allocator.dupe(u8, package_name);
+    errdefer allocator.free(owned_package_name);
+
+    return .{
+        .version = owned_version,
+        .package_name = owned_package_name,
+        .note = note,
+    };
+}
+
+fn isNewerPackageVersion(candidate_version: []const u8, current_version: []const u8) bool {
+    const candidate = parsePackageVersion(candidate_version);
+    const current = parsePackageVersion(current_version);
+    if (candidate == null or current == null) {
+        return !std.mem.eql(u8, std.mem.trim(u8, candidate_version, " \t\r\n"), std.mem.trim(u8, current_version, " \t\r\n"));
+    }
+
+    const left = candidate.?;
+    const right = current.?;
+    if (left.major != right.major) return left.major > right.major;
+    if (left.minor != right.minor) return left.minor > right.minor;
+    if (left.patch != right.patch) return left.patch > right.patch;
+    if (left.prerelease == null and right.prerelease == null) return false;
+    if (left.prerelease == null) return true;
+    if (right.prerelease == null) return false;
+    return std.mem.order(u8, left.prerelease.?, right.prerelease.?) == .gt;
+}
+
+fn parsePackageVersion(version: []const u8) ?ParsedPackageVersion {
+    var raw = std.mem.trim(u8, version, " \t\r\n");
+    if (raw.len > 0 and raw[0] == 'v') raw = raw[1..];
+    if (std.mem.indexOfScalar(u8, raw, '+')) |plus| raw = raw[0..plus];
+
+    var main = raw;
+    var prerelease: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, raw, '-')) |dash| {
+        main = raw[0..dash];
+        if (dash + 1 < raw.len) prerelease = raw[dash + 1 ..];
+    }
+
+    var parts = std.mem.splitScalar(u8, main, '.');
+    const major_text = parts.next() orelse return null;
+    const minor_text = parts.next() orelse return null;
+    const patch_text = parts.next() orelse return null;
+    if (parts.next() != null) return null;
+
+    return .{
+        .major = std.fmt.parseInt(u64, major_text, 10) catch return null,
+        .minor = std.fmt.parseInt(u64, minor_text, 10) catch return null,
+        .patch = std.fmt.parseInt(u64, patch_text, 10) catch return null,
+        .prerelease = prerelease,
+    };
+}
+
 fn runSelfUpdate(
     io: std.Io,
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
     agent_dir: []const u8,
-) !void {
+    force: bool,
+) !bool {
+    const update_package_name = try selfUpdatePackageName(io, allocator, env, force);
+    defer allocator.free(update_package_name);
+    if (update_package_name.len == 0) return false;
+
     var argv = try npmBaseArgv(io, allocator, env, agent_dir);
     defer argv.deinit(allocator);
     const manager = packageManagerName(argv.items);
@@ -1081,25 +1241,26 @@ fn runSelfUpdate(
         try argv.append(allocator, "install");
         try argv.append(allocator, "-g");
         try argv.append(allocator, "--ignore-scripts");
-        try argv.append(allocator, upstream_package_name);
+        try argv.append(allocator, update_package_name);
     } else if (std.mem.eql(u8, manager, "yarn")) {
         try argv.append(allocator, "global");
         try argv.append(allocator, "add");
         try argv.append(allocator, "--ignore-scripts");
-        try argv.append(allocator, upstream_package_name);
+        try argv.append(allocator, update_package_name);
     } else if (std.mem.eql(u8, manager, "bun")) {
         try argv.append(allocator, "install");
         try argv.append(allocator, "-g");
         try argv.append(allocator, "--ignore-scripts");
-        try argv.append(allocator, upstream_package_name);
+        try argv.append(allocator, update_package_name);
     } else {
         try argv.append(allocator, "install");
         try argv.append(allocator, "-g");
         try argv.append(allocator, "--ignore-scripts");
-        try argv.append(allocator, upstream_package_name);
+        try argv.append(allocator, update_package_name);
     }
 
     try runCommand(io, allocator, argv.items, null);
+    return true;
 }
 
 fn appendNpmCommandFromSettings(io: std.Io, allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), path: []const u8) !bool {
@@ -1237,9 +1398,34 @@ fn runCommandCapture(io: std.Io, allocator: std.mem.Allocator, argv: []const []c
     }
 }
 
+fn runCommandCaptureQuiet(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) ![]u8 {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+        .expand_arg0 = .expand,
+    });
+    errdefer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return result.stdout;
+            return error.PackageCommandFailed;
+        },
+        else => return error.PackageCommandFailed,
+    }
+}
+
 fn isOfflineMode(env: *const std.process.Environ.Map) bool {
     const value = env.get("PI_OFFLINE") orelse return false;
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+fn isVersionCheckSkipped(env: *const std.process.Environ.Map) bool {
+    const value = env.get("PI_SKIP_VERSION_CHECK") orelse return false;
+    return value.len > 0;
 }
 
 fn exitPackageError(io: std.Io, err: anyerror) noreturn {
