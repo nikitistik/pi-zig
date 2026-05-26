@@ -54,8 +54,12 @@ const server = http.createServer((req, res) => {
       return;
     }
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    const user = [...body.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
-    const userMessages = body.messages.filter((message) => message.role === 'user').map((message) => message.content);
+    const contentText = (content) => Array.isArray(content)
+      ? content.filter((part) => part?.type === 'text').map((part) => part.text ?? '').join('\\n')
+      : String(content ?? '');
+    const lastUserMessage = [...body.messages].reverse().find((message) => message.role === 'user');
+    const user = contentText(lastUserMessage?.content);
+    const userMessages = body.messages.filter((message) => message.role === 'user').map((message) => contentText(message.content));
     const system = body.messages.find((message) => message.role === 'system')?.content ?? '';
     const toolMessages = body.messages.filter((message) => message.role === 'tool');
     const hasTool = (name) => body.tools?.some((tool) => tool?.function?.name === name) ?? false;
@@ -90,6 +94,31 @@ const server = http.createServer((req, res) => {
       res.write('data: {"choices":[{"delta":{"content":"stream "}}]}\\n\\n');
       res.write('data: {"choices":[{"delta":{"content":"delta"}}]}\\n\\n');
       res.end('data: [DONE]\\n\\n');
+      return;
+    }
+    if (user.includes('image input json')) {
+      const content = lastUserMessage?.content;
+      const hasText = Array.isArray(content) && content.some((part) => part?.type === 'text' && part.text?.includes('image input json'));
+      const hasImage = Array.isArray(content) && content.some((part) => part?.type === 'image_url' && part.image_url?.url === 'data:image/png;base64,aW1hZ2Utc21va2U=');
+      if (!hasText || !hasImage || body.stream !== true || (body.tools?.length ?? 0) !== 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing streamed image content part', content, stream: body.stream, tools: body.tools }));
+        return;
+      }
+      writeStreamEvents([{ choices: [{ delta: { content: 'image json observed' } }] }]);
+      return;
+    }
+    if (user.includes('image input agent')) {
+      const content = lastUserMessage?.content;
+      const hasText = Array.isArray(content) && content.some((part) => part?.type === 'text' && part.text?.includes('image input agent'));
+      const hasImage = Array.isArray(content) && content.some((part) => part?.type === 'image_url' && part.image_url?.url === 'data:image/png;base64,aW1hZ2Utc21va2U=');
+      if (!hasText || !hasImage || (body.tools?.length ?? 0) === 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing agent image content part', content, tools: body.tools }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'image agent observed' } }] }));
       return;
     }
     if (user.includes('expect no tools')) {
@@ -2352,6 +2381,32 @@ try {
     !providerJsonStreamLines.some((line) => line.type === 'agent_end' && JSON.stringify(line.messages).includes('stream delta'))
   ) {
     throw new Error('top-level JSON mode smoke did not stream provider text deltas');
+  }
+
+  const providerImageFixture = path.resolve('zig-out/pi-zig-provider-image-fixture');
+  fs.rmSync(providerImageFixture, { recursive: true, force: true });
+  fs.mkdirSync(providerImageFixture, { recursive: true });
+  const providerImagePath = path.join(providerImageFixture, 'input.png');
+  fs.writeFileSync(providerImagePath, Buffer.from('aW1hZ2Utc21va2U=', 'base64'));
+  const providerJsonImageLines = run(
+    ['--mode', 'json', '--no-session', '--no-tools', '--provider', 'openai', '--model', 'mock-json-image-model', '@' + providerImagePath, '-p', 'image input json'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (!providerJsonImageLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'image json observed')) {
+    throw new Error('top-level JSON no-tools provider path did not send image content parts');
+  }
+  const providerAgentImage = run(
+    ['--no-session', '--provider', 'openai', '--model', 'mock-agent-image-model', '@' + providerImagePath, '-p', 'image input agent'],
+    undefined,
+    { env: providerEnv }
+  );
+  if (!providerAgentImage.includes('image agent observed')) {
+    throw new Error('provider-backed agent loop did not send image content parts');
   }
 
   const providerJsonToolLines = run(

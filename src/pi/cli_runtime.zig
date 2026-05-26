@@ -18,9 +18,17 @@ const all_tool_names = [_][]const u8{ "read", "bash", "edit", "write", "grep", "
 const PromptResult = struct {
     text: []const u8,
     owned: bool = false,
+    image_parts: []ai_client.ChatContentPart = &.{},
 
     fn deinit(self: PromptResult, allocator: std.mem.Allocator) void {
         if (self.owned) allocator.free(self.text);
+        for (self.image_parts) |part| {
+            switch (part) {
+                .image => |image| allocator.free(image.data),
+                .text => {},
+            }
+        }
+        if (self.image_parts.len > 0) allocator.free(self.image_parts);
     }
 };
 
@@ -105,8 +113,8 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     }
 
     return switch (mode) {
-        .json => runJsonPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text),
-        .text => runTextPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text),
+        .json => runJsonPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text, prompt.image_parts),
+        .text => runTextPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text, prompt.image_parts),
         .rpc => unreachable,
     };
 }
@@ -161,13 +169,14 @@ fn runTextPrintFoundation(
     env: *const std.process.Environ.Map,
     parsed: cli.ParsedArgs,
     prompt: []const u8,
+    image_parts: []const ai_client.ChatContentPart,
 ) !void {
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, false, null, null, null, null, null, null);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, image_parts, false, null, null, null, null, null, null);
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -184,9 +193,10 @@ fn runJsonPrintFoundation(
     env: *const std.process.Environ.Map,
     parsed: cli.ParsedArgs,
     prompt: []const u8,
+    image_parts: []const ai_client.ChatContentPart,
 ) !void {
     if (shouldUseProviderTextStream(parsed)) {
-        return runJsonProviderTextStream(io, allocator, env, parsed, prompt);
+        return runJsonProviderTextStream(io, allocator, env, parsed, prompt, image_parts);
     }
 
     var store = try maybeOpenStore(io, allocator, env, parsed);
@@ -211,6 +221,7 @@ fn runJsonPrintFoundation(
         env,
         parsed,
         prompt,
+        image_parts,
         true,
         &tool_event_context,
         handleJsonToolStart,
@@ -264,6 +275,7 @@ fn runJsonProviderTextStream(
     env: *const std.process.Environ.Map,
     parsed: cli.ParsedArgs,
     prompt: []const u8,
+    image_parts: []const ai_client.ChatContentPart,
 ) !void {
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
@@ -293,7 +305,9 @@ fn runJsonProviderTextStream(
         messages_buf[messages_len] = .{ .role = .system, .content = trimmed_system };
         messages_len += 1;
     }
-    messages_buf[messages_len] = .{ .role = .user, .content = prompt };
+    const prompt_content_parts = try buildPromptContentParts(allocator, prompt, image_parts);
+    defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
+    messages_buf[messages_len] = .{ .role = .user, .content = prompt, .content_parts = prompt_content_parts };
     messages_len += 1;
 
     try emitJsonPrelude(io, allocator, if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral");
@@ -580,8 +594,31 @@ fn buildPrompt(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs)
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    var image_parts: std.ArrayList(ai_client.ChatContentPart) = .empty;
+    errdefer {
+        for (image_parts.items) |part| {
+            switch (part) {
+                .image => |image| allocator.free(image.data),
+                .text => {},
+            }
+        }
+        image_parts.deinit(allocator);
+    }
 
     for (parsed.file_args[0..parsed.file_args_len]) |path| {
+        if (imageMimeTypeForPath(path)) |mime_type| {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024));
+            defer allocator.free(bytes);
+            const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+            const encoded = try allocator.alloc(u8, encoded_len);
+            errdefer allocator.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, bytes);
+            try image_parts.append(allocator, .{ .image = .{
+                .data = encoded,
+                .mime_type = mime_type,
+            } });
+            continue;
+        }
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
         defer allocator.free(bytes);
         if (out.written().len != 0) try w.writeAll("\n\n");
@@ -596,7 +633,17 @@ fn buildPrompt(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs)
         try w.writeAll(message);
     }
 
-    return .{ .text = try out.toOwnedSlice(), .owned = true };
+    var text: []const u8 = "";
+    var text_owned = false;
+    errdefer if (text_owned) allocator.free(text);
+    if (out.written().len == 0) {
+        out.deinit();
+    } else {
+        text = try out.toOwnedSlice();
+        text_owned = true;
+    }
+    const images: []ai_client.ChatContentPart = if (image_parts.items.len > 0) try image_parts.toOwnedSlice(allocator) else &.{};
+    return .{ .text = text, .owned = text_owned, .image_parts = images };
 }
 
 fn buildFoundationResponse(allocator: std.mem.Allocator, parsed: cli.ParsedArgs, prompt: []const u8) ![]u8 {
@@ -633,6 +680,7 @@ fn buildPrintResponse(
     env: *const std.process.Environ.Map,
     parsed: cli.ParsedArgs,
     prompt: []const u8,
+    image_parts: []const ai_client.ChatContentPart,
     stream_turns: bool,
     tool_event_context: ?*anyopaque,
     on_tool_start: ?agent.ToolStartCallback,
@@ -662,12 +710,15 @@ fn buildPrintResponse(
     defer allocator.free(runtime_system_prompt);
     const shell_settings = try settings.loadShellSettings(io, allocator, env);
     defer shell_settings.deinit(allocator);
+    const prompt_content_parts = try buildPromptContentParts(allocator, prompt, image_parts);
+    defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
 
     return agent.runPrompt(io, allocator, env, .{
         .provider = provider,
         .model = model,
         .api_key = api_key,
         .prompt = prompt,
+        .prompt_content_parts = prompt_content_parts,
         .system_prompt = runtime_system_prompt,
         .shell_path = shell_settings.shell_path,
         .shell_command_prefix = shell_settings.shell_command_prefix,
@@ -702,6 +753,44 @@ fn toolSetFromParsed(parsed: cli.ParsedArgs) agent.ToolSet {
         };
     }
     return .all;
+}
+
+fn buildPromptContentParts(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    image_parts: []const ai_client.ChatContentPart,
+) ![]ai_client.ChatContentPart {
+    if (image_parts.len == 0) return &.{};
+    const text_parts: usize = if (prompt.len > 0) 1 else 0;
+    const parts = try allocator.alloc(ai_client.ChatContentPart, text_parts + image_parts.len);
+    var index: usize = 0;
+    if (prompt.len > 0) {
+        parts[index] = .{ .text = prompt };
+        index += 1;
+    }
+    for (image_parts) |part| {
+        parts[index] = part;
+        index += 1;
+    }
+    return parts;
+}
+
+fn imageMimeTypeForPath(path: []const u8) ?[]const u8 {
+    const ext = std.fs.path.extension(path);
+    if (asciiEqlIgnoreCase(ext, ".png")) return "image/png";
+    if (asciiEqlIgnoreCase(ext, ".jpg")) return "image/jpeg";
+    if (asciiEqlIgnoreCase(ext, ".jpeg")) return "image/jpeg";
+    if (asciiEqlIgnoreCase(ext, ".webp")) return "image/webp";
+    if (asciiEqlIgnoreCase(ext, ".gif")) return "image/gif";
+    return null;
+}
+
+fn asciiEqlIgnoreCase(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    return true;
 }
 
 fn toolListContains(value: []const u8, needle: []const u8) bool {

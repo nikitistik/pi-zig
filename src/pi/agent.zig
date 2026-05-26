@@ -21,6 +21,7 @@ pub const RunOptions = struct {
     shell_path: ?[]const u8 = null,
     shell_command_prefix: ?[]const u8 = null,
     history: []const ai_client.ChatMessage = &.{},
+    prompt_content_parts: []const ai_client.ChatContentPart = &.{},
     max_turns: usize = 8,
     tool_set: ToolSet = .all,
     stream_turns: bool = false,
@@ -249,11 +250,13 @@ const all_tool_definitions = [_]ai_client.ChatToolDefinition{
 const OwnedMessage = struct {
     role: ai_client.ChatRole,
     content: []u8,
+    content_parts: []ai_client.ChatContentPart = &.{},
     tool_call_id: ?[]u8 = null,
     tool_calls: []ai_client.ChatToolCall = &.{},
 
     fn deinit(self: OwnedMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
+        freeContentParts(allocator, self.content_parts);
         if (self.tool_call_id) |id| allocator.free(id);
         for (self.tool_calls) |call| call.deinit(allocator);
         allocator.free(self.tool_calls);
@@ -263,6 +266,7 @@ const OwnedMessage = struct {
         return .{
             .role = self.role,
             .content = self.content,
+            .content_parts = self.content_parts,
             .tool_call_id = self.tool_call_id,
             .tool_calls = self.tool_calls,
         };
@@ -296,6 +300,7 @@ pub fn runPrompt(
     try messages.append(allocator, .{
         .role = .user,
         .content = try allocator.dupe(u8, options.prompt),
+        .content_parts = try cloneContentParts(allocator, options.prompt_content_parts),
     });
 
     var tool_results_count: usize = 0;
@@ -437,6 +442,7 @@ fn cloneChatMessage(allocator: std.mem.Allocator, message: ai_client.ChatMessage
     var owned = OwnedMessage{
         .role = message.role,
         .content = try allocator.dupe(u8, message.content),
+        .content_parts = try cloneContentParts(allocator, message.content_parts),
         .tool_call_id = null,
         .tool_calls = &.{},
     };
@@ -448,6 +454,49 @@ fn cloneChatMessage(allocator: std.mem.Allocator, message: ai_client.ChatMessage
         owned.tool_calls = try cloneToolCalls(allocator, message.tool_calls);
     }
     return owned;
+}
+
+fn cloneContentParts(allocator: std.mem.Allocator, parts: []const ai_client.ChatContentPart) ![]ai_client.ChatContentPart {
+    if (parts.len == 0) return &.{};
+    const cloned = try allocator.alloc(ai_client.ChatContentPart, parts.len);
+    var len: usize = 0;
+    errdefer {
+        for (cloned[0..len]) |part| {
+            switch (part) {
+                .text => |text| allocator.free(text),
+                .image => |image| {
+                    allocator.free(image.data);
+                    allocator.free(image.mime_type);
+                },
+            }
+        }
+        allocator.free(cloned);
+    }
+    for (parts) |part| {
+        cloned[len] = switch (part) {
+            .text => |text| .{ .text = try allocator.dupe(u8, text) },
+            .image => |image| .{ .image = .{
+                .data = try allocator.dupe(u8, image.data),
+                .mime_type = try allocator.dupe(u8, image.mime_type),
+            } },
+        };
+        len += 1;
+    }
+    return cloned;
+}
+
+fn freeContentParts(allocator: std.mem.Allocator, parts: []ai_client.ChatContentPart) void {
+    if (parts.len == 0) return;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| allocator.free(text),
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        }
+    }
+    allocator.free(parts);
 }
 
 fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai_client.ChatToolCall) ![]ai_client.ChatToolCall {
