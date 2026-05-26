@@ -6,6 +6,7 @@ const commands = @import("commands.zig");
 const context_files = @import("context_files.zig");
 const models = @import("models.zig");
 const session = @import("session.zig");
+const settings = @import("settings.zig");
 const system_prompt = @import("system_prompt.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
@@ -372,7 +373,15 @@ const Runtime = struct {
     }
 
     fn executeBash(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, shell_command: []const u8, timeout_ms: ?i64) !tools.ShellResult {
-        const result = try tools.runShellCaptureWithUpdates(io, allocator, shell_command, .{ .timeout_ms = timeout_ms });
+        var shell_settings: settings.ShellSettings = .{};
+        if (self.env) |env| shell_settings = try settings.loadShellSettings(io, allocator, env);
+        defer shell_settings.deinit(allocator);
+
+        const result = try tools.runShellCaptureWithUpdates(io, allocator, shell_command, .{
+            .timeout_ms = timeout_ms,
+            .shell_path = shell_settings.shell_path,
+            .command_prefix = shell_settings.shell_command_prefix,
+        });
         errdefer allocator.free(result.output);
         const entry_id = try self.store.appendBashExecution(io, allocator, shell_command, result);
         try self.addLoadedBash(entry_id, shell_command, result);
@@ -480,6 +489,8 @@ const Runtime = struct {
         defer allocator.free(api_key);
         const runtime_system_prompt = try buildRuntimeSystemPrompt(io, allocator, env);
         defer allocator.free(runtime_system_prompt);
+        const shell_settings = try settings.loadShellSettings(io, allocator, env);
+        defer shell_settings.deinit(allocator);
         var history = try self.buildAgentHistory(allocator);
         defer history.deinit(allocator);
 
@@ -489,6 +500,8 @@ const Runtime = struct {
             .api_key = api_key,
             .prompt = prompt,
             .system_prompt = runtime_system_prompt,
+            .shell_path = shell_settings.shell_path,
+            .shell_command_prefix = shell_settings.shell_command_prefix,
             .history = history.items,
             .tool_set = .all,
         });

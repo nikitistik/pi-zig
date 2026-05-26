@@ -19,6 +19,42 @@ const LoadResult = struct {
     }
 };
 
+pub const ShellSettings = struct {
+    shell_path: ?[]u8 = null,
+    shell_command_prefix: ?[]u8 = null,
+
+    pub fn deinit(self: ShellSettings, allocator: std.mem.Allocator) void {
+        if (self.shell_path) |value| allocator.free(value);
+        if (self.shell_command_prefix) |value| allocator.free(value);
+    }
+};
+
+pub fn loadShellSettings(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !ShellSettings {
+    const cwd = try currentPathOwned(io, allocator);
+    defer allocator.free(cwd);
+    const paths = try settingsPaths(allocator, env, cwd);
+    defer paths.deinit(allocator);
+
+    var global = try loadSettings(io, allocator, paths.global);
+    defer global.deinit();
+    var project = try loadSettings(io, allocator, paths.project);
+    defer project.deinit();
+
+    var result = ShellSettings{};
+    errdefer result.deinit(allocator);
+
+    const shell_path_setting = fieldString(project.parsed.value, "shellPath") orelse fieldString(global.parsed.value, "shellPath");
+    const shell_prefix_setting = fieldString(project.parsed.value, "shellCommandPrefix") orelse fieldString(global.parsed.value, "shellCommandPrefix");
+
+    if (nonEmptyString(shell_path_setting)) |shell_path| {
+        result.shell_path = try expandMaybeTilde(allocator, env, shell_path);
+    }
+    if (nonEmptyString(shell_prefix_setting)) |prefix| {
+        result.shell_command_prefix = try allocator.dupe(u8, prefix);
+    }
+    return result;
+}
+
 pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, args: []const []const u8) !bool {
     if (args.len == 0 or !std.mem.eql(u8, args[0], "settings")) return false;
 
@@ -329,6 +365,8 @@ fn resolvedSettings(allocator: std.mem.Allocator, env: *const std.process.Enviro
     try root.put(allocator, "steeringMode", .{ .string = fieldString(settings, "steeringMode") orelse "one-at-a-time" });
     try root.put(allocator, "followUpMode", .{ .string = fieldString(settings, "followUpMode") orelse "one-at-a-time" });
     try root.put(allocator, "theme", optionalStringValue(fieldString(settings, "theme")));
+    try root.put(allocator, "shellPath", try resolvedShellPathValue(allocator, env, fieldString(settings, "shellPath")));
+    try root.put(allocator, "shellCommandPrefix", optionalStringValue(nonEmptyString(fieldString(settings, "shellCommandPrefix"))));
     try root.put(allocator, "sessionDir", try resolvedSessionDir(allocator, env, fieldString(settings, "sessionDir")));
     try root.put(allocator, "compaction", try compactionSettings(allocator, settings));
     try root.put(allocator, "branchSummary", try branchSummarySettings(allocator, settings));
@@ -501,6 +539,17 @@ fn numberToI64(value: std.json.Value) ?i64 {
 
 fn optionalStringValue(value: ?[]const u8) std.json.Value {
     return if (value) |string| .{ .string = string } else .null;
+}
+
+fn nonEmptyString(value: ?[]const u8) ?[]const u8 {
+    const string = value orelse return null;
+    const trimmed = std.mem.trim(u8, string, " \t\r\n");
+    return if (trimmed.len == 0) null else trimmed;
+}
+
+fn resolvedShellPathValue(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, value: ?[]const u8) !std.json.Value {
+    const raw = nonEmptyString(value) orelse return .null;
+    return .{ .string = try expandMaybeTilde(allocator, env, raw) };
 }
 
 fn resolvedSessionDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, value: ?[]const u8) !std.json.Value {

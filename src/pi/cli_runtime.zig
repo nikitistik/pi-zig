@@ -9,6 +9,7 @@ const context_files = @import("context_files.zig");
 const models = @import("models.zig");
 const rpc = @import("rpc.zig");
 const session = @import("session.zig");
+const settings = @import("settings.zig");
 const system_prompt = @import("system_prompt.zig");
 const tools = @import("tools.zig");
 
@@ -659,6 +660,8 @@ fn buildPrintResponse(
 
     const runtime_system_prompt = try buildRuntimeSystemPrompt(io, allocator, env, parsed);
     defer allocator.free(runtime_system_prompt);
+    const shell_settings = try settings.loadShellSettings(io, allocator, env);
+    defer shell_settings.deinit(allocator);
 
     return agent.runPrompt(io, allocator, env, .{
         .provider = provider,
@@ -666,6 +669,8 @@ fn buildPrintResponse(
         .api_key = api_key,
         .prompt = prompt,
         .system_prompt = runtime_system_prompt,
+        .shell_path = shell_settings.shell_path,
+        .shell_command_prefix = shell_settings.shell_command_prefix,
         .tool_set = toolSetFromParsed(parsed),
         .stream_turns = stream_turns,
         .tool_event_context = tool_event_context,

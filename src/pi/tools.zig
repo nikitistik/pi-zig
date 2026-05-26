@@ -60,6 +60,8 @@ pub const ShellCaptureOptions = struct {
     cancellation_context: ?*anyopaque = null,
     should_cancel: ?ShellCancellationCallback = null,
     cancellation_poll_ms: i64 = 100,
+    shell_path: ?[]const u8 = null,
+    command_prefix: ?[]const u8 = null,
 };
 
 pub const GrepOptions = struct {
@@ -595,7 +597,9 @@ pub fn runShellCaptureWithUpdates(
     command: []const u8,
     options: ShellCaptureOptions,
 ) !ShellResult {
-    const argv = [_][]const u8{ "sh", "-lc", command };
+    const resolved_command = try prefixedShellCommand(allocator, command, options.command_prefix);
+    defer resolved_command.deinit(allocator);
+    const argv = [_][]const u8{ options.shell_path orelse "sh", "-lc", resolved_command.command };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdin = .ignore,
@@ -1024,6 +1028,24 @@ fn combineShellOutput(allocator: std.mem.Allocator, stdout: []const u8, stderr: 
     @memcpy(raw_output[0..stdout.len], stdout);
     @memcpy(raw_output[stdout.len..], stderr);
     return raw_output;
+}
+
+const ResolvedShellCommand = struct {
+    command: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: ResolvedShellCommand, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.command);
+    }
+};
+
+fn prefixedShellCommand(allocator: std.mem.Allocator, command: []const u8, maybe_prefix: ?[]const u8) !ResolvedShellCommand {
+    const prefix = std.mem.trim(u8, maybe_prefix orelse return .{ .command = command }, " \t\r\n");
+    if (prefix.len == 0) return .{ .command = command };
+    return .{
+        .command = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ prefix, command }),
+        .owned = true,
+    };
 }
 
 fn emitShellUpdateSnapshot(

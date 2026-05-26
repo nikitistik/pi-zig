@@ -1625,6 +1625,7 @@ fs.writeFileSync(
     compaction: {
       reserveTokens: 111
     },
+    shellCommandPrefix: 'export PI_ZIG_PREFIX=global-prefix',
     enabledModels: ['claude-opus-4-5', 'gpt-5.2-codex'],
     httpIdleTimeoutMs: 'disabled',
     sessionDir: '~/sessions'
@@ -1640,7 +1641,9 @@ fs.writeFileSync(
     },
     branchSummary: {
       skipPrompt: true
-    }
+    },
+    shellPath: '~/custom-shell',
+    shellCommandPrefix: 'export PI_ZIG_PREFIX=project-prefix'
   }, null, 2)
 );
 const settingsReport = JSON.parse(run(['settings', '--json'], undefined, { cwd: settingsFixtureProject, env: settingsFixtureEnv }));
@@ -1663,6 +1666,8 @@ if (
   settingsReport.resolved.retry?.provider?.maxRetryDelayMs !== 1234 ||
   settingsReport.resolved.branchSummary?.skipPrompt !== true ||
   settingsReport.resolved.httpIdleTimeoutMs !== 0 ||
+  settingsReport.resolved.shellPath !== path.join(settingsFixtureHome, 'custom-shell') ||
+  settingsReport.resolved.shellCommandPrefix !== 'export PI_ZIG_PREFIX=project-prefix' ||
   settingsReport.resolved.sessionDir !== path.join(settingsFixtureHome, 'sessions') ||
   settingsReport.resolved.enableSkillCommands !== false
 ) {
@@ -3085,6 +3090,34 @@ if (
   !rpcTimeoutMessages?.data?.messages?.[0]?.output?.includes('rpc-before-timeout')
 ) {
   throw new Error('rpc bash timeout smoke did not persist cancelled bashExecution message');
+}
+const rpcShellSettingsRoot = path.resolve('zig-out/pi-zig-rpc-shell-settings-smoke');
+const rpcShellSettingsProject = path.join(rpcShellSettingsRoot, 'project');
+const rpcShellSettingsHome = path.join(rpcShellSettingsRoot, 'home');
+fs.rmSync(rpcShellSettingsRoot, { recursive: true, force: true });
+fs.mkdirSync(path.join(rpcShellSettingsProject, '.pi'), { recursive: true });
+fs.mkdirSync(path.join(rpcShellSettingsHome, '.pi/agent'), { recursive: true });
+fs.writeFileSync(path.join(rpcShellSettingsProject, '.pi/settings.json'), JSON.stringify({
+  shellCommandPrefix: 'export PI_ZIG_RPC_PREFIX=from-settings'
+}, null, 2));
+const rpcShellSettingsOutput = run(
+  ['rpc', path.join(rpcShellSettingsRoot, 'rpc-shell-settings-smoke.jsonl')],
+  [
+    JSON.stringify({ id: 'rpc-shell-settings-bash-1', type: 'bash', command: 'printf $PI_ZIG_RPC_PREFIX' }),
+    ''
+  ].join('\n'),
+  {
+    cwd: rpcShellSettingsProject,
+    env: envWithoutAnthropicAuth({ HOME: rpcShellSettingsHome })
+  }
+);
+const rpcShellSettingsResponse = rpcShellSettingsOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)).find((response) => response.id === 'rpc-shell-settings-bash-1');
+if (
+  !rpcShellSettingsResponse?.success ||
+  rpcShellSettingsResponse?.data?.output !== 'from-settings' ||
+  rpcShellSettingsResponse?.data?.exitCode !== 0
+) {
+  throw new Error('rpc bash smoke did not apply shellCommandPrefix from settings');
 }
 const compactResponse = rpcResponses.find((response) => response.id === 'compact-1');
 if (
