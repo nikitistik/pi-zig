@@ -84,6 +84,7 @@ pub const ChatCompletionResult = struct {
 
 pub const ChatCompletionError = error{
     UnsupportedProvider,
+    ProviderClientError,
     ProviderRequestFailed,
     ProviderResponseInvalid,
     EmptyPrompt,
@@ -91,6 +92,14 @@ pub const ChatCompletionError = error{
 
 pub const StreamTextCallback = *const fn (ctx: *anyopaque, delta: []const u8) anyerror!void;
 const StreamDataCallback = *const fn (ctx: *anyopaque, data: []const u8) anyerror!void;
+
+fn providerErrorForStatus(status: std.http.Status) ChatCompletionError {
+    const code = @intFromEnum(status);
+    return if (code == 429 or code >= 500)
+        error.ProviderRequestFailed
+    else
+        error.ProviderClientError;
+}
 
 pub fn runChatCompletion(
     io: std.Io,
@@ -181,7 +190,7 @@ pub fn runChatTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(result.status);
     }
 
     return parseOpenAICompatibleResult(allocator, body);
@@ -296,7 +305,7 @@ fn streamChatTurnData(
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
         _ = reader.discardRemaining() catch {};
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(response.head.status);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -416,7 +425,7 @@ fn runAnthropicMessagesTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(result.status);
     }
 
     return parseAnthropicMessagesResult(allocator, body);
@@ -473,7 +482,7 @@ fn streamAnthropicMessagesData(
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
         _ = reader.discardRemaining() catch {};
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(response.head.status);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -522,7 +531,7 @@ fn runGoogleGenerateContentTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(result.status);
     }
 
     return parseGoogleGenerateContentResult(allocator, body);
@@ -577,7 +586,7 @@ fn streamGoogleGenerateContentData(
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
         _ = reader.discardRemaining() catch {};
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(response.head.status);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -629,7 +638,7 @@ fn runGoogleVertexGenerateContentTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(result.status);
     }
 
     return parseGoogleGenerateContentResult(allocator, body);
@@ -687,7 +696,7 @@ fn streamGoogleVertexGenerateContentData(
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
         _ = reader.discardRemaining() catch {};
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(response.head.status);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -735,7 +744,7 @@ fn runMistralChatTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(result.status);
     }
 
     return parseOpenAICompatibleResult(allocator, body);
@@ -789,7 +798,7 @@ fn streamMistralChatData(
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
         _ = reader.discardRemaining() catch {};
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(response.head.status);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -814,6 +823,7 @@ fn runBedrockConverseTurn(
     streamBedrockConverseData(io, allocator, env, request, &result_context, handleStreamResultData) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedProvider => return error.UnsupportedProvider,
+        error.ProviderClientError => return error.ProviderClientError,
         error.ProviderRequestFailed => return error.ProviderRequestFailed,
         error.ProviderResponseInvalid => return error.ProviderResponseInvalid,
         else => return error.ProviderRequestFailed,
@@ -872,7 +882,7 @@ fn streamBedrockConverseData(
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
         _ = reader.discardRemaining() catch {};
-        return error.ProviderRequestFailed;
+        return providerErrorForStatus(response.head.status);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -945,7 +955,7 @@ fn googleVertexAuthHeader(
             return .{ .authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token}) };
         }
     }
-    return error.ProviderRequestFailed;
+    return error.ProviderClientError;
 }
 
 fn isGoogleVertexPlaceholderApiKey(api_key: []const u8) bool {

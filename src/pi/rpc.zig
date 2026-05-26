@@ -1599,9 +1599,6 @@ const Runtime = struct {
         }
 
         if (std.mem.eql(u8, command, "abort_retry")) {
-            self.auto_retry_enabled = false;
-            self.last_retry_attempts = 0;
-            self.last_retry_delay_ms = 0;
             return writeSuccess(w, id, command);
         }
 
