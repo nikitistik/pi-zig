@@ -132,6 +132,9 @@ pub fn runChatTurn(
     if (isAnthropicMessagesProvider(request.provider)) {
         return runAnthropicMessagesTurn(io, allocator, env, request);
     }
+    if (isGoogleGenerativeProvider(request.provider)) {
+        return runGoogleGenerateContentTurn(io, allocator, env, request);
+    }
 
     const endpoint = try endpointForProvider(allocator, env, request.provider);
     defer allocator.free(endpoint);
@@ -229,6 +232,9 @@ fn streamChatTurnData(
     if (isAnthropicMessagesProvider(request.provider)) {
         return streamAnthropicMessagesData(io, allocator, env, request, callback_context, callback);
     }
+    if (isGoogleGenerativeProvider(request.provider)) {
+        return streamGoogleGenerateContentData(io, allocator, env, request, callback_context, callback);
+    }
 
     const endpoint = try endpointForProvider(allocator, env, request.provider);
     defer allocator.free(endpoint);
@@ -321,6 +327,10 @@ const StreamResultContext = struct {
 
 fn isAnthropicMessagesProvider(provider: []const u8) bool {
     return std.mem.eql(u8, provider, "anthropic");
+}
+
+fn isGoogleGenerativeProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "google");
 }
 
 fn runAnthropicMessagesTurn(
@@ -431,6 +441,110 @@ fn streamAnthropicMessagesData(
     try readAnthropicSseStream(allocator, reader, callback_context, callback);
 }
 
+fn runGoogleGenerateContentTurn(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+) ChatCompletionError!ChatCompletionResult {
+    const endpoint = try googleGenerateContentEndpointForProvider(allocator, env, request.model, false);
+    defer allocator.free(endpoint);
+
+    const payload = try buildGoogleGenerateContentPayload(allocator, request);
+    defer allocator.free(payload);
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "x-goog-api-key", .value = request.api_key },
+    };
+    const result = try client.fetch(.{
+        .location = .{ .url = endpoint },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+        },
+        .extra_headers = &extra_headers,
+    });
+
+    const body = response_body.written();
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        return error.ProviderRequestFailed;
+    }
+
+    return parseGoogleGenerateContentResult(allocator, body);
+}
+
+fn streamGoogleGenerateContentData(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    const endpoint = try googleGenerateContentEndpointForProvider(allocator, env, request.model, true);
+    defer allocator.free(endpoint);
+
+    const payload = try buildGoogleGenerateContentPayload(allocator, request);
+    defer allocator.free(payload);
+
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "x-goog-api-key", .value = request.api_key },
+    };
+    var request_handle = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .extra_headers = &extra_headers,
+    });
+    defer request_handle.deinit();
+
+    request_handle.transfer_encoding = .{ .content_length = payload.len };
+    var body_writer = try request_handle.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try request_handle.connection.?.flush();
+
+    var response = try request_handle.receiveHead(&.{});
+    if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
+        var transfer_buffer: [1024]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        _ = reader.discardRemaining() catch {};
+        return error.ProviderRequestFailed;
+    }
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    try readGoogleSseStream(reader, callback_context, callback);
+}
+
 const AnthropicAuthHeader = struct {
     authorization: ?[]u8 = null,
     oauth: bool = false,
@@ -484,6 +598,20 @@ fn anthropicMessagesEndpointForProvider(allocator: std.mem.Allocator, env: *cons
         return endpointFromBaseUrlWithPath(allocator, base_url, "/v1/messages");
     }
     return allocator.dupe(u8, "https://api.anthropic.com/v1/messages");
+}
+
+fn googleGenerateContentEndpointForProvider(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    model: []const u8,
+    stream: bool,
+) ![]u8 {
+    const base_url = env.get("PI_ZIG_PROVIDER_BASE_URL") orelse "https://generativelanguage.googleapis.com/v1beta";
+    var end = base_url.len;
+    while (end > 0 and base_url[end - 1] == '/') end -= 1;
+    const trimmed = base_url[0..end];
+    const action = if (stream) "streamGenerateContent?alt=sse" else "generateContent";
+    return std.fmt.allocPrint(allocator, "{s}/models/{s}:{s}", .{ trimmed, model, action });
 }
 
 fn endpointFromBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
@@ -568,6 +696,43 @@ fn buildAnthropicMessagesPayload(allocator: std.mem.Allocator, request: ChatTurn
             try writeAnthropicToolDefinition(w, tool);
         }
         try w.writeByte(']');
+    }
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn buildGoogleGenerateContentPayload(allocator: std.mem.Allocator, request: ChatTurnRequest) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    try w.writeAll("{\"contents\":[");
+    var emitted: usize = 0;
+    var index: usize = 0;
+    while (index < request.messages.len) {
+        const message = request.messages[index];
+        if (message.role == .system) {
+            index += 1;
+            continue;
+        }
+        if (emitted != 0) try w.writeByte(',');
+        if (message.role == .tool) {
+            try writeGoogleToolResultContent(w, request.messages, &index);
+        } else {
+            try writeGoogleContent(w, message);
+            index += 1;
+        }
+        emitted += 1;
+    }
+    try w.writeByte(']');
+    try writeGoogleSystemInstruction(w, request.messages);
+    if (request.tools.len > 0) {
+        try w.writeAll(",\"tools\":[{\"functionDeclarations\":[");
+        for (request.tools, 0..) |tool, tool_index| {
+            if (tool_index != 0) try w.writeByte(',');
+            try writeGoogleToolDefinition(w, tool);
+        }
+        try w.writeAll("]}],\"toolConfig\":{\"functionCallingConfig\":{\"mode\":\"AUTO\"}}");
     }
     try w.writeByte('}');
     return out.toOwnedSlice();
@@ -680,6 +845,123 @@ fn writeAnthropicToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !vo
     try w.writeByte('}');
 }
 
+fn writeGoogleSystemInstruction(w: *std.Io.Writer, messages: []const ChatMessage) !void {
+    var emitted: usize = 0;
+    for (messages) |message| {
+        if (message.role != .system or std.mem.trim(u8, message.content, " \t\r\n").len == 0) continue;
+        if (emitted == 0) try w.writeAll(",\"systemInstruction\":{\"parts\":[") else try w.writeByte(',');
+        try w.writeAll("{\"text\":");
+        try writeJsonString(w, message.content);
+        try w.writeByte('}');
+        emitted += 1;
+    }
+    if (emitted != 0) try w.writeAll("]}");
+}
+
+fn writeGoogleContent(w: *std.Io.Writer, message: ChatMessage) !void {
+    try w.writeAll("{\"role\":");
+    try writeJsonString(w, if (message.role == .assistant) "model" else "user");
+    try w.writeAll(",\"parts\":[");
+    var emitted: usize = 0;
+    if (message.role == .assistant and message.content.len > 0) {
+        try writeGoogleTextPart(w, message.content, &emitted);
+    } else if (message.content_parts.len > 0) {
+        for (message.content_parts) |part| {
+            if (emitted != 0) try w.writeByte(',');
+            try writeGoogleContentPart(w, part);
+            emitted += 1;
+        }
+    } else if (message.content.len > 0) {
+        try writeGoogleTextPart(w, message.content, &emitted);
+    }
+    if (message.role == .assistant and message.tool_calls.len > 0) {
+        for (message.tool_calls) |call| {
+            if (emitted != 0) try w.writeByte(',');
+            try writeGoogleFunctionCallPart(w, call);
+            emitted += 1;
+        }
+    }
+    try w.writeAll("]}");
+}
+
+fn writeGoogleToolResultContent(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize) !void {
+    try w.writeAll("{\"role\":\"user\",\"parts\":[");
+    var emitted: usize = 0;
+    while (index.* < messages.len and messages[index.*].role == .tool) : (index.* += 1) {
+        const message = messages[index.*];
+        const tool_call_id = message.tool_call_id orelse return error.ProviderResponseInvalid;
+        const tool_name = findToolNameForToolResult(messages, index.*, tool_call_id) orelse return error.ProviderResponseInvalid;
+        if (emitted != 0) try w.writeByte(',');
+        try w.writeAll("{\"functionResponse\":{\"name\":");
+        try writeJsonString(w, tool_name);
+        try w.writeAll(",\"response\":{\"output\":");
+        try writeJsonString(w, message.content);
+        try w.writeAll("}}}");
+        emitted += 1;
+    }
+    try w.writeAll("]}");
+}
+
+fn findToolNameForToolResult(messages: []const ChatMessage, up_to_index: usize, tool_call_id: []const u8) ?[]const u8 {
+    var remaining = up_to_index;
+    while (remaining > 0) {
+        remaining -= 1;
+        const message = messages[remaining];
+        if (message.role != .assistant) continue;
+        for (message.tool_calls) |call| {
+            if (std.mem.eql(u8, call.id, tool_call_id)) return call.name;
+        }
+    }
+    return null;
+}
+
+fn writeGoogleTextPart(w: *std.Io.Writer, text: []const u8, emitted: *usize) !void {
+    if (emitted.* != 0) try w.writeByte(',');
+    try w.writeAll("{\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+    emitted.* += 1;
+}
+
+fn writeGoogleContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
+    switch (part) {
+        .text => |text| {
+            try w.writeAll("{\"text\":");
+            try writeJsonString(w, text);
+            try w.writeByte('}');
+        },
+        .image => |image| {
+            try w.writeAll("{\"inlineData\":{\"mimeType\":");
+            try writeJsonString(w, image.mime_type);
+            try w.writeAll(",\"data\":");
+            try writeJsonString(w, image.data);
+            try w.writeAll("}}");
+        },
+    }
+}
+
+fn writeGoogleFunctionCallPart(w: *std.Io.Writer, call: ChatToolCall) !void {
+    try w.writeAll("{\"functionCall\":{\"name\":");
+    try writeJsonString(w, call.name);
+    try w.writeAll(",\"args\":");
+    if (std.mem.trim(u8, call.arguments_json, " \t\r\n").len == 0) {
+        try w.writeAll("{}");
+    } else {
+        try w.writeAll(call.arguments_json);
+    }
+    try w.writeAll("}}");
+}
+
+fn writeGoogleToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void {
+    try w.writeAll("{\"name\":");
+    try writeJsonString(w, tool.name);
+    try w.writeAll(",\"description\":");
+    try writeJsonString(w, tool.description);
+    try w.writeAll(",\"parametersJsonSchema\":");
+    try w.writeAll(tool.parameters_json);
+    try w.writeByte('}');
+}
+
 fn readAnthropicSseStream(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -728,6 +1010,30 @@ fn readAnthropicSseStream(
         if (try isAnthropicMessageStopData(allocator, data)) saw_stop = true;
     }
     if (!saw_stop) return error.ProviderResponseInvalid;
+}
+
+fn readGoogleSseStream(
+    reader: *std.Io.Reader,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    var saw_data = false;
+    while (true) {
+        const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => return error.ProviderResponseInvalid,
+            else => return err,
+        };
+        const line_with_cr = raw_line orelse break;
+        const line = stripTrailingCarriageReturn(line_with_cr);
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0 or trimmed[0] == ':') continue;
+        if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+        const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
+        if (data.len == 0) continue;
+        try callback(callback_context, data);
+        saw_data = true;
+    }
+    if (!saw_data) return error.ProviderResponseInvalid;
 }
 
 const AnthropicSseEventKind = enum {
@@ -791,6 +1097,64 @@ fn parseAnthropicMessagesResult(allocator: std.mem.Allocator, body: []const u8) 
                 .name = try allocator.dupe(u8, try requiredObjectString(block, "name")),
                 .arguments_json = arguments_json,
             });
+        }
+    }
+
+    if (text.written().len > 0) {
+        result.text = try text.toOwnedSlice();
+        text = .init(allocator);
+    }
+    if (calls.items.len > 0) {
+        result.tool_calls = try calls.toOwnedSlice(allocator);
+    }
+    if (result.text == null and result.tool_calls.len == 0) return error.ProviderResponseInvalid;
+    return result;
+}
+
+fn parseGoogleGenerateContentResult(allocator: std.mem.Allocator, body: []const u8) !ChatCompletionResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.ProviderResponseInvalid;
+    defer parsed.deinit();
+
+    var result: ChatCompletionResult = .{};
+    errdefer result.deinit(allocator);
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    var calls: std.ArrayList(ChatToolCall) = .empty;
+    errdefer {
+        for (calls.items) |call| call.deinit(allocator);
+        calls.deinit(allocator);
+    }
+
+    const parts = try firstGoogleCandidateParts(parsed.value) orelse return error.ProviderResponseInvalid;
+    for (parts, 0..) |part, index| {
+        if (part != .object) return error.ProviderResponseInvalid;
+        if (part.object.get("text")) |text_value| {
+            if (text_value != .string) return error.ProviderResponseInvalid;
+            try text.writer.writeAll(text_value.string);
+        }
+        if (part.object.get("functionCall")) |function_call| {
+            if (function_call != .object) return error.ProviderResponseInvalid;
+            const name = try optionalObjectString(function_call, "name") orelse return error.ProviderResponseInvalid;
+            var id: ?[]u8 = if (try optionalObjectString(function_call, "id")) |provided_id|
+                try allocator.dupe(u8, provided_id)
+            else
+                try std.fmt.allocPrint(allocator, "{s}_google_{d}", .{ name, index + 1 });
+            errdefer if (id) |value| allocator.free(value);
+            var name_copy: ?[]u8 = try allocator.dupe(u8, name);
+            errdefer if (name_copy) |value| allocator.free(value);
+            var arguments_json: ?[]u8 = if (function_call.object.get("args")) |args|
+                if (args == .null) try allocator.dupe(u8, "{}") else try jsonValueToOwnedString(allocator, args)
+            else
+                try allocator.dupe(u8, "{}");
+            errdefer if (arguments_json) |value| allocator.free(value);
+            try calls.append(allocator, .{
+                .id = id.?,
+                .name = name_copy.?,
+                .arguments_json = arguments_json.?,
+            });
+            id = null;
+            name_copy = null;
+            arguments_json = null;
         }
     }
 
@@ -1607,6 +1971,39 @@ test "serializes Anthropic messages payload with images tools and tool results" 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"name\":\"bash\",\"description\":\"run shell\",\"input_schema\":{\"type\":\"object\"}}]") != null);
 }
 
+test "serializes Google generate content payload with images tools and tool results" {
+    const parts = [_]ChatContentPart{
+        .{ .text = "inspect this" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const tool_calls = [_]ChatToolCall{
+        .{ .id = @constCast("call_1"), .name = @constCast("bash"), .arguments_json = @constCast("{\"command\":\"printf ok\"}") },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "be terse" },
+        .{ .role = .user, .content_parts = parts[0..] },
+        .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
+        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1" },
+    };
+    const tools = [_]ChatToolDefinition{
+        .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
+    };
+    const payload = try buildGoogleGenerateContentPayload(std.testing.allocator, .{
+        .provider = "google",
+        .model = "gemini-test",
+        .api_key = "google-test",
+        .messages = messages[0..],
+        .tools = tools[0..],
+    });
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"systemInstruction\":{\"parts\":[{\"text\":\"be terse\"}]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"aGVsbG8=\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"functionCall\":{\"name\":\"bash\",\"args\":{\"command\":\"printf ok\"}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"functionResponse\":{\"name\":\"bash\",\"response\":{\"output\":\"ok\"}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"functionDeclarations\":[{\"name\":\"bash\",\"description\":\"run shell\",\"parametersJsonSchema\":{\"type\":\"object\"}}]}]") != null);
+}
+
 test "parses OpenAI-compatible tool calls" {
     const body =
         \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf ok\"}"}}]}}]}
@@ -1720,6 +2117,19 @@ test "parses Anthropic messages result text and tool use" {
     try std.testing.expectEqualStrings("{\"command\":\"printf ok\"}", result.tool_calls[0].arguments_json);
 }
 
+test "parses Google generate content result text and function call" {
+    const body =
+        \\{"candidates":[{"content":{"parts":[{"text":"before "},{"functionCall":{"id":"call_1","name":"bash","args":{"command":"printf ok"}}}]},"finishReason":"STOP"}]}
+    ;
+    const result = try parseGoogleGenerateContentResult(std.testing.allocator, body);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("before ", result.text.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf ok\"}", result.tool_calls[0].arguments_json);
+}
+
 test "parses native Anthropic SSE frames without done sentinel" {
     var accumulator = StreamChatAccumulator.init(std.testing.allocator);
     errdefer accumulator.deinit();
@@ -1745,6 +2155,25 @@ test "parses native Anthropic SSE frames without done sentinel" {
     const result = try accumulator.toResult();
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("native anthropic", result.text.?);
+}
+
+test "parses native Google SSE frames without done sentinel" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    var context = StreamResultContext{
+        .allocator = std.testing.allocator,
+        .accumulator = &accumulator,
+        .text_callback_context = null,
+        .text_callback = null,
+    };
+    var reader = std.Io.Reader.fixed(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"native \"}]}}]}\n\n" ++
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"google\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+    );
+    try readGoogleSseStream(&reader, &context, handleStreamResultData);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("native google", result.text.?);
 }
 
 test "assembles Anthropic tool use stream events" {
@@ -1823,4 +2252,18 @@ test "Anthropic provider base URL appends messages endpoint once" {
     const endpoint_from_root_base = try anthropicMessagesEndpointForProvider(std.testing.allocator, &env);
     defer std.testing.allocator.free(endpoint_from_root_base);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/messages", endpoint_from_root_base);
+}
+
+test "Google provider base URL appends stream generate content endpoint" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put("PI_ZIG_PROVIDER_BASE_URL", "http://127.0.0.1:43123/v1/");
+    const stream_endpoint = try googleGenerateContentEndpointForProvider(std.testing.allocator, &env, "gemini-test", true);
+    defer std.testing.allocator.free(stream_endpoint);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/models/gemini-test:streamGenerateContent?alt=sse", stream_endpoint);
+
+    const non_stream_endpoint = try googleGenerateContentEndpointForProvider(std.testing.allocator, &env, "gemini-test", false);
+    defer std.testing.allocator.free(non_stream_endpoint);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/models/gemini-test:generateContent", non_stream_endpoint);
 }

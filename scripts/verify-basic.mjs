@@ -106,6 +106,63 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'unknown native anthropic request', body }));
       return;
     }
+    const requestUrl = new URL(req.url, 'http://127.0.0.1');
+    const isGoogleGenerateContent = req.method === 'POST' &&
+      requestUrl.pathname.includes('/models/') &&
+      (requestUrl.pathname.endsWith(':streamGenerateContent') || requestUrl.pathname.endsWith(':generateContent'));
+    if (isGoogleGenerateContent) {
+      if (req.headers['x-goog-api-key'] !== 'fake-google-key') {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing google auth', headers: req.headers }));
+        return;
+      }
+      const body = JSON.parse(rawBody);
+      const googlePartText = (part) => part?.text ?? part?.functionResponse?.response?.output ?? part?.functionResponse?.response?.error ?? '';
+      const googleContentText = (content) => Array.isArray(content?.parts)
+        ? content.parts.map(googlePartText).join('\\n')
+        : '';
+      const userText = body.contents?.filter((content) => content.role === 'user').map(googleContentText).join('\\n') ?? '';
+      const functionResponses = body.contents?.flatMap((content) => Array.isArray(content.parts) ? content.parts.filter((part) => part?.functionResponse) : []) ?? [];
+      const hasBashTool = body.tools?.some((tool) => tool?.functionDeclarations?.some((decl) => decl?.name === 'bash' && decl?.parametersJsonSchema?.type === 'object')) ?? false;
+      const writeGoogleEvents = (events) => {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'close'
+        });
+        for (const event of events) {
+          res.write('data: ' + JSON.stringify(event) + '\\n\\n');
+        }
+        res.end();
+      };
+      if (userText.includes('native google stream tool events')) {
+        if (!requestUrl.pathname.endsWith(':streamGenerateContent') || !body.systemInstruction?.parts?.some((part) => part.text) || !hasBashTool) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native google request shape mismatch', body, pathname: requestUrl.pathname }));
+          return;
+        }
+        if (functionResponses.length === 0) {
+          writeGoogleEvents([
+            { candidates: [{ content: { parts: [{ functionCall: { id: 'call_native_google_stream_1', name: 'bash', args: { command: 'printf native-google-ok' } } }] }, finishReason: 'STOP' }] }
+          ]);
+          return;
+        }
+        const lastResponse = functionResponses.at(-1)?.functionResponse;
+        if (lastResponse?.name !== 'bash' || String(lastResponse?.response?.output ?? '').trim() !== 'native-google-ok') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native Google tool result mismatch', functionResponses }));
+          return;
+        }
+        writeGoogleEvents([
+          { candidates: [{ content: { parts: [{ text: 'native google ' }] } }] },
+          { candidates: [{ content: { parts: [{ text: 'tool complete: native-google-ok' }] }, finishReason: 'STOP' }] }
+        ]);
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unknown native google request', body }));
+      return;
+    }
     if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'not found' }));
@@ -2735,7 +2792,9 @@ try {
     (line) => line.type === 'tool_execution_update' &&
       line.toolName === 'bash' &&
       line.toolCallId === 'call_long_bash_updates_1' &&
-      line.partialResult?.details?.truncation?.truncated === true
+      line.partialResult?.details?.truncation?.truncated === true &&
+      line.partialResult?.details?.truncation?.totalLines === 2105 &&
+      line.partialResult?.content?.[0]?.text?.includes('json-update-line-2104')
   );
   if (
     longBashTruncatedUpdate?.partialResult?.details?.truncation?.truncatedBy !== 'lines' ||
@@ -2860,6 +2919,32 @@ try {
     !providerJsonGoogleToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('google stream tool complete: google-tool-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not assemble Google streamed tool calls');
+  }
+
+  const nativeGoogleEnv = {
+    ...envWithoutAnthropicAuth(),
+    GEMINI_API_KEY: 'fake-google-key',
+    PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl
+  };
+  const providerJsonNativeGoogleToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'google', '--model', 'gemini-2.5-flash', '-p', 'please run native google stream tool events'],
+    undefined,
+    { env: nativeGoogleEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonNativeGoogleToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_native_google_stream_1') ||
+    !providerJsonNativeGoogleToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_native_google_stream_1' && JSON.stringify(line.partialResult).includes('native-google-ok')) ||
+    !providerJsonNativeGoogleToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('native-google-ok')) ||
+    !providerJsonNativeGoogleToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_native_google_stream_1')) ||
+    !providerJsonNativeGoogleToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'native google ') ||
+    !providerJsonNativeGoogleToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'tool complete: native-google-ok') ||
+    !providerJsonNativeGoogleToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('native google tool complete: native-google-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not run native Google streamed tool calls');
   }
 
   const providerJsonToolErrorLines = run(
