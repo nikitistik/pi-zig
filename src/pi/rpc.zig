@@ -941,6 +941,7 @@ const Runtime = struct {
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
         history_limit: usize,
         batch_history_messages: []const UserBatchMessage,
         prompt: []const u8,
@@ -950,15 +951,29 @@ const Runtime = struct {
         self.last_retry_attempts = 0;
         self.last_retry_delay_ms = 0;
         while (true) {
-            return self.runAgentIfAuthenticatedOnce(io, allocator, history_limit, batch_history_messages, prompt, prompt_image_parts) catch |err| {
-                if (!self.auto_retry_enabled or !isRetryableAgentError(err) or retry_attempts >= self.auto_retry_max_attempts) return err;
+            const result = self.runAgentIfAuthenticatedOnce(io, allocator, history_limit, batch_history_messages, prompt, prompt_image_parts) catch |err| {
+                if (!self.auto_retry_enabled or !isRetryableAgentError(err)) return err;
+                if (retry_attempts >= self.auto_retry_max_attempts) {
+                    if (retry_attempts > 0) {
+                        try writeRpcAgentEndEvent(w, false);
+                        try writeRpcAutoRetryEndEvent(w, false, retry_attempts, @errorName(err));
+                    }
+                    return err;
+                }
                 retry_attempts += 1;
                 self.last_retry_attempts = retry_attempts;
                 const delay_ms = self.retryDelayMs(retry_attempts);
                 self.last_retry_delay_ms += delay_ms;
+                try writeRpcAgentEndEvent(w, true);
+                try writeRpcAutoRetryStartEvent(w, retry_attempts, self.auto_retry_max_attempts, delay_ms, @errorName(err));
                 if (delay_ms > 0) try sleepMilliseconds(io, delay_ms);
                 continue;
             };
+            if (retry_attempts > 0) {
+                try writeRpcAutoRetryEndEvent(w, true, retry_attempts, null);
+                try writeRpcAgentEndEvent(w, false);
+            }
+            return result;
         }
     }
 
@@ -1223,6 +1238,7 @@ const Runtime = struct {
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
         messages: []const UserBatchMessage,
         last_result: *?agent.RunResult,
     ) !void {
@@ -1236,6 +1252,7 @@ const Runtime = struct {
         const maybe_run_result = try self.runAgentIfAuthenticated(
             io,
             allocator,
+            w,
             history_limit,
             messages[0 .. messages.len - 1],
             prompt_message.text,
@@ -1262,18 +1279,19 @@ const Runtime = struct {
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
         last_result: *?agent.RunResult,
     ) !void {
         var batch: [max_pending_messages]UserBatchMessage = undefined;
         while (self.steering_queue.count > 0 or self.follow_up_queue.count > 0) {
             if (self.steering_queue.count > 0) {
                 const count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, &batch);
-                try self.runUserBatch(io, allocator, batch[0..count], last_result);
+                try self.runUserBatch(io, allocator, w, batch[0..count], last_result);
                 self.steering_queue.dropPrefix(allocator, count);
                 continue;
             }
             const count = self.drainQueueBatch(&self.follow_up_queue, self.follow_up_mode, &batch);
-            try self.runUserBatch(io, allocator, batch[0..count], last_result);
+            try self.runUserBatch(io, allocator, w, batch[0..count], last_result);
             self.follow_up_queue.dropPrefix(allocator, count);
         }
     }
@@ -1322,12 +1340,12 @@ const Runtime = struct {
         var initial_batch: [1 + max_pending_messages]UserBatchMessage = undefined;
         initial_batch[0] = .{ .text = message, .image_parts = image_parts };
         const steering_count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, initial_batch[1..]);
-        self.runUserBatch(io, allocator, initial_batch[0 .. 1 + steering_count], &last_result) catch |err| {
+        self.runUserBatch(io, allocator, w, initial_batch[0 .. 1 + steering_count], &last_result) catch |err| {
             return writeError(w, id, command, @errorName(err));
         };
         self.steering_queue.dropPrefix(allocator, steering_count);
 
-        self.drainQueuedMessages(io, allocator, &last_result) catch |err| {
+        self.drainQueuedMessages(io, allocator, w, &last_result) catch |err| {
             return writeError(w, id, command, @errorName(err));
         };
 
@@ -2244,6 +2262,42 @@ fn writeResponseHead(w: *std.Io.Writer, id: ?[]const u8, command: []const u8, su
     try writeJsonString(w, command);
     try w.writeAll(",\"success\":");
     try w.writeAll(if (success) "true" else "false");
+}
+
+fn writeRpcAgentEndEvent(w: *std.Io.Writer, will_retry: bool) !void {
+    try w.writeAll("{\"type\":\"agent_end\",\"willRetry\":");
+    try w.writeAll(if (will_retry) "true" else "false");
+    try w.writeAll("}\n");
+}
+
+fn writeRpcAutoRetryStartEvent(
+    w: *std.Io.Writer,
+    attempt: usize,
+    max_attempts: usize,
+    delay_ms: usize,
+    error_message: []const u8,
+) !void {
+    try w.writeAll("{\"type\":\"auto_retry_start\",\"attempt\":");
+    try w.print("{d}", .{attempt});
+    try w.writeAll(",\"maxAttempts\":");
+    try w.print("{d}", .{max_attempts});
+    try w.writeAll(",\"delayMs\":");
+    try w.print("{d}", .{delay_ms});
+    try w.writeAll(",\"errorMessage\":");
+    try writeJsonString(w, error_message);
+    try w.writeAll("}\n");
+}
+
+fn writeRpcAutoRetryEndEvent(w: *std.Io.Writer, success: bool, attempt: usize, final_error: ?[]const u8) !void {
+    try w.writeAll("{\"type\":\"auto_retry_end\",\"success\":");
+    try w.writeAll(if (success) "true" else "false");
+    try w.writeAll(",\"attempt\":");
+    try w.print("{d}", .{attempt});
+    if (final_error) |message| {
+        try w.writeAll(",\"finalError\":");
+        try writeJsonString(w, message);
+    }
+    try w.writeAll("}\n");
 }
 
 fn writeBashResultJson(w: *std.Io.Writer, result: tools.ShellResult) !void {
