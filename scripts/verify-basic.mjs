@@ -597,16 +597,27 @@ const packageCommandManagedPackageDir = path.join(
   'lib/node_modules/@earendil-works/pi-coding-agent'
 );
 const packageCommandManagedBin = path.join(packageCommandManagedPackageDir, 'bin/pi-zig');
+const packageCommandPnpmRoot = path.join(packageCommandRoot, 'pnpm/global/node_modules');
+const packageCommandPnpmBin = path.join(packageCommandPnpmRoot, '@earendil-works/pi-coding-agent/bin/pi-zig');
+const packageCommandYarnDir = path.join(packageCommandRoot, '.yarn/global');
+const packageCommandYarnBin = path.join(packageCommandYarnDir, 'node_modules/@earendil-works/pi-coding-agent/bin/pi-zig');
+const packageCommandBunRoot = path.join(packageCommandHome, '.bun/install/global/node_modules');
+const packageCommandBunBin = path.join(packageCommandBunRoot, '@earendil-works/pi-coding-agent/bin/pi-zig');
 const packageCommandEnv = {
   ...process.env,
   HOME: packageCommandHome,
   PATH: `${packageCommandFakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
   PI_ZIG_FAKE_COMMAND_RECORD: packageCommandRecord,
   PI_ZIG_FAKE_GLOBAL_PREFIX: packageCommandGlobalPrefix,
+  PI_ZIG_FAKE_PNPM_ROOT: packageCommandPnpmRoot,
+  PI_ZIG_FAKE_YARN_DIR: packageCommandYarnDir,
   PI_ZIG_FAKE_LATEST_RESPONSE: JSON.stringify({ version: '0.1.0' })
 };
+function runPackageBinary(commandBin, args, input, options = {}) {
+  return execFileSync(commandBin, args, { encoding: 'utf8', input, ...options });
+}
 function runPackageManaged(args, input, options = {}) {
-  return execFileSync(packageCommandManagedBin, args, { encoding: 'utf8', input, ...options });
+  return runPackageBinary(packageCommandManagedBin, args, input, options);
 }
 function runPackageManagedFail(args, input, options = {}) {
   try {
@@ -632,6 +643,11 @@ fs.mkdirSync(packageCommandFakeBin, { recursive: true });
 fs.mkdirSync(path.dirname(packageCommandManagedBin), { recursive: true });
 fs.writeFileSync(path.join(packageCommandManagedPackageDir, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent' }));
 fs.symlinkSync(bin, packageCommandManagedBin);
+for (const managedBin of [packageCommandPnpmBin, packageCommandYarnBin, packageCommandBunBin]) {
+  fs.mkdirSync(path.dirname(managedBin), { recursive: true });
+  fs.writeFileSync(path.join(path.dirname(path.dirname(managedBin)), 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent' }));
+  fs.symlinkSync(bin, managedBin);
+}
 fs.writeFileSync(
   path.join(packageCommandFakeBin, 'npm'),
   `#!/usr/bin/env node
@@ -681,6 +697,46 @@ process.exit(0);
 `
 );
 fs.chmodSync(path.join(packageCommandFakeBin, 'npm'), 0o755);
+fs.writeFileSync(
+  path.join(packageCommandFakeBin, 'pnpm'),
+  `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.PI_ZIG_FAKE_COMMAND_RECORD, JSON.stringify({ command: 'pnpm', args, cwd: process.cwd() }) + '\\n');
+if (args[0] === 'root' && args[1] === '-g') {
+  console.log(process.env.PI_ZIG_FAKE_PNPM_ROOT);
+}
+process.exit(0);
+`
+);
+fs.chmodSync(path.join(packageCommandFakeBin, 'pnpm'), 0o755);
+fs.writeFileSync(
+  path.join(packageCommandFakeBin, 'yarn'),
+  `#!/usr/bin/env node
+import fs from 'node:fs';
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.PI_ZIG_FAKE_COMMAND_RECORD, JSON.stringify({ command: 'yarn', args, cwd: process.cwd() }) + '\\n');
+if (args[0] === 'global' && args[1] === 'dir') {
+  console.log(process.env.PI_ZIG_FAKE_YARN_DIR);
+}
+process.exit(0);
+`
+);
+fs.chmodSync(path.join(packageCommandFakeBin, 'yarn'), 0o755);
+fs.writeFileSync(
+  path.join(packageCommandFakeBin, 'bun'),
+  `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.PI_ZIG_FAKE_COMMAND_RECORD, JSON.stringify({ command: 'bun', args, cwd: process.cwd() }) + '\\n');
+if (args[0] === 'pm' && args[1] === 'bin' && args[2] === '-g') {
+  console.log(path.join(process.env.HOME, '.bun/bin'));
+}
+process.exit(0);
+`
+);
+fs.chmodSync(path.join(packageCommandFakeBin, 'bun'), 0o755);
 fs.writeFileSync(
   path.join(packageCommandFakeBin, 'curl'),
   `#!/usr/bin/env node
@@ -833,6 +889,25 @@ if (
   )
 ) {
   throw new Error('package self-update smoke did not run upstream-shaped package-manager command');
+}
+for (const [manager, managedBin, rootArgs, installArgs] of [
+  ['pnpm', packageCommandPnpmBin, ['root', '-g'], ['install', '-g', '--ignore-scripts', '@earendil-works/pi-coding-agent']],
+  ['yarn', packageCommandYarnBin, ['global', 'dir'], ['global', 'add', '--ignore-scripts', '@earendil-works/pi-coding-agent']],
+  ['bun', packageCommandBunBin, ['pm', 'bin', '-g'], ['install', '-g', '--ignore-scripts', '@earendil-works/pi-coding-agent']]
+]) {
+  const recordCount = readPackageCommandRecords().length;
+  const output = runPackageBinary(managedBin, ['update', '--self', '--force'], undefined, {
+    cwd: packageCommandProject,
+    env: packageCommandEnv
+  });
+  const records = readPackageCommandRecords().slice(recordCount);
+  if (
+    !output.includes('Updated pi-zig') ||
+    !records.some((record) => record.command === manager && rootArgs.every((arg, index) => record.args[index] === arg)) ||
+    !records.some((record) => record.command === manager && installArgs.every((arg) => record.args.includes(arg)))
+  ) {
+    throw new Error(`package self-update smoke did not validate ${manager} global install detection and command shape`);
+  }
 }
 
 const authFixtureRoot = path.resolve('zig-out/pi-zig-auth-fixture');
