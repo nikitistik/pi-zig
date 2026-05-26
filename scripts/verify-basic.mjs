@@ -2335,6 +2335,39 @@ try {
     PI_ZIG_PROVIDER_BASE_URL: rpcFakeProvider.baseUrl,
     PI_CODING_AGENT_DIR: rpcProviderAuthDir
   };
+  const rpcProviderContextFixture = path.resolve('zig-out/pi-zig-rpc-provider-context-fixture');
+  const rpcProviderContextCwd = path.join(rpcProviderContextFixture, 'project');
+  const rpcProviderContextSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-context-smoke.jsonl');
+  fs.rmSync(rpcProviderContextFixture, { recursive: true, force: true });
+  fs.rmSync(rpcProviderContextSessionFile, { force: true });
+  fs.mkdirSync(path.join(rpcProviderContextCwd, '.pi'), { recursive: true });
+  fs.writeFileSync(path.join(rpcProviderContextCwd, 'AGENTS.md'), 'rpc provider project context sentinel');
+  fs.writeFileSync(path.join(rpcProviderContextCwd, '.pi', 'APPEND_SYSTEM.md'), 'rpc provider append sentinel');
+  const rpcProviderContextOutput = run(
+    ['rpc', rpcProviderContextSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-provider-context-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-provider-context-prompt', type: 'prompt', message: 'hello rpc provider context' }),
+      ''
+    ].join('\n'),
+    {
+      cwd: rpcProviderContextCwd,
+      env: rpcProviderEnv
+    }
+  );
+  const rpcProviderContextResponses = rpcProviderContextOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderContextPrompt = rpcProviderContextResponses.find((response) => response.id === 'rpc-provider-context-prompt');
+  if (
+    !rpcProviderContextPrompt?.success ||
+    !rpcProviderContextPrompt?.data?.text?.includes('mock provider response for gpt-4o: hello rpc provider context') ||
+    !rpcProviderContextPrompt?.data?.text?.includes('Available tools:') ||
+    !rpcProviderContextPrompt?.data?.text?.includes('read: Read file contents') ||
+    !rpcProviderContextPrompt?.data?.text?.includes('rpc provider append sentinel') ||
+    !rpcProviderContextPrompt?.data?.text?.includes('rpc provider project context sentinel')
+  ) {
+    throw new Error('rpc provider prompt smoke did not build a runtime system prompt with context and tool metadata');
+  }
+
   const rpcProviderOutput = run(
     ['rpc', rpcProviderSessionFile],
     [

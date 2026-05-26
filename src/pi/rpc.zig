@@ -2,11 +2,14 @@ const std = @import("std");
 const agent = @import("agent.zig");
 const auth = @import("auth.zig");
 const commands = @import("commands.zig");
+const context_files = @import("context_files.zig");
 const models = @import("models.zig");
 const session = @import("session.zig");
+const system_prompt = @import("system_prompt.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 
+const all_tool_names = [_][]const u8{ "read", "bash", "edit", "write", "grep", "find", "ls" };
 const max_messages = 128;
 const max_message_bytes = 8 * 1024;
 const max_command_bytes = 4 * 1024;
@@ -413,12 +416,15 @@ const Runtime = struct {
         const env = self.env orelse return null;
         const api_key = try auth.resolveProviderApiKey(io, allocator, env, model.provider) orelse return null;
         defer allocator.free(api_key);
+        const runtime_system_prompt = try buildRuntimeSystemPrompt(io, allocator, env);
+        defer allocator.free(runtime_system_prompt);
 
         return try agent.runPrompt(io, allocator, env, .{
             .provider = model.provider,
             .model = model.id,
             .api_key = api_key,
             .prompt = prompt,
+            .system_prompt = runtime_system_prompt,
             .tool_set = .all,
         });
     }
@@ -1021,6 +1027,44 @@ fn writeAgentToolResultsJson(w: *std.Io.Writer, results: []const agent.ToolResul
         try w.writeByte('}');
     }
     try w.writeByte(']');
+}
+
+fn buildRuntimeSystemPrompt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+) ![]u8 {
+    const cwd = try currentPathOwned(io, allocator);
+    defer allocator.free(cwd);
+
+    const package_dir = try system_prompt.resolvePackageDir(io, allocator, env, cwd, null);
+    defer allocator.free(package_dir);
+
+    var discovery = try context_files.discover(io, allocator, env, .{});
+    defer discovery.deinit();
+
+    const append_prompt = try system_prompt.combineAppendPrompt(allocator, discovery.append_system_prompt, &.{});
+    defer if (append_prompt) |value| allocator.free(value);
+
+    var date_buf: [10]u8 = undefined;
+    const current_date = try system_prompt.currentUtcDate(io, &date_buf);
+
+    return system_prompt.build(allocator, .{
+        .custom_prompt = if (discovery.system_prompt) |file| file.content else null,
+        .append_system_prompt = append_prompt,
+        .selected_tools = all_tool_names[0..],
+        .cwd = cwd,
+        .package_dir = package_dir,
+        .date = current_date,
+        .context_files = discovery.context_files.items,
+        .include_builtin_tool_metadata = true,
+    });
+}
+
+fn currentPathOwned(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try std.process.currentPath(io, &buf);
+    return allocator.dupe(u8, buf[0..len]);
 }
 
 fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
