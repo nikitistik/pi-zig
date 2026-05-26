@@ -79,6 +79,8 @@ const StoredMessage = struct {
     exit_code: ?u8 = null,
     cancelled: bool = false,
     truncated: bool = false,
+    full_output_path_len: usize = 0,
+    full_output_path: [max_session_path_bytes]u8 = undefined,
 
     fn entryId(self: *const StoredMessage) []const u8 {
         return self.id[0..self.id_len];
@@ -90,6 +92,11 @@ const StoredMessage = struct {
 
     fn commandText(self: *const StoredMessage) []const u8 {
         return self.command[0..self.command_len];
+    }
+
+    fn fullOutputPath(self: *const StoredMessage) ?[]const u8 {
+        if (self.full_output_path_len == 0) return null;
+        return self.full_output_path[0..self.full_output_path_len];
     }
 };
 
@@ -243,6 +250,7 @@ const Runtime = struct {
                         .exit_code = message.exit_code,
                         .cancelled = message.cancelled,
                         .truncated = message.truncated,
+                        .full_output_path = message.fullOutputPath(),
                     };
                     _ = try new_store.appendBashExecution(io, allocator, message.commandText(), result);
                 },
@@ -341,6 +349,7 @@ const Runtime = struct {
         slot.exit_code = null;
         slot.cancelled = false;
         slot.truncated = false;
+        slot.full_output_path_len = 0;
         self.message_count += 1;
     }
 
@@ -357,6 +366,8 @@ const Runtime = struct {
         if (entry_id.len > 32) return error.ValueTooLong;
         if (self.message_count >= max_messages) return error.MessageLimitReached;
         const output = boundedStoredOutput(result.output);
+        const full_output_path = result.full_output_path orelse "";
+        if (full_output_path.len > max_session_path_bytes) return error.ValueTooLong;
 
         var slot = &self.messages[self.message_count];
         slot.role = .bash_execution;
@@ -369,6 +380,8 @@ const Runtime = struct {
         slot.exit_code = result.exit_code;
         slot.cancelled = result.cancelled;
         slot.truncated = result.truncated or output.len < result.output.len;
+        slot.full_output_path_len = full_output_path.len;
+        if (full_output_path.len > 0) @memcpy(slot.full_output_path[0..full_output_path.len], full_output_path);
         self.message_count += 1;
     }
 
@@ -582,7 +595,11 @@ const Runtime = struct {
             if (code != 0) try w.print("\n\nCommand exited with code {d}", .{code});
         }
         if (message.truncated) {
-            try w.writeAll("\n\n[Output truncated.]");
+            if (message.fullOutputPath()) |path| {
+                try w.print("\n\n[Output truncated. Full output: {s}]", .{path});
+            } else {
+                try w.writeAll("\n\n[Output truncated.]");
+            }
         }
         return out.toOwnedSlice();
     }
@@ -1089,6 +1106,10 @@ const Runtime = struct {
             try w.writeAll(if (message.cancelled) "true" else "false");
             try w.writeAll(",\"truncated\":");
             try w.writeAll(if (message.truncated) "true" else "false");
+            if (message.fullOutputPath()) |path| {
+                try w.writeAll(",\"fullOutputPath\":");
+                try writeJsonString(w, path);
+            }
         } else {
             try w.writeAll(",\"content\":");
             try writeJsonString(w, message.text());

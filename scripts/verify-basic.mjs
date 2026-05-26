@@ -3044,6 +3044,7 @@ const rpcOutput = run(
     JSON.stringify({ id: 'export-1', type: 'export_html', outputPath: rpcExportFile }),
     JSON.stringify({ id: 'state-2', type: 'get_state' }),
     JSON.stringify({ id: 'bash-long-1', type: 'bash', command: "node -e \"for (let i = 0; i < 2105; i++) console.log('rpc-bash-line-' + String(i).padStart(4, '0'))\"" }),
+    JSON.stringify({ id: 'messages-after-long-bash', type: 'get_messages' }),
     ''
   ].join('\n'),
   { env: envWithoutAnthropicAuth({ PI_CODING_AGENT_DIR: rpcLocalAuthDir }) }
@@ -3095,6 +3096,16 @@ if (
   !bashLongResponse?.data?.output?.includes('rpc-bash-line-2104')
 ) {
   throw new Error('rpc long bash smoke did not return truncated output with full-output path');
+}
+const messagesAfterLongBash = rpcResponses.find((response) => response.id === 'messages-after-long-bash');
+const longBashMessage = messagesAfterLongBash?.data?.messages?.find(
+  (message) => message.role === 'bashExecution' && message.command?.includes('rpc-bash-line-')
+);
+if (
+  longBashMessage?.truncated !== true ||
+  longBashMessage?.fullOutputPath !== 'zig-out/pi-zig-bash-full-output.log'
+) {
+  throw new Error('rpc get_messages smoke did not preserve fullOutputPath for truncated bashExecution');
 }
 const rpcBashFullOutput = fs.readFileSync('zig-out/pi-zig-bash-full-output.log', 'utf8');
 if (!rpcBashFullOutput.includes('rpc-bash-line-0000') || !rpcBashFullOutput.includes('rpc-bash-line-2104')) {
