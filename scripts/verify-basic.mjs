@@ -365,6 +365,20 @@ const server = http.createServer((req, res) => {
     const toolMessages = body.messages.filter((message) => message.role === 'tool');
     const hasTool = (name) => body.tools?.some((tool) => tool?.function?.name === name) ?? false;
     const hasBashTool = hasTool('bash');
+    const extensionBashOverrideDefinitionError = () => {
+      const bashTools = body.tools?.filter((tool) => tool?.function?.name === 'bash') ?? [];
+      const bashTool = bashTools[0]?.function;
+      if (
+        bashTools.length !== 1 ||
+        !bashTool?.description?.includes('Extension override') ||
+        bashTool?.parameters?.properties?.value?.type !== 'string' ||
+        bashTool?.parameters?.properties?.command ||
+        !bashTool?.parameters?.required?.includes('value')
+      ) {
+        return { error: 'extension bash override definition mismatch', tools: body.tools };
+      }
+      return null;
+    };
     const writeStreamEvents = (events) => {
       res.writeHead(200, {
         'content-type': 'text/event-stream',
@@ -765,6 +779,48 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension tool complete: ' + toolOutput } }] }));
       return;
     }
+    if (user.includes('rpc extension bash override tool')) {
+      const definitionError = extensionBashOverrideDefinitionError();
+      if (definitionError) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(definitionError));
+        return;
+      }
+      if (body.stream === true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc extension bash override expected non-stream request' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_rpc_extension_bash_override_1',
+                type: 'function',
+                function: {
+                  name: 'bash',
+                  arguments: JSON.stringify({ value: 'rpc-override-ok' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const lastTool = toolMessages.at(-1);
+      const toolOutput = String(lastTool?.content ?? '').trim();
+      if (lastTool?.tool_call_id !== 'call_rpc_extension_bash_override_1' || toolOutput !== 'ext-bash: rpc-override-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc extension bash override did not execute extension tool', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension bash override complete: ' + toolOutput } }] }));
+      return;
+    }
     if (user.includes('rpc extension typescript tool')) {
       if (!hasTool('ext_ts_echo')) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -825,6 +881,37 @@ const server = http.createServer((req, res) => {
       }
       writeStreamEvents([
         { choices: [{ delta: { content: 'extension tool ' } }] },
+        { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
+      ]);
+      return;
+    }
+    if (user.includes('extension bash override tool') && !user.includes('rpc extension bash override tool')) {
+      const definitionError = extensionBashOverrideDefinitionError();
+      if (definitionError) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(definitionError));
+        return;
+      }
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected extension bash override stream request' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_extension_bash_override_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ value: 'json-override-ok' }) } }] } }] }
+        ]);
+        return;
+      }
+      const lastTool = toolMessages.at(-1);
+      const toolOutput = String(lastTool?.content ?? '').trim();
+      if (lastTool?.tool_call_id !== 'call_extension_bash_override_1' || toolOutput !== 'ext-bash: json-override-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'extension bash override did not execute extension tool', toolMessages }));
+        return;
+      }
+      writeStreamEvents([
+        { choices: [{ delta: { content: 'extension bash override ' } }] },
         { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
       ]);
       return;
@@ -3055,6 +3142,26 @@ export default function(pi) {
   });
 }
 `);
+  const extensionBashOverridePath = path.join(extensionHookFixture, 'bash-override.mjs');
+  fs.writeFileSync(extensionBashOverridePath, `
+export default function(pi) {
+  pi.registerTool({
+    name: "bash",
+    label: "Extension Bash Override",
+    description: "Extension override for the built-in bash tool",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false
+    },
+    execute: async (_toolCallId, params) => ({
+      content: [{ type: "text", text: "ext-bash: " + params.value }],
+      isError: false
+    })
+  });
+}
+`);
   const extensionTsHelperPath = path.join(extensionHookFixture, 'helper.ts');
   fs.writeFileSync(extensionTsHelperPath, `
 export const prefix: string = "ext-ts-echo";
@@ -3393,6 +3500,24 @@ export default function(pi: any): void {
     !providerJsonExtensionToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension tool complete: ext-echo: registered-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const providerJsonExtensionBashOverrideLines = run(
+    ['--mode', 'json', '--no-session', '--extension', extensionBashOverridePath, '--provider', 'openai', '--model', 'mock-json-extension-bash-override-model', '-p', 'please run extension bash override tool'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonExtensionBashOverrideLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_extension_bash_override_1' && line.args?.value === 'json-override-ok' && line.args?.command === undefined) ||
+    !providerJsonExtensionBashOverrideLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('ext-bash: json-override-ok')) ||
+    !providerJsonExtensionBashOverrideLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_bash_override_1' && JSON.stringify(result).includes('ext-bash: json-override-ok'))) ||
+    !providerJsonExtensionBashOverrideLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension bash override complete: ext-bash: json-override-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not let a registered extension tool override built-in bash');
   }
 
   const providerJsonTsExtensionHookLines = run(
@@ -4155,6 +4280,26 @@ export default function(pi) {
   });
 }
 `);
+  const rpcExtensionBashOverridePath = path.join(rpcExtensionHookFixture, 'bash-override.mjs');
+  fs.writeFileSync(rpcExtensionBashOverridePath, `
+export default function(pi) {
+  pi.registerTool({
+    name: "bash",
+    label: "Extension Bash Override",
+    description: "Extension override for the built-in bash tool",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false
+    },
+    execute: async (_toolCallId, params) => ({
+      content: [{ type: "text", text: "ext-bash: " + params.value }],
+      isError: false
+    })
+  });
+}
+`);
   const rpcExtensionTsHelperPath = path.join(rpcExtensionHookFixture, 'helper.ts');
   fs.writeFileSync(rpcExtensionTsHelperPath, `
 export const prefix: string = "ext-ts-echo";
@@ -4639,6 +4784,34 @@ export default function(pi: any): void {
     !rpcProviderExtensionToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-registered-ok')
   ) {
     throw new Error('rpc provider prompt smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const rpcProviderExtensionBashOverrideSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-bash-override-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionBashOverrideSessionFile, { force: true });
+  const rpcProviderExtensionBashOverrideOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionBashOverrideSessionFile, '--extension', rpcExtensionBashOverridePath],
+    [
+      JSON.stringify({ id: 'rpc-extension-bash-override-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-bash-override-prompt', type: 'prompt', message: 'rpc extension bash override tool' }),
+      JSON.stringify({ id: 'rpc-extension-bash-override-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionBashOverrideResponses = rpcProviderExtensionBashOverrideOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionBashOverridePrompt = rpcProviderExtensionBashOverrideResponses.find((response) => response.id === 'rpc-extension-bash-override-prompt');
+  const rpcProviderExtensionBashOverrideMessages = rpcProviderExtensionBashOverrideResponses.find((response) => response.id === 'rpc-extension-bash-override-messages');
+  if (
+    !rpcProviderExtensionBashOverridePrompt?.success ||
+    rpcProviderExtensionBashOverridePrompt?.data?.text !== 'rpc extension bash override complete: ext-bash: rpc-override-ok' ||
+    rpcProviderExtensionBashOverridePrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_rpc_extension_bash_override_1' ||
+    rpcProviderExtensionBashOverridePrompt?.data?.toolResults?.[0]?.toolName !== 'bash' ||
+    JSON.parse(rpcProviderExtensionBashOverridePrompt?.data?.toolResults?.[0]?.arguments ?? '{}')?.value !== 'rpc-override-ok' ||
+    rpcProviderExtensionBashOverridePrompt?.data?.toolResults?.[0]?.content !== 'ext-bash: rpc-override-ok' ||
+    !rpcProviderExtensionBashOverrideMessages?.data?.messages?.some((message) => message.role === 'assistant' && message.toolCalls?.[0]?.name === 'bash') ||
+    !rpcProviderExtensionBashOverrideMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_bash_override_1' && message.toolName === 'bash' && message.content === 'ext-bash: rpc-override-ok')
+  ) {
+    throw new Error('rpc provider prompt smoke did not let a registered extension tool override built-in bash');
   }
 
   const rpcProviderExtensionTsToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-ts-tool-smoke.jsonl');

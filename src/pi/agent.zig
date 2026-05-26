@@ -321,7 +321,7 @@ pub fn runPrompt(
     }
 
     var built_in_tool_definitions_buf: [all_tool_definitions.len]ai_client.ChatToolDefinition = undefined;
-    const built_in_tool_definitions = enabledToolDefinitions(options.tool_set, &built_in_tool_definitions_buf);
+    const built_in_tool_definitions = enabledToolDefinitions(options.tool_set, options.custom_tools, &built_in_tool_definitions_buf);
     var tool_definitions_list: std.ArrayList(ai_client.ChatToolDefinition) = .empty;
     defer tool_definitions_list.deinit(allocator);
     try tool_definitions_list.appendSlice(allocator, built_in_tool_definitions);
@@ -529,11 +529,13 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai_client.Ch
 
 fn enabledToolDefinitions(
     tool_set: ToolSet,
+    custom_tools: []const ai_client.ChatToolDefinition,
     buf: *[all_tool_definitions.len]ai_client.ChatToolDefinition,
 ) []const ai_client.ChatToolDefinition {
     var len: usize = 0;
     for (all_tool_definitions) |definition| {
         if (!tool_set.contains(definition.name)) continue;
+        if (customToolEnabled(custom_tools, definition.name)) continue;
         buf[len] = definition;
         len += 1;
     }
@@ -801,13 +803,6 @@ fn executeToolCallWithUpdates(
     call: ai_client.ChatToolCall,
     options: ?RunOptions,
 ) !ToolExecutionResult {
-    if (std.mem.eql(u8, call.name, "read")) return executeReadTool(io, allocator, call.arguments_json);
-    if (std.mem.eql(u8, call.name, "bash")) return executeBashTool(io, allocator, call, options);
-    if (std.mem.eql(u8, call.name, "edit")) return executeEditTool(io, allocator, call.arguments_json);
-    if (std.mem.eql(u8, call.name, "write")) return executeWriteTool(io, allocator, call.arguments_json);
-    if (std.mem.eql(u8, call.name, "grep")) return executeGrepTool(io, allocator, call.arguments_json);
-    if (std.mem.eql(u8, call.name, "find")) return executeFindTool(io, allocator, call.arguments_json);
-    if (std.mem.eql(u8, call.name, "ls")) return executeLsTool(io, allocator, call.arguments_json);
     if (options) |run_options| {
         if (run_options.execute_custom_tool) |callback| {
             if (customToolEnabled(run_options.custom_tools, call.name)) {
@@ -816,6 +811,13 @@ fn executeToolCallWithUpdates(
             }
         }
     }
+    if (std.mem.eql(u8, call.name, "read")) return executeReadTool(io, allocator, call.arguments_json);
+    if (std.mem.eql(u8, call.name, "bash")) return executeBashTool(io, allocator, call, options);
+    if (std.mem.eql(u8, call.name, "edit")) return executeEditTool(io, allocator, call.arguments_json);
+    if (std.mem.eql(u8, call.name, "write")) return executeWriteTool(io, allocator, call.arguments_json);
+    if (std.mem.eql(u8, call.name, "grep")) return executeGrepTool(io, allocator, call.arguments_json);
+    if (std.mem.eql(u8, call.name, "find")) return executeFindTool(io, allocator, call.arguments_json);
+    if (std.mem.eql(u8, call.name, "ls")) return executeLsTool(io, allocator, call.arguments_json);
     return toolError(try std.fmt.allocPrint(allocator, "Tool {s} is not implemented in pi-zig yet.", .{call.name}));
 }
 
@@ -1571,4 +1573,54 @@ test "tool execution checks cancellation after before hook before executing" {
     try std.testing.expectError(error.AgentAborted, result);
     try std.testing.expectEqual(@as(usize, 2), ctx.checks);
     try std.testing.expectEqual(@as(usize, 1), ctx.before_calls);
+}
+
+test "custom tool with built-in name overrides provider definition and execution" {
+    const custom_tools = [_]ai_client.ChatToolDefinition{.{
+        .name = "bash",
+        .description = "Custom bash override",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"]}",
+    }};
+    var definitions_buf: [all_tool_definitions.len]ai_client.ChatToolDefinition = undefined;
+    const definitions = enabledToolDefinitions(.all, &custom_tools, &definitions_buf);
+    for (definitions) |definition| {
+        try std.testing.expect(!std.mem.eql(u8, definition.name, "bash"));
+    }
+
+    const CustomContext = struct {
+        allocator: std.mem.Allocator,
+        calls: usize = 0,
+    };
+    const Hooks = struct {
+        fn execute(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall) anyerror!ToolExecutionResult {
+            const ctx: *CustomContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.calls += 1;
+            try std.testing.expectEqualStrings("bash", call.name);
+            try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "\"value\":\"unit-override\"") != null);
+            return .{ .content = try ctx.allocator.dupe(u8, "custom bash override") };
+        }
+    };
+
+    var ctx = CustomContext{ .allocator = std.testing.allocator };
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_custom_bash"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"value\":\"unit-override\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    var result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .custom_tools = &custom_tools,
+        .custom_tool_context = &ctx,
+        .execute_custom_tool = Hooks.execute,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectEqualStrings("custom bash override", result.content);
+    try std.testing.expect(!result.is_error);
 }
