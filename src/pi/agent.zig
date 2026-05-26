@@ -711,7 +711,6 @@ fn executeToolCallWithHooks(
     options: RunOptions,
 ) !ToolExecutionResult {
     try checkCancellation(options);
-    if (!isImplementedTool(call.name)) return executeToolCall(io, allocator, call);
 
     var effective_call = call;
     var overridden_arguments_json: ?[]u8 = null;
@@ -802,17 +801,6 @@ fn executeToolCallWithUpdates(
     if (std.mem.eql(u8, call.name, "find")) return executeFindTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "ls")) return executeLsTool(io, allocator, call.arguments_json);
     return toolError(try std.fmt.allocPrint(allocator, "Tool {s} is not implemented in pi-zig yet.", .{call.name}));
-}
-
-fn isImplementedTool(name: []const u8) bool {
-    if (std.mem.eql(u8, name, "read")) return true;
-    if (std.mem.eql(u8, name, "bash")) return true;
-    if (std.mem.eql(u8, name, "edit")) return true;
-    if (std.mem.eql(u8, name, "write")) return true;
-    if (std.mem.eql(u8, name, "grep")) return true;
-    if (std.mem.eql(u8, name, "find")) return true;
-    if (std.mem.eql(u8, name, "ls")) return true;
-    return false;
 }
 
 fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {

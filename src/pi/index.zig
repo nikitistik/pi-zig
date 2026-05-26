@@ -7,6 +7,7 @@ pub const commands = @import("commands.zig");
 pub const config = @import("config.zig");
 pub const context_files = @import("context_files.zig");
 pub const extensions = @import("extensions.zig");
+pub const extension_runner = @import("extension_runner.zig");
 pub const models = @import("models.zig");
 pub const package_manager = @import("package_manager.zig");
 pub const providers = @import("providers.zig");
@@ -29,6 +30,7 @@ test {
     _ = config;
     _ = context_files;
     _ = extensions;
+    _ = extension_runner;
     _ = models;
     _ = package_manager;
     _ = providers;

@@ -6,6 +6,7 @@ const cli = @import("cli.zig");
 const commands = @import("commands.zig");
 const config = @import("config.zig");
 const context_files = @import("context_files.zig");
+const extension_runner = @import("extension_runner.zig");
 const models = @import("models.zig");
 const rpc = @import("rpc.zig");
 const session = @import("session.zig");
@@ -158,7 +159,7 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
         \\  system-prompt                   Build the effective system prompt text
         \\
         \\Current top-level scope: print/json/rpc entry-point foundation. Interactive TUI,
-        \\extension execution, streamed tool calls, and full upstream agent parity remain incomplete.
+        \\full extension execution, and full upstream agent parity remain incomplete.
         \\
     );
 }
@@ -712,6 +713,12 @@ fn buildPrintResponse(
     defer shell_settings.deinit(allocator);
     const prompt_content_parts = try buildPromptContentParts(allocator, prompt, image_parts);
     defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
+    var hooks = extension_runner.Runner{
+        .io = io,
+        .allocator = allocator,
+        .extension_paths = if (parsed.no_extensions) &.{} else parsed.extensions[0..parsed.extensions_len],
+    };
+    const has_extension_hooks = hooks.hasExtensions();
 
     return agent.runPrompt(io, allocator, env, .{
         .provider = provider,
@@ -729,6 +736,9 @@ fn buildPrintResponse(
         .on_tool_start = on_tool_start,
         .on_tool_update = on_tool_update,
         .on_tool_end = on_tool_end,
+        .tool_hook_context = if (has_extension_hooks) &hooks else null,
+        .before_tool_call = if (has_extension_hooks) extension_runner.Runner.beforeToolCall else null,
+        .after_tool_call = if (has_extension_hooks) extension_runner.Runner.afterToolCall else null,
         .text_event_context = text_event_context,
         .on_text_delta = on_text_delta,
     }) catch |err| {

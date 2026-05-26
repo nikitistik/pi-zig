@@ -664,6 +664,35 @@ const server = http.createServer((req, res) => {
       ]);
       return;
     }
+    if (user.includes('extension hook events')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected extension hook stream request' }));
+        return;
+      }
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_extension_hook_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'printf extension-original' }) } }] } }] }
+        ]);
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_extension_hook_1' || toolOutput !== 'extension-result-patched') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'extension hook did not rewrite arguments and patch result', toolMessages }));
+        return;
+      }
+      writeStreamEvents([
+        { choices: [{ delta: { content: 'extension hook ' } }] },
+        { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
+      ]);
+      return;
+    }
     if (user.includes('multi tool loop')) {
       const requiredTools = ['read', 'ls', 'grep', 'find', 'write', 'edit'];
       const missingTools = requiredTools.filter((name) => !hasTool(name));
@@ -2785,6 +2814,27 @@ try {
     OPENAI_API_KEY: 'fake-provider-key',
     PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl
   };
+  const extensionHookFixture = path.resolve('zig-out/pi-zig-extension-hook-fixture');
+  fs.rmSync(extensionHookFixture, { recursive: true, force: true });
+  fs.mkdirSync(extensionHookFixture, { recursive: true });
+  const extensionHookPath = path.join(extensionHookFixture, 'hook.mjs');
+  fs.writeFileSync(extensionHookPath, `
+export default function(pi) {
+  pi.on("tool_call", (event) => {
+    if (event.toolName === "bash" && event.input.command === "printf extension-original") {
+      event.input.command = "printf extension-rewritten-ok";
+    }
+  });
+  pi.on("tool_result", (event) => {
+    const text = Array.isArray(event.content)
+      ? event.content.filter((part) => part?.type === "text").map((part) => part.text ?? "").join("\\n")
+      : "";
+    if (event.toolName === "bash" && text.trim() === "extension-rewritten-ok") {
+      return { content: [{ type: "text", text: "extension-result-patched" }], isError: false };
+    }
+  });
+}
+`);
   const providerPrint = run(
     [
       '--provider', 'openai',
@@ -3038,6 +3088,24 @@ try {
     !providerJsonStreamingToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('streaming tool loop complete: stream-tool-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not assemble streamed provider tool calls');
+  }
+
+  const providerJsonExtensionHookLines = run(
+    ['--mode', 'json', '--no-session', '--extension', extensionHookPath, '--provider', 'openai', '--model', 'mock-json-extension-hook-model', '-p', 'please run extension hook events'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonExtensionHookLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('extension-result-patched')) ||
+    !providerJsonExtensionHookLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_hook_1' && JSON.stringify(result).includes('extension-result-patched'))) ||
+    !providerJsonExtensionHookLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'extension hook ') ||
+    !providerJsonExtensionHookLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension hook complete: extension-result-patched'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not bind explicit extension tool_call/tool_result hooks');
   }
 
   const providerJsonResponsesToolLines = run(
