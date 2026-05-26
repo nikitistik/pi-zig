@@ -565,7 +565,9 @@ pub fn runShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !
 
 pub fn runShellCapture(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ShellResult {
     const shell_path = try resolveShellPath(io, null);
-    const argv = [_][]const u8{ shell_path, "-c", command };
+    const merged_command = try stderrMergedShellCommand(allocator, command);
+    defer merged_command.deinit(allocator);
+    const argv = [_][]const u8{ shell_path, "-c", merged_command.command };
     const result = try std.process.run(allocator, io, .{
         .argv = &argv,
         .stdout_limit = .limited(max_bash_capture_bytes),
@@ -600,8 +602,10 @@ pub fn runShellCaptureWithUpdates(
 ) !ShellResult {
     const resolved_command = try prefixedShellCommand(allocator, command, options.command_prefix);
     defer resolved_command.deinit(allocator);
+    const merged_command = try stderrMergedShellCommand(allocator, resolved_command.command);
+    defer merged_command.deinit(allocator);
     const shell_path = try resolveShellPath(io, options.shell_path);
-    const argv = [_][]const u8{ shell_path, "-c", resolved_command.command };
+    const argv = [_][]const u8{ shell_path, "-c", merged_command.command };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdin = .ignore,
@@ -1116,6 +1120,13 @@ fn prefixedShellCommand(allocator: std.mem.Allocator, command: []const u8, maybe
     };
 }
 
+fn stderrMergedShellCommand(allocator: std.mem.Allocator, command: []const u8) !ResolvedShellCommand {
+    return .{
+        .command = try std.fmt.allocPrint(allocator, "exec 2>&1\n{s}", .{command}),
+        .owned = true,
+    };
+}
+
 fn resolveShellPath(io: std.Io, custom_shell_path: ?[]const u8) ![]const u8 {
     if (custom_shell_path) |path| {
         try validateShellPath(io, path);
@@ -1614,6 +1625,20 @@ test "bash output sanitizes ansi carriage returns and control bytes" {
     defer std.testing.allocator.free(result.output);
 
     try std.testing.expectEqualStrings("red\nbadok", result.output);
+}
+
+test "bash output preserves stdout stderr write order" {
+    const result = try runShellCapture(std.testing.io, std.testing.allocator, "printf out; printf err >&2; printf done");
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expectEqualStrings("outerrdone", result.output);
+}
+
+test "bash output update path preserves stdout stderr write order" {
+    const result = try runShellCaptureWithUpdates(std.testing.io, std.testing.allocator, "printf out; printf err >&2; printf done", .{});
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expectEqualStrings("outerrdone", result.output);
 }
 
 test "shell path resolution validates custom paths and prefers bash on unix" {

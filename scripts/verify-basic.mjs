@@ -2554,6 +2554,10 @@ const bashSanitized = run(['tool-bash', "printf '\\033[31mred\\033[0m\\r\\nbad\\
 if (bashSanitized !== 'red\nbadok') {
   throw new Error(`tool-bash sanitization smoke returned unexpected output: ${JSON.stringify(bashSanitized)}`);
 }
+const bashInterleaved = run(['tool-bash', 'printf out; printf err >&2; printf done']);
+if (bashInterleaved !== 'outerrdone') {
+  throw new Error(`tool-bash interleaved stdout/stderr smoke returned unexpected output: ${JSON.stringify(bashInterleaved)}`);
+}
 const bashNoOutput = run(['tool-bash', 'true']);
 if (bashNoOutput !== '(no output)') {
   throw new Error(`tool-bash no-output smoke returned unexpected output: ${JSON.stringify(bashNoOutput)}`);

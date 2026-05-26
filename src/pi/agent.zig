@@ -1215,7 +1215,7 @@ test "bash tool cancellation stops a running shell command" {
         fn shouldCancel(ctx_ptr: *anyopaque) bool {
             const ctx: *CancelContext = @ptrCast(@alignCast(ctx_ptr));
             ctx.checks += 1;
-            return ctx.checks >= 2;
+            return ctx.checks >= 4;
         }
     };
 
@@ -1241,7 +1241,7 @@ test "bash tool cancellation stops a running shell command" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "before-cancel") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "after-cancel") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Command cancelled") != null);
-    try std.testing.expect(ctx.checks >= 2);
+    try std.testing.expect(ctx.checks >= 4);
 }
 
 test "prepare next turn can update request state before should-stop runs" {
