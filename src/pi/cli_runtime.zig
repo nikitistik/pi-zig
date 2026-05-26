@@ -278,7 +278,7 @@ fn runJsonPrintFoundation(
 }
 
 fn shouldUseProviderTextStream(parsed: cli.ParsedArgs) bool {
-    return parsed.provider != null and parsed.model != null and (parsed.no_tools or parsed.no_builtin_tools);
+    return parsed.provider != null and parsed.model != null and parsed.no_tools;
 }
 
 fn runJsonProviderTextStream(

@@ -744,6 +744,117 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension hook complete: ' + toolOutput } }] }));
       return;
     }
+    if (user.includes('rpc extension no builtin registered tool')) {
+      const unexpectedBuiltins = ['bash', 'read', 'grep', 'ls', 'find', 'write', 'edit'].filter((name) => hasTool(name));
+      if (!hasTool('ext_echo') || unexpectedBuiltins.length > 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc no-builtin extension tool definition mismatch', unexpectedBuiltins, tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_rpc_extension_no_builtin_tool_1',
+                type: 'function',
+                function: {
+                  name: 'ext_echo',
+                  arguments: JSON.stringify({ value: 'rpc-no-builtin-ok' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_rpc_extension_no_builtin_tool_1' || toolOutput !== 'ext-echo: rpc-no-builtin-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc no-builtin extension registered tool did not execute', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension no builtin tool complete: ' + toolOutput } }] }));
+      return;
+    }
+    if (user.includes('rpc extension allowlist registered tool')) {
+      const unexpectedBuiltins = ['bash', 'read', 'grep', 'ls', 'find', 'write', 'edit'].filter((name) => hasTool(name));
+      if (!hasTool('ext_echo') || unexpectedBuiltins.length > 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc allowlisted extension tool definition mismatch', unexpectedBuiltins, tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_rpc_extension_allowlist_tool_1',
+                type: 'function',
+                function: {
+                  name: 'ext_echo',
+                  arguments: JSON.stringify({ value: 'rpc-allowlist-ok' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_rpc_extension_allowlist_tool_1' || toolOutput !== 'ext-echo: rpc-allowlist-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc allowlisted extension registered tool did not execute', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension allowlist tool complete: ' + toolOutput } }] }));
+      return;
+    }
+    if (user.includes('rpc extension permission gate')) {
+      if (!hasTool('bash')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool for rpc permission gate', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_rpc_extension_permission_gate_1',
+                type: 'function',
+                function: {
+                  name: 'bash',
+                  arguments: JSON.stringify({ command: 'printf should-not-run' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = String(toolMessages.at(-1)?.content ?? '').trim();
+      if (
+        toolMessages.at(-1)?.tool_call_id !== 'call_rpc_extension_permission_gate_1' ||
+        !toolOutput.includes('blocked by headless permission gate') ||
+        toolOutput.includes('should-not-run')
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc extension permission gate did not block bash before execution', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension permission gate complete: ' + toolOutput } }] }));
+      return;
+    }
     if (user.includes('rpc extension registered tool')) {
       if (!hasTool('ext_echo')) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -881,6 +992,99 @@ const server = http.createServer((req, res) => {
       }
       writeStreamEvents([
         { choices: [{ delta: { content: 'extension tool ' } }] },
+        { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
+      ]);
+      return;
+    }
+    if (user.includes('extension no builtin registered tool')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected extension no-builtin registered tool stream request' }));
+        return;
+      }
+      const unexpectedBuiltins = ['bash', 'read', 'grep', 'ls', 'find', 'write', 'edit'].filter((name) => hasTool(name));
+      if (!hasTool('ext_echo') || unexpectedBuiltins.length > 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'no-builtin extension tool definition mismatch', unexpectedBuiltins, tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_extension_no_builtin_tool_1', type: 'function', function: { name: 'ext_echo', arguments: JSON.stringify({ value: 'no-builtin-ok' }) } }] } }] }
+        ]);
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_extension_no_builtin_tool_1' || toolOutput !== 'ext-echo: no-builtin-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'no-builtin extension registered tool did not execute', toolMessages }));
+        return;
+      }
+      writeStreamEvents([
+        { choices: [{ delta: { content: 'extension no builtin tool ' } }] },
+        { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
+      ]);
+      return;
+    }
+    if (user.includes('extension allowlist registered tool')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected extension allowlist registered tool stream request' }));
+        return;
+      }
+      const unexpectedBuiltins = ['bash', 'read', 'grep', 'ls', 'find', 'write', 'edit'].filter((name) => hasTool(name));
+      if (!hasTool('ext_echo') || unexpectedBuiltins.length > 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'allowlisted extension tool definition mismatch', unexpectedBuiltins, tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_extension_allowlist_tool_1', type: 'function', function: { name: 'ext_echo', arguments: JSON.stringify({ value: 'allowlist-ok' }) } }] } }] }
+        ]);
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_extension_allowlist_tool_1' || toolOutput !== 'ext-echo: allowlist-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'allowlisted extension registered tool did not execute', toolMessages }));
+        return;
+      }
+      writeStreamEvents([
+        { choices: [{ delta: { content: 'extension allowlist tool ' } }] },
+        { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
+      ]);
+      return;
+    }
+    if (user.includes('extension permission gate') && !user.includes('rpc extension permission gate')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected extension permission gate stream request' }));
+        return;
+      }
+      if (!hasTool('bash')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool for extension permission gate', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_extension_permission_gate_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'printf should-not-run' }) } }] } }] }
+        ]);
+        return;
+      }
+      const toolOutput = String(toolMessages.at(-1)?.content ?? '').trim();
+      if (
+        toolMessages.at(-1)?.tool_call_id !== 'call_extension_permission_gate_1' ||
+        !toolOutput.includes('blocked by headless permission gate') ||
+        toolOutput.includes('should-not-run')
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'extension permission gate did not block bash before execution', toolMessages }));
+        return;
+      }
+      writeStreamEvents([
+        { choices: [{ delta: { content: 'extension permission gate ' } }] },
         { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
       ]);
       return;
@@ -3208,6 +3412,19 @@ export default function(pi) {
   });
 }
 `);
+  const extensionPermissionGatePath = path.join(extensionHookFixture, 'permission-gate.mjs');
+  fs.writeFileSync(extensionPermissionGatePath, `
+export default function(pi) {
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName === "bash" && event.input.command === "printf should-not-run") {
+      const allowed = await ctx.ui.confirm("Run bash command?", event.input.command);
+      if (!allowed) {
+        return { block: true, reason: "blocked by headless permission gate" };
+      }
+    }
+  });
+}
+`);
   const extensionBashOverridePath = path.join(extensionHookFixture, 'bash-override.mjs');
   fs.writeFileSync(extensionBashOverridePath, `
 export default function(pi) {
@@ -3566,6 +3783,63 @@ export default function(pi: any): void {
     !providerJsonExtensionToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension tool complete: ext-echo: registered-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const providerJsonExtensionNoBuiltinToolLines = run(
+    ['--mode', 'json', '--no-session', '--no-builtin-tools', '--extension', extensionToolPath, '--provider', 'openai', '--model', 'mock-json-extension-no-builtin-tool-model', '-p', 'please run extension no builtin registered tool'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonExtensionNoBuiltinToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'ext_echo' && line.toolCallId === 'call_extension_no_builtin_tool_1') ||
+    !providerJsonExtensionNoBuiltinToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_echo' && JSON.stringify(line.result).includes('ext-echo: no-builtin-ok')) ||
+    !providerJsonExtensionNoBuiltinToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_no_builtin_tool_1' && JSON.stringify(result).includes('ext-echo: no-builtin-ok'))) ||
+    !providerJsonExtensionNoBuiltinToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'extension no builtin tool ') ||
+    !providerJsonExtensionNoBuiltinToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension no builtin tool complete: ext-echo: no-builtin-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not keep extension tools active under --no-builtin-tools');
+  }
+
+  const providerJsonExtensionAllowlistToolLines = run(
+    ['--mode', 'json', '--no-session', '--tools', 'ext_echo', '--extension', extensionToolPath, '--provider', 'openai', '--model', 'mock-json-extension-allowlist-tool-model', '-p', 'please run extension allowlist registered tool'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonExtensionAllowlistToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'ext_echo' && line.toolCallId === 'call_extension_allowlist_tool_1') ||
+    !providerJsonExtensionAllowlistToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_echo' && JSON.stringify(line.result).includes('ext-echo: allowlist-ok')) ||
+    !providerJsonExtensionAllowlistToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_allowlist_tool_1' && JSON.stringify(result).includes('ext-echo: allowlist-ok'))) ||
+    !providerJsonExtensionAllowlistToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'extension allowlist tool ') ||
+    !providerJsonExtensionAllowlistToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension allowlist tool complete: ext-echo: allowlist-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not allowlist an extension registered tool');
+  }
+
+  const providerJsonExtensionPermissionGateLines = run(
+    ['--mode', 'json', '--no-session', '--extension', extensionPermissionGatePath, '--provider', 'openai', '--model', 'mock-json-extension-permission-gate-model', '-p', 'please run extension permission gate'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonExtensionPermissionGateLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_extension_permission_gate_1') ||
+    !providerJsonExtensionPermissionGateLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && line.isError === true && JSON.stringify(line.result).includes('blocked by headless permission gate') && !JSON.stringify(line.result).includes('should-not-run')) ||
+    !providerJsonExtensionPermissionGateLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_permission_gate_1' && result.isError === true && JSON.stringify(result).includes('blocked by headless permission gate'))) ||
+    !providerJsonExtensionPermissionGateLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'extension permission gate ') ||
+    !providerJsonExtensionPermissionGateLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension permission gate complete: blocked by headless permission gate'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not block a bash tool call through extension headless permission UI');
   }
 
   const providerJsonExtensionBashOverrideLines = run(
@@ -4346,6 +4620,19 @@ export default function(pi) {
   });
 }
 `);
+  const rpcExtensionPermissionGatePath = path.join(rpcExtensionHookFixture, 'permission-gate.mjs');
+  fs.writeFileSync(rpcExtensionPermissionGatePath, `
+export default function(pi) {
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName === "bash" && event.input.command === "printf should-not-run") {
+      const allowed = await ctx.ui.confirm("Run bash command?", event.input.command);
+      if (!allowed) {
+        return { block: true, reason: "blocked by headless permission gate" };
+      }
+    }
+  });
+}
+`);
   const rpcExtensionBashOverridePath = path.join(rpcExtensionHookFixture, 'bash-override.mjs');
   fs.writeFileSync(rpcExtensionBashOverridePath, `
 export default function(pi) {
@@ -4902,6 +5189,86 @@ export default function(pi: any): void {
     !rpcProviderExtensionToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-registered-ok')
   ) {
     throw new Error('rpc provider prompt smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const rpcProviderExtensionNoBuiltinToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-no-builtin-tool-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionNoBuiltinToolSessionFile, { force: true });
+  const rpcProviderExtensionNoBuiltinToolOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionNoBuiltinToolSessionFile, '--no-builtin-tools', '--extension', rpcExtensionToolPath],
+    [
+      JSON.stringify({ id: 'rpc-extension-no-builtin-tool-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-no-builtin-tool-prompt', type: 'prompt', message: 'rpc extension no builtin registered tool' }),
+      JSON.stringify({ id: 'rpc-extension-no-builtin-tool-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionNoBuiltinToolResponses = rpcProviderExtensionNoBuiltinToolOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionNoBuiltinToolPrompt = rpcProviderExtensionNoBuiltinToolResponses.find((response) => response.id === 'rpc-extension-no-builtin-tool-prompt');
+  const rpcProviderExtensionNoBuiltinToolMessages = rpcProviderExtensionNoBuiltinToolResponses.find((response) => response.id === 'rpc-extension-no-builtin-tool-messages');
+  if (
+    !rpcProviderExtensionNoBuiltinToolPrompt?.success ||
+    rpcProviderExtensionNoBuiltinToolPrompt?.data?.text !== 'rpc extension no builtin tool complete: ext-echo: rpc-no-builtin-ok' ||
+    rpcProviderExtensionNoBuiltinToolPrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_rpc_extension_no_builtin_tool_1' ||
+    rpcProviderExtensionNoBuiltinToolPrompt?.data?.toolResults?.[0]?.toolName !== 'ext_echo' ||
+    rpcProviderExtensionNoBuiltinToolPrompt?.data?.toolResults?.[0]?.content !== 'ext-echo: rpc-no-builtin-ok' ||
+    !rpcProviderExtensionNoBuiltinToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_no_builtin_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-no-builtin-ok')
+  ) {
+    throw new Error('rpc provider prompt smoke did not keep extension tools active under --no-builtin-tools');
+  }
+
+  const rpcProviderExtensionAllowlistToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-allowlist-tool-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionAllowlistToolSessionFile, { force: true });
+  const rpcProviderExtensionAllowlistToolOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionAllowlistToolSessionFile, '--tools', 'ext_echo', '--extension', rpcExtensionToolPath],
+    [
+      JSON.stringify({ id: 'rpc-extension-allowlist-tool-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-allowlist-tool-prompt', type: 'prompt', message: 'rpc extension allowlist registered tool' }),
+      JSON.stringify({ id: 'rpc-extension-allowlist-tool-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionAllowlistToolResponses = rpcProviderExtensionAllowlistToolOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionAllowlistToolPrompt = rpcProviderExtensionAllowlistToolResponses.find((response) => response.id === 'rpc-extension-allowlist-tool-prompt');
+  const rpcProviderExtensionAllowlistToolMessages = rpcProviderExtensionAllowlistToolResponses.find((response) => response.id === 'rpc-extension-allowlist-tool-messages');
+  if (
+    !rpcProviderExtensionAllowlistToolPrompt?.success ||
+    rpcProviderExtensionAllowlistToolPrompt?.data?.text !== 'rpc extension allowlist tool complete: ext-echo: rpc-allowlist-ok' ||
+    rpcProviderExtensionAllowlistToolPrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_rpc_extension_allowlist_tool_1' ||
+    rpcProviderExtensionAllowlistToolPrompt?.data?.toolResults?.[0]?.toolName !== 'ext_echo' ||
+    rpcProviderExtensionAllowlistToolPrompt?.data?.toolResults?.[0]?.content !== 'ext-echo: rpc-allowlist-ok' ||
+    !rpcProviderExtensionAllowlistToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_allowlist_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-allowlist-ok')
+  ) {
+    throw new Error('rpc provider prompt smoke did not allowlist an extension registered tool');
+  }
+
+  const rpcProviderExtensionPermissionGateSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-permission-gate-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionPermissionGateSessionFile, { force: true });
+  const rpcProviderExtensionPermissionGateOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionPermissionGateSessionFile, '--extension', rpcExtensionPermissionGatePath],
+    [
+      JSON.stringify({ id: 'rpc-extension-permission-gate-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-permission-gate-prompt', type: 'prompt', message: 'rpc extension permission gate' }),
+      JSON.stringify({ id: 'rpc-extension-permission-gate-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionPermissionGateResponses = rpcProviderExtensionPermissionGateOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionPermissionGatePrompt = rpcProviderExtensionPermissionGateResponses.find((response) => response.id === 'rpc-extension-permission-gate-prompt');
+  const rpcProviderExtensionPermissionGateMessages = rpcProviderExtensionPermissionGateResponses.find((response) => response.id === 'rpc-extension-permission-gate-messages');
+  if (
+    !rpcProviderExtensionPermissionGatePrompt?.success ||
+    rpcProviderExtensionPermissionGatePrompt?.data?.text !== 'rpc extension permission gate complete: blocked by headless permission gate' ||
+    rpcProviderExtensionPermissionGatePrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_rpc_extension_permission_gate_1' ||
+    rpcProviderExtensionPermissionGatePrompt?.data?.toolResults?.[0]?.toolName !== 'bash' ||
+    rpcProviderExtensionPermissionGatePrompt?.data?.toolResults?.[0]?.isError !== true ||
+    rpcProviderExtensionPermissionGatePrompt?.data?.toolResults?.[0]?.content !== 'blocked by headless permission gate' ||
+    rpcProviderExtensionPermissionGatePrompt?.data?.toolResults?.[0]?.content.includes('should-not-run') ||
+    !rpcProviderExtensionPermissionGateMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_permission_gate_1' && message.toolName === 'bash' && message.content === 'blocked by headless permission gate')
+  ) {
+    throw new Error('rpc provider prompt smoke did not block a bash tool call through extension headless permission UI');
   }
 
   const rpcProviderExtensionBashOverrideSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-bash-override-smoke.jsonl');
