@@ -393,9 +393,7 @@ fn parseOpenAICompatibleStreamResultData(
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return error.ProviderResponseInvalid;
     defer parsed.deinit();
     if (isResponseStreamEvent(parsed.value)) {
-        if (try responseStreamTextDelta(parsed.value)) |delta| {
-            try accumulator.appendTextDelta(delta, text_callback_context, text_callback);
-        }
+        try accumulator.appendResponseStreamEvent(parsed.value, text_callback_context, text_callback);
         return;
     }
     const delta = try firstStreamDelta(parsed.value) orelse return;
@@ -449,12 +447,19 @@ const StreamToolCallAccumulator = struct {
         self.name.deinit();
         self.arguments_json.deinit();
     }
+
+    fn replaceArguments(self: *StreamToolCallAccumulator, allocator: std.mem.Allocator, arguments_json: []const u8) !void {
+        self.arguments_json.deinit();
+        self.arguments_json = .init(allocator);
+        try self.arguments_json.writer.writeAll(arguments_json);
+    }
 };
 
 const StreamChatAccumulator = struct {
     allocator: std.mem.Allocator,
     text: std.Io.Writer.Allocating,
     tool_calls: std.ArrayList(StreamToolCallAccumulator),
+    response_tool_index: ?usize = null,
 
     fn init(allocator: std.mem.Allocator) StreamChatAccumulator {
         return .{
@@ -484,6 +489,45 @@ const StreamChatAccumulator = struct {
 
         if (delta.object.get("tool_calls")) |tool_calls| {
             try self.appendToolCallDeltas(tool_calls);
+        }
+    }
+
+    fn appendResponseStreamEvent(
+        self: *StreamChatAccumulator,
+        value: std.json.Value,
+        text_callback_context: ?*anyopaque,
+        text_callback: ?StreamTextCallback,
+    ) !void {
+        const event_type = try requiredObjectString(value, "type");
+        if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
+            const delta = value.object.get("delta") orelse return error.ProviderResponseInvalid;
+            if (delta != .string) return error.ProviderResponseInvalid;
+            try self.appendTextDelta(delta.string, text_callback_context, text_callback);
+            return;
+        }
+        if (std.mem.eql(u8, event_type, "response.output_item.added")) {
+            const item = value.object.get("item") orelse return error.ProviderResponseInvalid;
+            if (try isResponseFunctionCallItem(item)) try self.startResponseFunctionCall(item);
+            return;
+        }
+        if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
+            const index = self.response_tool_index orelse return;
+            const delta = value.object.get("delta") orelse return error.ProviderResponseInvalid;
+            if (delta != .string) return error.ProviderResponseInvalid;
+            try self.tool_calls.items[index].arguments_json.writer.writeAll(delta.string);
+            return;
+        }
+        if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
+            const index = self.response_tool_index orelse return;
+            const arguments = value.object.get("arguments") orelse return error.ProviderResponseInvalid;
+            if (arguments != .string) return error.ProviderResponseInvalid;
+            try self.tool_calls.items[index].replaceArguments(self.allocator, arguments.string);
+            return;
+        }
+        if (std.mem.eql(u8, event_type, "response.output_item.done")) {
+            const item = value.object.get("item") orelse return error.ProviderResponseInvalid;
+            if (try isResponseFunctionCallItem(item)) try self.finishResponseFunctionCall(item);
+            return;
         }
     }
 
@@ -532,6 +576,36 @@ const StreamChatAccumulator = struct {
                 }
             }
         }
+    }
+
+    fn startResponseFunctionCall(self: *StreamChatAccumulator, item: std.json.Value) !void {
+        const index = self.tool_calls.items.len;
+        const call = try self.ensureToolCall(index);
+        call.seen = true;
+        self.response_tool_index = index;
+
+        const call_id = try requiredObjectString(item, "call_id");
+        const item_id = try requiredObjectString(item, "id");
+        const compound_id = try std.fmt.allocPrint(self.allocator, "{s}|{s}", .{ call_id, item_id });
+        defer self.allocator.free(compound_id);
+        try call.id.writer.writeAll(compound_id);
+        try call.name.writer.writeAll(try requiredObjectString(item, "name"));
+        if (try optionalObjectString(item, "arguments")) |arguments| {
+            try call.arguments_json.writer.writeAll(arguments);
+        }
+    }
+
+    fn finishResponseFunctionCall(self: *StreamChatAccumulator, item: std.json.Value) !void {
+        const call = if (self.response_tool_index) |index|
+            &self.tool_calls.items[index]
+        else blk: {
+            try self.startResponseFunctionCall(item);
+            break :blk &self.tool_calls.items[self.response_tool_index.?];
+        };
+        if (try optionalObjectString(item, "arguments")) |arguments| {
+            try call.replaceArguments(self.allocator, arguments);
+        }
+        self.response_tool_index = null;
     }
 
     fn ensureToolCall(self: *StreamChatAccumulator, index: usize) !*StreamToolCallAccumulator {
@@ -594,6 +668,28 @@ const StreamChatAccumulator = struct {
         return result;
     }
 };
+
+fn requiredObjectString(value: std.json.Value, key: []const u8) ![]const u8 {
+    if (value != .object) return error.ProviderResponseInvalid;
+    const field = value.object.get(key) orelse return error.ProviderResponseInvalid;
+    if (field != .string) return error.ProviderResponseInvalid;
+    return field.string;
+}
+
+fn optionalObjectString(value: std.json.Value, key: []const u8) !?[]const u8 {
+    if (value != .object) return error.ProviderResponseInvalid;
+    const field = value.object.get(key) orelse return null;
+    if (field == .null) return null;
+    if (field != .string) return error.ProviderResponseInvalid;
+    return field.string;
+}
+
+fn isResponseFunctionCallItem(item: std.json.Value) !bool {
+    if (item != .object) return error.ProviderResponseInvalid;
+    const item_type = item.object.get("type") orelse return false;
+    if (item_type != .string) return error.ProviderResponseInvalid;
+    return std.mem.eql(u8, item_type.string, "function_call");
+}
 
 fn streamToolCallIndex(value: std.json.Value) !usize {
     return switch (value) {
@@ -875,6 +971,30 @@ test "assembles OpenAI Responses output text deltas" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("response delta", result.text.?);
     try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+}
+
+test "assembles OpenAI Responses function call stream events" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"bash","arguments":"{\"command\":\"printf "}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"response.function_call_arguments.delta","delta":"response-"}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"response.function_call_arguments.done","arguments":"{\"command\":\"printf response-ok\"}"}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"response.output_item.done","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"bash","arguments":"{\"command\":\"printf response-ok\"}"}}
+    , &accumulator, null, null);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.text == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1|item_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf response-ok\"}", result.tool_calls[0].arguments_json);
 }
 
 test "provider base URL appends chat completions endpoint" {

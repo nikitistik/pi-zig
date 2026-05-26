@@ -151,6 +151,43 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'selected tools observed' } }] }));
       return;
     }
+    if (user.includes('responses stream tool events')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected streaming request' }));
+        return;
+      }
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { type: 'response.output_item.added', item: { type: 'function_call', id: 'item_responses_stream_1', call_id: 'call_responses_stream_1', name: 'bash', arguments: '{"command":"printf ' } },
+          { type: 'response.function_call_arguments.delta', delta: 'responses-tool-ok"}' },
+          { type: 'response.function_call_arguments.done', arguments: '{"command":"printf responses-tool-ok"}' },
+          { type: 'response.output_item.done', item: { type: 'function_call', id: 'item_responses_stream_1', call_id: 'call_responses_stream_1', name: 'bash', arguments: '{"command":"printf responses-tool-ok"}' } }
+        ]);
+        return;
+      }
+      if (toolMessages.at(-1).tool_call_id !== 'call_responses_stream_1|item_responses_stream_1') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Responses tool result did not preserve compound tool_call_id', toolMessages }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolOutput !== 'responses-tool-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unexpected Responses tool output', toolOutput }));
+        return;
+      }
+      writeStreamEvents([
+        { type: 'response.output_text.delta', delta: 'responses stream ' },
+        { type: 'response.output_text.delta', delta: 'tool complete: ' + toolOutput }
+      ]);
+      return;
+    }
     if (user.includes('streaming tool loop')) {
       if (body.stream !== true) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2534,6 +2571,27 @@ try {
     !providerJsonStreamingToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('streaming tool loop complete: stream-tool-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not assemble streamed provider tool calls');
+  }
+
+  const providerJsonResponsesToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-responses-tool-model', '-p', 'please run responses stream tool events'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonResponsesToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_responses_stream_1|item_responses_stream_1') ||
+    !providerJsonResponsesToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_responses_stream_1|item_responses_stream_1' && JSON.stringify(line.partialResult).includes('responses-tool-ok')) ||
+    !providerJsonResponsesToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('responses-tool-ok')) ||
+    !providerJsonResponsesToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_responses_stream_1|item_responses_stream_1')) ||
+    !providerJsonResponsesToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'responses stream ') ||
+    !providerJsonResponsesToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'tool complete: responses-tool-ok') ||
+    !providerJsonResponsesToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('responses stream tool complete: responses-tool-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not assemble OpenAI Responses streamed tool calls');
   }
 
   const providerJsonToolErrorLines = run(
