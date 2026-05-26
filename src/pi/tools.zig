@@ -26,6 +26,7 @@ pub const ShellResult = struct {
     cancelled: bool = false,
     truncated: bool = false,
     full_output_path: ?[]const u8 = null,
+    truncation: ?ShellTruncationDetails = null,
 };
 
 pub const ShellUpdate = struct {
@@ -597,6 +598,7 @@ pub fn runShellCapture(io: std.Io, allocator: std.mem.Allocator, command: []cons
         .exit_code = exit_code,
         .truncated = formatted.truncated,
         .full_output_path = formatted.full_output_path,
+        .truncation = formatted.truncation,
     };
 }
 
@@ -707,6 +709,7 @@ pub fn runShellCaptureWithUpdates(
         .cancelled = timed_out or cancelled_by_request,
         .truncated = formatted.truncated,
         .full_output_path = formatted.full_output_path,
+        .truncation = formatted.truncation,
     };
 }
 

@@ -857,6 +857,7 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
     const content = try allocator.dupe(u8, shell_result.output);
     errdefer allocator.free(content);
     const is_error = shell_result.exit_code == null or shell_result.exit_code.? != 0;
+    try emitToolUpdateWithDetails(options, call, content, is_error, false, shell_result.truncated, shell_result.full_output_path, shell_result.truncation);
     return .{
         .content = content,
         .is_error = is_error,

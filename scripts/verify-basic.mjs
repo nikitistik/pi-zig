@@ -43,6 +43,69 @@ const server = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (chunk) => chunks.push(chunk));
   req.on('end', () => {
+    const rawBody = Buffer.concat(chunks).toString('utf8');
+    if (req.method === 'POST' && req.url === '/v1/messages') {
+      if (req.headers['x-api-key'] !== 'fake-provider-key') {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing anthropic auth', headers: req.headers }));
+        return;
+      }
+      const body = JSON.parse(rawBody);
+      const contentText = (content) => Array.isArray(content)
+        ? content.map((part) => part?.type === 'text' ? (part.text ?? '') : part?.type === 'tool_result' ? (part.content ?? '') : '').join('\\n')
+        : String(content ?? '');
+      const userText = body.messages?.filter((message) => message.role === 'user').map((message) => contentText(message.content)).join('\\n') ?? '';
+      const toolResults = body.messages?.flatMap((message) => Array.isArray(message.content) ? message.content.filter((part) => part?.type === 'tool_result') : []) ?? [];
+      const hasBashTool = body.tools?.some((tool) => tool?.name === 'bash' && tool?.input_schema?.type === 'object') ?? false;
+      const writeAnthropicEvents = (events) => {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'close'
+        });
+        for (const event of events) {
+          res.write('event: ' + event.type + '\\n');
+          res.write('data: ' + JSON.stringify(event) + '\\n\\n');
+        }
+        res.end();
+      };
+      if (userText.includes('native anthropic stream tool events')) {
+        if (body.stream !== true || !Array.isArray(body.system) || !hasBashTool) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native anthropic request shape mismatch', body }));
+          return;
+        }
+        if (toolResults.length === 0) {
+          writeAnthropicEvents([
+            { type: 'message_start', message: { id: 'msg_native_anthropic_stream_1' } },
+            { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'call_native_anthropic_stream_1', name: 'bash', input: {} } },
+            { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"command":"printf ' } },
+            { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: 'native-anthropic-ok"}' } },
+            { type: 'content_block_stop', index: 0 },
+            { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 1 } },
+            { type: 'message_stop' }
+          ]);
+          return;
+        }
+        if (toolResults.at(-1)?.tool_use_id !== 'call_native_anthropic_stream_1' || String(toolResults.at(-1)?.content ?? '').trim() !== 'native-anthropic-ok') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native Anthropic tool result mismatch', toolResults }));
+          return;
+        }
+        writeAnthropicEvents([
+          { type: 'message_start', message: { id: 'msg_native_anthropic_stream_2' } },
+          { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'native anthropic ' } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'tool complete: native-anthropic-ok' } },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_stop' }
+        ]);
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unknown native anthropic request', body }));
+      return;
+    }
     if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'not found' }));
@@ -53,7 +116,7 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'missing auth' }));
       return;
     }
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const body = JSON.parse(rawBody);
     const contentText = (content) => Array.isArray(content)
       ? content.filter((part) => part?.type === 'text').map((part) => part.text ?? '').join('\\n')
       : String(content ?? '');
@@ -2750,6 +2813,32 @@ try {
     !providerJsonAnthropicToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('anthropic stream tool complete: anthropic-tool-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not assemble Anthropic streamed tool calls');
+  }
+
+  const nativeAnthropicEnv = {
+    ...envWithoutAnthropicAuth(),
+    ANTHROPIC_API_KEY: 'fake-provider-key',
+    PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl
+  };
+  const providerJsonNativeAnthropicToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'anthropic', '--model', 'claude-haiku-4-5', '-p', 'please run native anthropic stream tool events'],
+    undefined,
+    { env: nativeAnthropicEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonNativeAnthropicToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_native_anthropic_stream_1') ||
+    !providerJsonNativeAnthropicToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_native_anthropic_stream_1' && JSON.stringify(line.partialResult).includes('native-anthropic-ok')) ||
+    !providerJsonNativeAnthropicToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('native-anthropic-ok')) ||
+    !providerJsonNativeAnthropicToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_native_anthropic_stream_1')) ||
+    !providerJsonNativeAnthropicToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'native anthropic ') ||
+    !providerJsonNativeAnthropicToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'tool complete: native-anthropic-ok') ||
+    !providerJsonNativeAnthropicToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('native anthropic tool complete: native-anthropic-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not run native Anthropic messages streamed tool calls');
   }
 
   const providerJsonGoogleToolLines = run(

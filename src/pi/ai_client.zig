@@ -129,6 +129,10 @@ pub fn runChatTurn(
     env: *const std.process.Environ.Map,
     request: ChatTurnRequest,
 ) ChatCompletionError!ChatCompletionResult {
+    if (isAnthropicMessagesProvider(request.provider)) {
+        return runAnthropicMessagesTurn(io, allocator, env, request);
+    }
+
     const endpoint = try endpointForProvider(allocator, env, request.provider);
     defer allocator.free(endpoint);
 
@@ -222,6 +226,10 @@ fn streamChatTurnData(
     callback_context: *anyopaque,
     callback: StreamDataCallback,
 ) !void {
+    if (isAnthropicMessagesProvider(request.provider)) {
+        return streamAnthropicMessagesData(io, allocator, env, request, callback_context, callback);
+    }
+
     const endpoint = try endpointForProvider(allocator, env, request.provider);
     defer allocator.free(endpoint);
 
@@ -311,6 +319,153 @@ const StreamResultContext = struct {
     text_callback: ?StreamTextCallback,
 };
 
+fn isAnthropicMessagesProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "anthropic");
+}
+
+fn runAnthropicMessagesTurn(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+) ChatCompletionError!ChatCompletionResult {
+    const endpoint = try anthropicMessagesEndpointForProvider(allocator, env);
+    defer allocator.free(endpoint);
+
+    const payload = try buildAnthropicMessagesPayload(allocator, request, false);
+    defer allocator.free(payload);
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    var auth_header = try anthropicAuthHeader(allocator, request.api_key);
+    defer auth_header.deinit(allocator);
+    const user_agent = if (auth_header.oauth) "claude-cli/2.1.75" else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer if (!auth_header.oauth) allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    var extra_headers_buf: [5]std.http.Header = undefined;
+    const extra_headers = anthropicExtraHeaders(&extra_headers_buf, request.api_key, auth_header.oauth);
+    const result = try client.fetch(.{
+        .location = .{ .url = endpoint },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .authorization = if (auth_header.authorization) |value| .{ .override = value } else .default,
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+        },
+        .extra_headers = extra_headers,
+    });
+
+    const body = response_body.written();
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        return error.ProviderRequestFailed;
+    }
+
+    return parseAnthropicMessagesResult(allocator, body);
+}
+
+fn streamAnthropicMessagesData(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    const endpoint = try anthropicMessagesEndpointForProvider(allocator, env);
+    defer allocator.free(endpoint);
+
+    const payload = try buildAnthropicMessagesPayload(allocator, request, true);
+    defer allocator.free(payload);
+
+    var auth_header = try anthropicAuthHeader(allocator, request.api_key);
+    defer auth_header.deinit(allocator);
+    const user_agent = if (auth_header.oauth) "claude-cli/2.1.75" else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer if (!auth_header.oauth) allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    var extra_headers_buf: [5]std.http.Header = undefined;
+    const extra_headers = anthropicExtraHeaders(&extra_headers_buf, request.api_key, auth_header.oauth);
+    var request_handle = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .authorization = if (auth_header.authorization) |value| .{ .override = value } else .default,
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .extra_headers = extra_headers,
+    });
+    defer request_handle.deinit();
+
+    request_handle.transfer_encoding = .{ .content_length = payload.len };
+    var body_writer = try request_handle.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try request_handle.connection.?.flush();
+
+    var response = try request_handle.receiveHead(&.{});
+    if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
+        var transfer_buffer: [1024]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        _ = reader.discardRemaining() catch {};
+        return error.ProviderRequestFailed;
+    }
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    try readAnthropicSseStream(allocator, reader, callback_context, callback);
+}
+
+const AnthropicAuthHeader = struct {
+    authorization: ?[]u8 = null,
+    oauth: bool = false,
+
+    fn deinit(self: *AnthropicAuthHeader, allocator: std.mem.Allocator) void {
+        if (self.authorization) |value| allocator.free(value);
+    }
+};
+
+fn anthropicAuthHeader(allocator: std.mem.Allocator, api_key: []const u8) !AnthropicAuthHeader {
+    if (std.mem.startsWith(u8, api_key, "sk-ant-oat")) {
+        return .{
+            .authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}),
+            .oauth = true,
+        };
+    }
+    return .{};
+}
+
+fn anthropicExtraHeaders(buf: *[5]std.http.Header, api_key: []const u8, oauth: bool) []const std.http.Header {
+    var len: usize = 0;
+    buf[len] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+    len += 1;
+    if (oauth) {
+        buf[len] = .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" };
+        len += 1;
+        buf[len] = .{ .name = "x-app", .value = "cli" };
+        len += 1;
+    } else {
+        buf[len] = .{ .name = "x-api-key", .value = api_key };
+        len += 1;
+    }
+    return buf[0..len];
+}
+
 fn endpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, provider: []const u8) ![]u8 {
     if (env.get("PI_ZIG_PROVIDER_BASE_URL")) |base_url| {
         return endpointFromBaseUrl(allocator, base_url);
@@ -324,12 +479,26 @@ fn endpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Env
     return error.UnsupportedProvider;
 }
 
+fn anthropicMessagesEndpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
+    if (env.get("PI_ZIG_PROVIDER_BASE_URL")) |base_url| {
+        return endpointFromBaseUrlWithPath(allocator, base_url, "/v1/messages");
+    }
+    return allocator.dupe(u8, "https://api.anthropic.com/v1/messages");
+}
+
 fn endpointFromBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
+    return endpointFromBaseUrlWithPath(allocator, base_url, "/chat/completions");
+}
+
+fn endpointFromBaseUrlWithPath(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]u8 {
     var end = base_url.len;
     while (end > 0 and base_url[end - 1] == '/') end -= 1;
     const trimmed = base_url[0..end];
-    if (std.mem.endsWith(u8, trimmed, "/chat/completions")) return allocator.dupe(u8, trimmed);
-    return std.fmt.allocPrint(allocator, "{s}/chat/completions", .{trimmed});
+    if (std.mem.endsWith(u8, trimmed, suffix)) return allocator.dupe(u8, trimmed);
+    if (std.mem.startsWith(u8, suffix, "/v1/") and std.mem.endsWith(u8, trimmed, "/v1")) {
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, suffix["/v1".len..] });
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, suffix });
 }
 
 fn buildPayload(allocator: std.mem.Allocator, request: ChatTurnRequest) ![]u8 {
@@ -360,6 +529,280 @@ fn buildPayloadWithStream(allocator: std.mem.Allocator, request: ChatTurnRequest
     }
     try w.writeByte('}');
     return out.toOwnedSlice();
+}
+
+fn buildAnthropicMessagesPayload(allocator: std.mem.Allocator, request: ChatTurnRequest, stream: bool) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    try w.writeAll("{\"model\":");
+    try writeJsonString(w, request.model);
+    try w.writeAll(",\"max_tokens\":4096");
+    try w.writeAll(",\"stream\":");
+    try w.writeAll(if (stream) "true" else "false");
+    try writeAnthropicSystem(w, request.messages);
+    try w.writeAll(",\"messages\":[");
+    var emitted: usize = 0;
+    var index: usize = 0;
+    while (index < request.messages.len) {
+        const message = request.messages[index];
+        if (message.role == .system) {
+            index += 1;
+            continue;
+        }
+        if (emitted != 0) try w.writeByte(',');
+        if (message.role == .tool) {
+            try writeAnthropicToolResultMessage(w, request.messages, &index);
+        } else {
+            try writeAnthropicMessage(w, message);
+            index += 1;
+        }
+        emitted += 1;
+    }
+    try w.writeByte(']');
+    if (request.tools.len > 0) {
+        try w.writeAll(",\"tools\":[");
+        for (request.tools, 0..) |tool, tool_index| {
+            if (tool_index != 0) try w.writeByte(',');
+            try writeAnthropicToolDefinition(w, tool);
+        }
+        try w.writeByte(']');
+    }
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn writeAnthropicSystem(w: *std.Io.Writer, messages: []const ChatMessage) !void {
+    var emitted: usize = 0;
+    for (messages) |message| {
+        if (message.role != .system or std.mem.trim(u8, message.content, " \t\r\n").len == 0) continue;
+        if (emitted == 0) try w.writeAll(",\"system\":[") else try w.writeByte(',');
+        try w.writeAll("{\"type\":\"text\",\"text\":");
+        try writeJsonString(w, message.content);
+        try w.writeByte('}');
+        emitted += 1;
+    }
+    if (emitted != 0) try w.writeByte(']');
+}
+
+fn writeAnthropicMessage(w: *std.Io.Writer, message: ChatMessage) !void {
+    try w.writeAll("{\"role\":");
+    try writeJsonString(w, switch (message.role) {
+        .assistant => "assistant",
+        else => "user",
+    });
+    try w.writeAll(",\"content\":[");
+    var emitted: usize = 0;
+    if (message.role == .assistant and message.content.len > 0) {
+        try writeAnthropicTextBlock(w, message.content, &emitted);
+    } else if (message.content_parts.len > 0) {
+        for (message.content_parts) |part| {
+            if (emitted != 0) try w.writeByte(',');
+            try writeAnthropicContentPart(w, part);
+            emitted += 1;
+        }
+    } else if (message.content.len > 0) {
+        try writeAnthropicTextBlock(w, message.content, &emitted);
+    }
+    if (message.role == .assistant and message.tool_calls.len > 0) {
+        for (message.tool_calls) |call| {
+            if (emitted != 0) try w.writeByte(',');
+            try writeAnthropicToolUseBlock(w, call);
+            emitted += 1;
+        }
+    }
+    try w.writeAll("]}");
+}
+
+fn writeAnthropicToolResultMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize) !void {
+    try w.writeAll("{\"role\":\"user\",\"content\":[");
+    var emitted: usize = 0;
+    while (index.* < messages.len and messages[index.*].role == .tool) : (index.* += 1) {
+        if (emitted != 0) try w.writeByte(',');
+        const message = messages[index.*];
+        try w.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
+        try writeJsonString(w, message.tool_call_id orelse "");
+        try w.writeAll(",\"content\":");
+        try writeJsonString(w, message.content);
+        try w.writeByte('}');
+        emitted += 1;
+    }
+    try w.writeAll("]}");
+}
+
+fn writeAnthropicTextBlock(w: *std.Io.Writer, text: []const u8, emitted: *usize) !void {
+    if (emitted.* != 0) try w.writeByte(',');
+    try w.writeAll("{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+    emitted.* += 1;
+}
+
+fn writeAnthropicContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
+    switch (part) {
+        .text => |text| {
+            try w.writeAll("{\"type\":\"text\",\"text\":");
+            try writeJsonString(w, text);
+            try w.writeByte('}');
+        },
+        .image => |image| {
+            try w.writeAll("{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
+            try writeJsonString(w, image.mime_type);
+            try w.writeAll(",\"data\":");
+            try writeJsonString(w, image.data);
+            try w.writeAll("}}");
+        },
+    }
+}
+
+fn writeAnthropicToolUseBlock(w: *std.Io.Writer, call: ChatToolCall) !void {
+    try w.writeAll("{\"type\":\"tool_use\",\"id\":");
+    try writeJsonString(w, call.id);
+    try w.writeAll(",\"name\":");
+    try writeJsonString(w, call.name);
+    try w.writeAll(",\"input\":");
+    if (std.mem.trim(u8, call.arguments_json, " \t\r\n").len == 0) {
+        try w.writeAll("{}");
+    } else {
+        try w.writeAll(call.arguments_json);
+    }
+    try w.writeByte('}');
+}
+
+fn writeAnthropicToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void {
+    try w.writeAll("{\"name\":");
+    try writeJsonString(w, tool.name);
+    try w.writeAll(",\"description\":");
+    try writeJsonString(w, tool.description);
+    try w.writeAll(",\"input_schema\":");
+    try w.writeAll(tool.parameters_json);
+    try w.writeByte('}');
+}
+
+fn readAnthropicSseStream(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    var data_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer data_writer.deinit();
+    var event_kind: AnthropicSseEventKind = .none;
+    var saw_stop = false;
+
+    while (true) {
+        const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => return error.ProviderResponseInvalid,
+            else => return err,
+        };
+        const line_with_cr = raw_line orelse break;
+        const line = stripTrailingCarriageReturn(line_with_cr);
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) {
+            if (data_writer.written().len > 0) {
+                if (event_kind == .err) return error.ProviderRequestFailed;
+                const data = data_writer.written();
+                try callback(callback_context, data);
+                if (try isAnthropicMessageStopData(allocator, data)) saw_stop = true;
+                data_writer.deinit();
+                data_writer = .init(allocator);
+            }
+            event_kind = .none;
+            continue;
+        }
+        if (trimmed[0] == ':') continue;
+        if (std.mem.startsWith(u8, trimmed, "event:")) {
+            event_kind = parseAnthropicSseEventKind(std.mem.trim(u8, trimmed["event:".len..], " \t"));
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "data:")) {
+            if (data_writer.written().len > 0) try data_writer.writer.writeByte('\n');
+            try data_writer.writer.writeAll(std.mem.trim(u8, trimmed["data:".len..], " \t"));
+        }
+    }
+    if (data_writer.written().len > 0) {
+        if (event_kind == .err) return error.ProviderRequestFailed;
+        const data = data_writer.written();
+        try callback(callback_context, data);
+        if (try isAnthropicMessageStopData(allocator, data)) saw_stop = true;
+    }
+    if (!saw_stop) return error.ProviderResponseInvalid;
+}
+
+const AnthropicSseEventKind = enum {
+    none,
+    known,
+    err,
+};
+
+fn parseAnthropicSseEventKind(event: []const u8) AnthropicSseEventKind {
+    if (std.mem.eql(u8, event, "error")) return .err;
+    if (std.mem.eql(u8, event, "message_start") or
+        std.mem.eql(u8, event, "message_delta") or
+        std.mem.eql(u8, event, "message_stop") or
+        std.mem.eql(u8, event, "content_block_start") or
+        std.mem.eql(u8, event, "content_block_delta") or
+        std.mem.eql(u8, event, "content_block_stop"))
+    {
+        return .known;
+    }
+    return .none;
+}
+
+fn isAnthropicMessageStopData(allocator: std.mem.Allocator, data: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return error.ProviderResponseInvalid;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ProviderResponseInvalid;
+    const event_type = parsed.value.object.get("type") orelse return false;
+    if (event_type != .string) return error.ProviderResponseInvalid;
+    return std.mem.eql(u8, event_type.string, "message_stop");
+}
+
+fn parseAnthropicMessagesResult(allocator: std.mem.Allocator, body: []const u8) !ChatCompletionResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.ProviderResponseInvalid;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ProviderResponseInvalid;
+
+    const content = parsed.value.object.get("content") orelse return error.ProviderResponseInvalid;
+    if (content != .array) return error.ProviderResponseInvalid;
+
+    var result: ChatCompletionResult = .{};
+    errdefer result.deinit(allocator);
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    var calls: std.ArrayList(ChatToolCall) = .empty;
+    errdefer {
+        for (calls.items) |call| call.deinit(allocator);
+        calls.deinit(allocator);
+    }
+
+    for (content.array.items) |block| {
+        if (block != .object) return error.ProviderResponseInvalid;
+        const block_type = try requiredObjectString(block, "type");
+        if (std.mem.eql(u8, block_type, "text")) {
+            try text.writer.writeAll(try requiredObjectString(block, "text"));
+        } else if (std.mem.eql(u8, block_type, "tool_use")) {
+            const input = block.object.get("input") orelse return error.ProviderResponseInvalid;
+            const arguments_json = try jsonValueToOwnedString(allocator, input);
+            errdefer allocator.free(arguments_json);
+            try calls.append(allocator, .{
+                .id = try allocator.dupe(u8, try requiredObjectString(block, "id")),
+                .name = try allocator.dupe(u8, try requiredObjectString(block, "name")),
+                .arguments_json = arguments_json,
+            });
+        }
+    }
+
+    if (text.written().len > 0) {
+        result.text = try text.toOwnedSlice();
+        text = .init(allocator);
+    }
+    if (calls.items.len > 0) {
+        result.tool_calls = try calls.toOwnedSlice(allocator);
+    }
+    if (result.text == null and result.tool_calls.len == 0) return error.ProviderResponseInvalid;
+    return result;
 }
 
 fn parseOpenAICompatibleStreamData(
@@ -1131,6 +1574,39 @@ test "serializes OpenAI-compatible text and image content parts" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"content\":[{\"type\":\"text\",\"text\":\"inspect this\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGVsbG8=\"}}]") != null);
 }
 
+test "serializes Anthropic messages payload with images tools and tool results" {
+    const parts = [_]ChatContentPart{
+        .{ .text = "inspect this" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const tool_calls = [_]ChatToolCall{
+        .{ .id = @constCast("call_1"), .name = @constCast("bash"), .arguments_json = @constCast("{\"command\":\"printf ok\"}") },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "be terse" },
+        .{ .role = .user, .content_parts = parts[0..] },
+        .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
+        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1" },
+    };
+    const tools = [_]ChatToolDefinition{
+        .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
+    };
+    const payload = try buildAnthropicMessagesPayload(std.testing.allocator, .{
+        .provider = "anthropic",
+        .model = "claude-test",
+        .api_key = "sk-ant-test",
+        .messages = messages[0..],
+        .tools = tools[0..],
+    }, true);
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"system\":[{\"type\":\"text\",\"text\":\"be terse\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"aGVsbG8=\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"bash\",\"input\":{\"command\":\"printf ok\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"ok\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"name\":\"bash\",\"description\":\"run shell\",\"input_schema\":{\"type\":\"object\"}}]") != null);
+}
+
 test "parses OpenAI-compatible tool calls" {
     const body =
         \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf ok\"}"}}]}}]}
@@ -1231,6 +1707,46 @@ test "assembles Anthropic text stream events" {
     try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
 }
 
+test "parses Anthropic messages result text and tool use" {
+    const body =
+        \\{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"before "},{"type":"tool_use","id":"call_1","name":"bash","input":{"command":"printf ok"}}]}
+    ;
+    const result = try parseAnthropicMessagesResult(std.testing.allocator, body);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("before ", result.text.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf ok\"}", result.tool_calls[0].arguments_json);
+}
+
+test "parses native Anthropic SSE frames without done sentinel" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    var context = StreamResultContext{
+        .allocator = std.testing.allocator,
+        .accumulator = &accumulator,
+        .text_callback_context = null,
+        .text_callback = null,
+    };
+    var reader = std.Io.Reader.fixed(
+        "event: message_start\n" ++
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n" ++
+            "event: content_block_start\n" ++
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+            "event: content_block_delta\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"native \"}}\n\n" ++
+            "event: content_block_delta\n" ++
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"anthropic\"}}\n\n" ++
+            "event: message_stop\n" ++
+            "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    try readAnthropicSseStream(std.testing.allocator, &reader, &context, handleStreamResultData);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("native anthropic", result.text.?);
+}
+
 test "assembles Anthropic tool use stream events" {
     var accumulator = StreamChatAccumulator.init(std.testing.allocator);
     errdefer accumulator.deinit();
@@ -1292,4 +1808,19 @@ test "provider base URL appends chat completions endpoint" {
     const endpoint = try endpointForProvider(std.testing.allocator, &env, "openai");
     defer std.testing.allocator.free(endpoint);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/chat/completions", endpoint);
+}
+
+test "Anthropic provider base URL appends messages endpoint once" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put("PI_ZIG_PROVIDER_BASE_URL", "http://127.0.0.1:43123/v1/");
+    const endpoint_from_versioned_base = try anthropicMessagesEndpointForProvider(std.testing.allocator, &env);
+    defer std.testing.allocator.free(endpoint_from_versioned_base);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/messages", endpoint_from_versioned_base);
+
+    try env.put("PI_ZIG_PROVIDER_BASE_URL", "http://127.0.0.1:43123");
+    const endpoint_from_root_base = try anthropicMessagesEndpointForProvider(std.testing.allocator, &env);
+    defer std.testing.allocator.free(endpoint_from_root_base);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/messages", endpoint_from_root_base);
 }
