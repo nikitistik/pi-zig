@@ -5483,6 +5483,7 @@ export default function(pi: any): void {
       JSON.stringify({ id: 'rpc-retry-exhausted-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
       JSON.stringify({ id: 'rpc-retry-exhausted-prompt', type: 'prompt', message: 'rpc retry exhausted' }),
       JSON.stringify({ id: 'rpc-retry-exhausted-state', type: 'get_state' }),
+      JSON.stringify({ id: 'rpc-retry-exhausted-messages', type: 'get_messages' }),
       ''
     ].join('\n'),
     { env: rpcProviderEnv }
@@ -5490,17 +5491,29 @@ export default function(pi: any): void {
   const rpcProviderRetryExhaustedResponses = rpcProviderRetryExhaustedOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const rpcProviderRetryExhaustedPrompt = rpcProviderRetryExhaustedResponses.find((response) => response.id === 'rpc-retry-exhausted-prompt');
   const rpcProviderRetryExhaustedState = rpcProviderRetryExhaustedResponses.find((response) => response.id === 'rpc-retry-exhausted-state');
+  const rpcProviderRetryExhaustedMessages = rpcProviderRetryExhaustedResponses.find((response) => response.id === 'rpc-retry-exhausted-messages');
   const rpcProviderRetryExhaustedEventSummary = rpcProviderRetryExhaustedResponses
-    .filter((response) => ['agent_end', 'auto_retry_start', 'auto_retry_end'].includes(response.type))
+    .filter((response) => (response.type === 'agent_end' && 'willRetry' in response) || response.type === 'auto_retry_start' || response.type === 'auto_retry_end')
     .map((response) => {
       if (response.type === 'agent_end') return `agent_end:${response.willRetry}`;
       if (response.type === 'auto_retry_start') return `auto_retry_start:${response.attempt}:${response.maxAttempts}`;
       return `auto_retry_end:${response.success}:${response.attempt}:${response.finalError}`;
     });
+  const rpcProviderRetryExhaustedLifecycle = rpcProviderRetryExhaustedResponses
+    .filter((response) => ['message_start', 'message_end', 'turn_end', 'agent_end'].includes(response.type) && !('willRetry' in response))
+    .map((response) => {
+      if (response.type === 'agent_end') return `agent_end:${response.messages?.[0]?.stopReason}:${response.messages?.[0]?.errorMessage}`;
+      return `${response.type}:${response.message?.stopReason}:${response.message?.errorMessage}`;
+    });
+  const rpcProviderRetryExhaustedAssistant = rpcProviderRetryExhaustedMessages?.data?.messages
+    ?.filter((message) => message.role === 'assistant')
+    ?.at(-1);
   if (
     rpcProviderRetryExhaustedPrompt?.success !== false ||
     rpcProviderRetryExhaustedPrompt?.error !== 'ProviderRequestFailed' ||
     rpcProviderRetryExhaustedState?.data?.lastRetryAttempts !== 2 ||
+    rpcProviderRetryExhaustedAssistant?.stopReason !== 'error' ||
+    rpcProviderRetryExhaustedAssistant?.errorMessage !== 'ProviderRequestFailed' ||
     JSON.stringify(rpcProviderRetryExhaustedEventSummary) !== JSON.stringify([
       'agent_end:true',
       'auto_retry_start:1:2',
@@ -5508,6 +5521,12 @@ export default function(pi: any): void {
       'auto_retry_start:2:2',
       'agent_end:false',
       'auto_retry_end:false:2:ProviderRequestFailed'
+    ]) ||
+    JSON.stringify(rpcProviderRetryExhaustedLifecycle) !== JSON.stringify([
+      'message_start:error:ProviderRequestFailed',
+      'message_end:error:ProviderRequestFailed',
+      'turn_end:error:ProviderRequestFailed',
+      'agent_end:error:ProviderRequestFailed'
     ])
   ) {
     throw new Error('rpc provider retry exhaustion smoke did not emit upstream-shaped retry events');
@@ -5544,6 +5563,7 @@ export default function(pi: any): void {
       JSON.stringify({ id: 'rpc-retry-client-error-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
       JSON.stringify({ id: 'rpc-retry-client-error-prompt', type: 'prompt', message: 'rpc retry client error' }),
       JSON.stringify({ id: 'rpc-retry-client-error-state', type: 'get_state' }),
+      JSON.stringify({ id: 'rpc-retry-client-error-messages', type: 'get_messages' }),
       ''
     ].join('\n'),
     { env: rpcProviderEnv }
@@ -5551,10 +5571,16 @@ export default function(pi: any): void {
   const rpcProviderRetryClientErrorResponses = rpcProviderRetryClientErrorOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const rpcProviderRetryClientErrorPrompt = rpcProviderRetryClientErrorResponses.find((response) => response.id === 'rpc-retry-client-error-prompt');
   const rpcProviderRetryClientErrorState = rpcProviderRetryClientErrorResponses.find((response) => response.id === 'rpc-retry-client-error-state');
+  const rpcProviderRetryClientErrorMessages = rpcProviderRetryClientErrorResponses.find((response) => response.id === 'rpc-retry-client-error-messages');
+  const rpcProviderRetryClientErrorAssistant = rpcProviderRetryClientErrorMessages?.data?.messages
+    ?.filter((message) => message.role === 'assistant')
+    ?.at(-1);
   if (
     rpcProviderRetryClientErrorPrompt?.success !== false ||
     rpcProviderRetryClientErrorPrompt?.error !== 'ProviderClientError' ||
     rpcProviderRetryClientErrorState?.data?.lastRetryAttempts !== 0 ||
+    rpcProviderRetryClientErrorAssistant?.stopReason !== 'error' ||
+    rpcProviderRetryClientErrorAssistant?.errorMessage !== 'ProviderClientError' ||
     rpcProviderRetryClientErrorResponses.some((response) => response.type === 'auto_retry_start' || response.type === 'auto_retry_end') ||
     JSON.stringify(rpcProviderRetryClientErrorResponses).includes('client error was retried')
   ) {

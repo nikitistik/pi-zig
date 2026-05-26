@@ -1488,9 +1488,11 @@ const Runtime = struct {
             prompt_message.text,
             prompt_message.image_parts,
         ) catch |err| {
-            if (err == error.AgentAborted) {
-                try self.addAssistantStatusMessage(io, allocator, "", "aborted", "Request was aborted");
-                try writeRpcAbortedAssistantEventsMaybeLocked(retry_event_output, w, self);
+            if (err != error.RetryCancelled) {
+                const stop_reason: []const u8 = if (err == error.AgentAborted) "aborted" else "error";
+                const error_message: []const u8 = if (err == error.AgentAborted) "Request was aborted" else @errorName(err);
+                try self.addAssistantStatusMessage(io, allocator, "", stop_reason, error_message);
+                try writeRpcAssistantStatusEventsMaybeLocked(retry_event_output, w, self, stop_reason, error_message);
             }
             return err;
         };
@@ -2596,7 +2598,12 @@ fn writeResponseHead(w: *std.Io.Writer, id: ?[]const u8, command: []const u8, su
     try w.writeAll(if (success) "true" else "false");
 }
 
-fn writeRpcAbortedAssistantMessageJson(w: *std.Io.Writer, runtime: *Runtime) !void {
+fn writeRpcAssistantStatusMessageJson(
+    w: *std.Io.Writer,
+    runtime: *Runtime,
+    stop_reason: []const u8,
+    error_message: []const u8,
+) !void {
     try w.writeAll("{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]");
     if (runtime.selected_model) |model| {
         try w.writeAll(",\"api\":");
@@ -2607,32 +2614,47 @@ fn writeRpcAbortedAssistantMessageJson(w: *std.Io.Writer, runtime: *Runtime) !vo
         try writeJsonString(w, model.id);
     }
     try w.writeAll(",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}}");
-    try w.writeAll(",\"stopReason\":\"aborted\",\"errorMessage\":\"Request was aborted\"}");
+    try w.writeAll(",\"stopReason\":");
+    try writeJsonString(w, stop_reason);
+    try w.writeAll(",\"errorMessage\":");
+    try writeJsonString(w, error_message);
+    try w.writeByte('}');
 }
 
-fn writeRpcAbortedAssistantEvents(w: *std.Io.Writer, runtime: *Runtime) !void {
+fn writeRpcAssistantStatusEvents(
+    w: *std.Io.Writer,
+    runtime: *Runtime,
+    stop_reason: []const u8,
+    error_message: []const u8,
+) !void {
     try w.writeAll("{\"type\":\"message_start\",\"message\":");
-    try writeRpcAbortedAssistantMessageJson(w, runtime);
+    try writeRpcAssistantStatusMessageJson(w, runtime, stop_reason, error_message);
     try w.writeAll("}\n");
     try w.writeAll("{\"type\":\"message_end\",\"message\":");
-    try writeRpcAbortedAssistantMessageJson(w, runtime);
+    try writeRpcAssistantStatusMessageJson(w, runtime, stop_reason, error_message);
     try w.writeAll("}\n");
     try w.writeAll("{\"type\":\"turn_end\",\"message\":");
-    try writeRpcAbortedAssistantMessageJson(w, runtime);
+    try writeRpcAssistantStatusMessageJson(w, runtime, stop_reason, error_message);
     try w.writeAll(",\"toolResults\":[]}\n");
     try w.writeAll("{\"type\":\"agent_end\",\"messages\":[");
-    try writeRpcAbortedAssistantMessageJson(w, runtime);
+    try writeRpcAssistantStatusMessageJson(w, runtime, stop_reason, error_message);
     try w.writeAll("]}\n");
 }
 
-fn writeRpcAbortedAssistantEventsMaybeLocked(output: ?*RpcOutput, w: *std.Io.Writer, runtime: *Runtime) !void {
+fn writeRpcAssistantStatusEventsMaybeLocked(
+    output: ?*RpcOutput,
+    w: *std.Io.Writer,
+    runtime: *Runtime,
+    stop_reason: []const u8,
+    error_message: []const u8,
+) !void {
     if (output) |rpc_output| {
         rpc_output.mutex.lock();
         defer rpc_output.mutex.unlock();
-        try writeRpcAbortedAssistantEvents(rpc_output.writer, runtime);
+        try writeRpcAssistantStatusEvents(rpc_output.writer, runtime, stop_reason, error_message);
         return rpc_output.writer.flush();
     }
-    return writeRpcAbortedAssistantEvents(w, runtime);
+    return writeRpcAssistantStatusEvents(w, runtime, stop_reason, error_message);
 }
 
 fn writeRpcAgentEndEvent(w: *std.Io.Writer, will_retry: bool) !void {
