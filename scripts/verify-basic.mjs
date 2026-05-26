@@ -210,6 +210,27 @@ const server = http.createServer((req, res) => {
         return;
       }
       const byId = Object.fromEntries(toolMessages.map((message) => [message.tool_call_id, message.content]));
+      const assistantToolMessage = body.messages.find(
+        (message) => message.role === 'assistant' && Array.isArray(message.tool_calls)
+      );
+      const expectedToolCallIds = [
+        'call_read_1',
+        'call_ls_1',
+        'call_grep_1',
+        'call_find_1',
+        'call_write_1',
+        'call_edit_1'
+      ];
+      const assistantToolCallIds = assistantToolMessage?.tool_calls?.map((call) => call.id) ?? [];
+      const toolMessageIds = toolMessages.map((message) => message.tool_call_id);
+      if (
+        assistantToolCallIds.length !== expectedToolCallIds.length ||
+        expectedToolCallIds.some((id) => !assistantToolCallIds.includes(id) || !toolMessageIds.includes(id))
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'multi tool transcript did not preserve all tool_call_ids', assistantToolCallIds, toolMessageIds }));
+        return;
+      }
       const hasExpectedResults =
         byId.call_read_1?.includes('Needle Alpha') &&
         byId.call_ls_1?.includes('input.txt') &&
@@ -353,6 +374,41 @@ const server = http.createServer((req, res) => {
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: 'long bash updates complete' } }] }));
+      return;
+    }
+    if (user.includes('invalid tool arguments loop')) {
+      if (!hasTool('read')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing read tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_invalid_tool_args_1',
+                type: 'function',
+                function: {
+                  name: 'read',
+                  arguments: '{"path":'
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const invalidToolMessage = toolMessages.find((message) => message.tool_call_id === 'call_invalid_tool_args_1');
+      if (!invalidToolMessage?.content?.includes('read tool argument JSON is invalid:')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid tool arguments did not return a structured tool error', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'invalid tool arguments loop complete' } }] }));
       return;
     }
     if (user.includes('tool loop')) {
@@ -2405,6 +2461,14 @@ try {
   );
   if (!providerToolLoop.includes('tool loop complete: tool-loop-ok')) {
     throw new Error('provider-backed agent loop did not execute bash tool call and return the follow-up response');
+  }
+  const providerInvalidToolArgumentsLoop = run(
+    ['--no-session', '--provider', 'openai', '--model', 'mock-invalid-tool-arguments-model', '-p', 'please run the invalid tool arguments loop'],
+    undefined,
+    { env: providerEnv }
+  );
+  if (!providerInvalidToolArgumentsLoop.includes('invalid tool arguments loop complete')) {
+    throw new Error('provider-backed agent loop did not surface invalid tool arguments as a tool-result error');
   }
 
   const providerNoTools = run(

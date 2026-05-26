@@ -956,6 +956,21 @@ test "failed tool calls are marked as errors" {
     try std.testing.expect(std.mem.startsWith(u8, result.content, "read tool failed:"));
 }
 
+test "invalid tool argument JSON returns a tool error result" {
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_invalid_bash_json"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"command\":"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCall(std.testing.io, std.testing.allocator, call);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(!result.terminate);
+    try std.testing.expect(std.mem.startsWith(u8, result.content, "bash tool argument JSON is invalid:"));
+}
+
 test "before tool hook can block execution with an error result" {
     const HookContext = struct {
         allocator: std.mem.Allocator,
