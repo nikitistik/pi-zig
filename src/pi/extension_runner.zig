@@ -81,6 +81,65 @@ pub const Runner = struct {
         self.allocator.free(definitions);
     }
 
+    pub const CommandDefinition = struct {
+        name: []const u8,
+        description: []const u8,
+        source_info_json: []const u8,
+    };
+
+    pub fn discoverCommandDefinitions(self: *Runner) ![]CommandDefinition {
+        if (!self.hasExtensions()) return &.{};
+
+        const payload = try self.buildDiscoverCommandsPayload();
+        defer self.allocator.free(payload);
+        const output = try self.runNodeHook(payload);
+        defer if (output) |bytes| self.allocator.free(bytes);
+        const bytes = output orelse return &.{};
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch return error.ExtensionHookInvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ExtensionHookInvalidResponse;
+        const commands = parsed.value.object.get("commands") orelse return &.{};
+        if (commands != .array) return error.ExtensionHookInvalidResponse;
+
+        var definitions: std.ArrayList(CommandDefinition) = .empty;
+        errdefer {
+            for (definitions.items) |definition| {
+                self.allocator.free(definition.name);
+                self.allocator.free(definition.description);
+                self.allocator.free(definition.source_info_json);
+            }
+            definitions.deinit(self.allocator);
+        }
+
+        for (commands.array.items) |item| {
+            if (item != .object) return error.ExtensionHookInvalidResponse;
+            const name = item.object.get("name") orelse return error.ExtensionHookInvalidResponse;
+            if (name != .string or name.string.len == 0) return error.ExtensionHookInvalidResponse;
+            const description = item.object.get("description");
+            if (description != null and description.? != .string) return error.ExtensionHookInvalidResponse;
+            const source_info = item.object.get("sourceInfo") orelse return error.ExtensionHookInvalidResponse;
+            if (source_info != .object) return error.ExtensionHookInvalidResponse;
+
+            try definitions.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, name.string),
+                .description = try self.allocator.dupe(u8, if (description) |value| value.string else ""),
+                .source_info_json = try jsonValueToOwnedString(self.allocator, source_info),
+            });
+        }
+        if (definitions.items.len == 0) return &.{};
+        return definitions.toOwnedSlice(self.allocator);
+    }
+
+    pub fn deinitCommandDefinitions(self: *Runner, definitions: []CommandDefinition) void {
+        for (definitions) |definition| {
+            self.allocator.free(definition.name);
+            self.allocator.free(definition.description);
+            self.allocator.free(definition.source_info_json);
+        }
+        self.allocator.free(definitions);
+    }
+
     fn runBeforeToolCall(self: *Runner, call: ai_client.ChatToolCall) !agent.BeforeToolCallResult {
         if (!self.hasExtensions()) return .{};
 
@@ -205,6 +264,15 @@ pub const Runner = struct {
         const w = &out.writer;
         try self.writePayloadHead(w);
         try w.writeAll(",\"event\":{\"type\":\"discover_tools\"}}");
+        return out.toOwnedSlice();
+    }
+
+    fn buildDiscoverCommandsPayload(self: *Runner) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try self.writePayloadHead(w);
+        try w.writeAll(",\"event\":{\"type\":\"discover_commands\"}}");
         return out.toOwnedSlice();
     }
 
@@ -424,7 +492,9 @@ const hook_runner_script =
     \\const payload = JSON.parse(process.argv[1] || "{}");
     \\const handlers = new Map();
     \\const extensionToolMaps = [];
+    \\const extensionCommandMaps = [];
     \\let activeToolMap = null;
+    \\let activeCommandMap = null;
     \\const diagnostics = [];
     \\const api = {
     \\  on(type, handler) {
@@ -434,7 +504,9 @@ const hook_runner_script =
     \\  registerTool(tool) {
     \\    if (tool && typeof tool.name === "string" && activeToolMap) activeToolMap.set(tool.name, tool);
     \\  },
-    \\  registerCommand() {},
+    \\  registerCommand(name, options) {
+    \\    if (typeof name === "string" && name.length > 0 && activeCommandMap) activeCommandMap.set(name, { name, ...(options || {}) });
+    \\  },
     \\  registerFlag() {},
     \\  events: { on() {}, emit() {} },
     \\};
@@ -449,17 +521,23 @@ const hook_runner_script =
     \\  diagnostics,
     \\};
     \\async function loadExtension(extensionPath) {
-    \\  const mod = await importExtensionModule(path.resolve(extensionPath));
+    \\  const resolvedExtensionPath = path.resolve(extensionPath);
+    \\  const mod = await importExtensionModule(resolvedExtensionPath);
     \\  const factory = typeof mod.default === "function" ? mod.default : typeof mod === "function" ? mod : null;
     \\  const toolMap = new Map();
+    \\  const commandMap = new Map();
     \\  const previousToolMap = activeToolMap;
+    \\  const previousCommandMap = activeCommandMap;
     \\  activeToolMap = toolMap;
+    \\  activeCommandMap = commandMap;
     \\  try {
     \\    if (factory) await factory(api);
     \\  } finally {
     \\    activeToolMap = previousToolMap;
+    \\    activeCommandMap = previousCommandMap;
     \\  }
     \\  extensionToolMaps.push(toolMap);
+    \\  extensionCommandMaps.push({ extensionPath: resolvedExtensionPath, commands: commandMap });
     \\}
     \\function allRegisteredTools() {
     \\  const toolsByName = new Map();
@@ -469,6 +547,35 @@ const hook_runner_script =
     \\    }
     \\  }
     \\  return Array.from(toolsByName.values());
+    \\}
+    \\function sourceInfoForExtension(extensionPath) {
+    \\  return { path: extensionPath, source: "extension", scope: "temporary", origin: "top-level", baseDir: path.dirname(extensionPath) };
+    \\}
+    \\function allRegisteredCommands() {
+    \\  const commands = [];
+    \\  const counts = new Map();
+    \\  for (const entry of extensionCommandMaps) {
+    \\    for (const command of entry.commands.values()) {
+    \\      commands.push({ ...command, extensionPath: entry.extensionPath });
+    \\      counts.set(command.name, (counts.get(command.name) || 0) + 1);
+    \\    }
+    \\  }
+    \\  const seen = new Map();
+    \\  const taken = new Set();
+    \\  return commands.map((command) => {
+    \\    const occurrence = (seen.get(command.name) || 0) + 1;
+    \\    seen.set(command.name, occurrence);
+    \\    let invocationName = (counts.get(command.name) || 0) > 1 ? `${command.name}:${occurrence}` : command.name;
+    \\    if (taken.has(invocationName)) {
+    \\      let suffix = occurrence;
+    \\      do {
+    \\        suffix++;
+    \\        invocationName = `${command.name}:${suffix}`;
+    \\      } while (taken.has(invocationName));
+    \\    }
+    \\    taken.add(invocationName);
+    \\    return { ...command, invocationName };
+    \\  });
     \\}
     \\function contentText(content) {
     \\  if (!Array.isArray(content)) return undefined;
@@ -491,10 +598,24 @@ const hook_runner_script =
     \\  return { content, contentText: text, isError: Boolean(result.isError), terminate: Boolean(result.terminate) };
     \\}
     \\(async () => {
-    \\  for (const extensionPath of payload.extensions || []) await loadExtension(extensionPath);
+    \\  for (const extensionPath of payload.extensions || []) {
+    \\    try {
+    \\      await loadExtension(extensionPath);
+    \\    } catch (err) {
+    \\      diagnostics.push({ extensionPath: String(extensionPath), error: err && err.message ? err.message : String(err) });
+    \\    }
+    \\  }
     \\  const event = payload.event;
     \\  if (event?.type === "discover_tools") {
     \\    process.stdout.write(JSON.stringify({ tools: allRegisteredTools().map(toolSummary) }) + "\n");
+    \\    return;
+    \\  }
+    \\  if (event?.type === "discover_commands") {
+    \\    process.stdout.write(JSON.stringify({ commands: allRegisteredCommands().map((command) => ({
+    \\      name: String(command.invocationName),
+    \\      description: String(command.description ?? ""),
+    \\      sourceInfo: sourceInfoForExtension(command.extensionPath),
+    \\    })) }) + "\n");
     \\    return;
     \\  }
     \\  if (event?.type === "execute_tool") {
@@ -697,6 +818,38 @@ test "extension runner keeps first extension tool when names collide" {
     defer allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("first final", result.content);
+}
+
+test "extension runner discovers registered commands with upstream invocation names" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-command-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const first_path = fixture_dir ++ "/a-first.mjs";
+    const second_path = fixture_dir ++ "/b-second.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = first_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerCommand("deploy", { description: "Deploy from first", handler: async () => {} });
+        \\  pi.registerCommand("review", { description: "Review from first", handler: async () => {} });
+        \\}
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = second_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerCommand("deploy", { description: "Deploy from second", handler: async () => {} });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{ first_path, second_path } };
+    const definitions = try runner.discoverCommandDefinitions();
+    defer runner.deinitCommandDefinitions(definitions);
+    try std.testing.expectEqual(@as(usize, 3), definitions.len);
+    try std.testing.expectEqualStrings("deploy:1", definitions[0].name);
+    try std.testing.expectEqualStrings("Deploy from first", definitions[0].description);
+    try std.testing.expect(std.mem.indexOf(u8, definitions[0].source_info_json, "\"source\":\"extension\"") != null);
+    try std.testing.expectEqualStrings("review", definitions[1].name);
+    try std.testing.expectEqualStrings("Review from first", definitions[1].description);
+    try std.testing.expectEqualStrings("deploy:2", definitions[2].name);
+    try std.testing.expectEqualStrings("Deploy from second", definitions[2].description);
 }
 
 test "extension runner loads TypeScript registered tools" {

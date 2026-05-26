@@ -1,4 +1,5 @@
 const std = @import("std");
+const extension_runner = @import("extension_runner.zig");
 
 const legacy_project_prompts_dir = ".pi/agent/prompts";
 const legacy_project_skills_dir = ".pi/agent/skills";
@@ -11,6 +12,7 @@ pub const Options = struct {
     home: ?[]const u8 = null,
     additional_skill_paths: []const []const u8 = &.{},
     additional_prompt_paths: []const []const u8 = &.{},
+    extension_paths: []const []const u8 = &.{},
     no_skills: bool = false,
     no_prompt_templates: bool = false,
 };
@@ -41,6 +43,8 @@ pub fn writeCommandsDataJsonWithOptions(
     try w.writeAll("{\"commands\":[");
     var emitted: usize = 0;
 
+    try writeExtensionCommands(io, allocator, w, &emitted, options.extension_paths);
+
     if (!options.no_prompt_templates) {
         try writeDefaultPromptCommands(io, allocator, w, &emitted, options.home);
         try writeSettingsPromptCommands(io, allocator, w, &emitted, options.home);
@@ -54,6 +58,26 @@ pub fn writeCommandsDataJsonWithOptions(
     try writeSkillCommandsForPaths(io, allocator, w, &emitted, options.additional_skill_paths, "temporary", true);
 
     try w.writeAll("]}");
+}
+
+fn writeExtensionCommands(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    emitted: *usize,
+    extension_paths: []const []const u8,
+) !void {
+    if (extension_paths.len == 0) return;
+    var runner = extension_runner.Runner{ .io = io, .allocator = allocator, .extension_paths = extension_paths };
+    const definitions = try runner.discoverCommandDefinitions();
+    defer if (definitions.len > 0) runner.deinitCommandDefinitions(definitions);
+    for (definitions) |definition| {
+        if (emitted.* != 0) try w.writeByte(',');
+        try writeCommandHead(w, definition.name, definition.description, "extension");
+        try w.writeAll(definition.source_info_json);
+        try w.writeByte('}');
+        emitted.* += 1;
+    }
 }
 
 fn writeDefaultPromptCommands(

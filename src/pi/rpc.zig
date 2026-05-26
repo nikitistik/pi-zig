@@ -1590,7 +1590,9 @@ const Runtime = struct {
         if (std.mem.eql(u8, command, "get_commands")) {
             try writeResponseHead(w, id, command, true);
             try w.writeAll(",\"data\":");
-            try commands.writeCommandsDataJsonWithOptions(io, allocator, w, self.run_options.command_options);
+            var command_options = self.run_options.command_options;
+            command_options.extension_paths = self.run_options.extension_paths;
+            try commands.writeCommandsDataJsonWithOptions(io, allocator, w, command_options);
             try w.writeAll("}\n");
             return;
         }

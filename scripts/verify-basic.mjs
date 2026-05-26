@@ -1596,6 +1596,7 @@ fs.mkdirSync(path.join(commandsFixtureRoot, 'packages/project-disabled/skills/pr
 fs.mkdirSync(path.join(commandsFixtureRoot, 'workspace/nested'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, 'explicit/prompts'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, 'explicit/skills/ship-skill'), { recursive: true });
+fs.mkdirSync(path.join(commandsFixtureRoot, 'extensions'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureHome, '.pi/agent/prompts'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureHome, '.pi/agent/skills/global-skill'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureHome, '.pi/agent/settings-prompts'), { recursive: true });
@@ -1792,6 +1793,23 @@ fs.writeFileSync(
   ['---', 'name: ship-skill', 'description: Temporary release skill', '---', 'Use the release skill.'].join('\n')
 );
 fs.writeFileSync(
+  path.join(commandsFixtureRoot, 'extensions/commands-a.mjs'),
+  [
+    'export default function(pi) {',
+    '  pi.registerCommand("deploy", { description: "Deploy from extension A", handler: async () => {} });',
+    '  pi.registerCommand("review", { description: "Review from extension A", handler: async () => {} });',
+    '}'
+  ].join('\n')
+);
+fs.writeFileSync(
+  path.join(commandsFixtureRoot, 'extensions/commands-b.mjs'),
+  [
+    'export default function(pi) {',
+    '  pi.registerCommand("deploy", { description: "Deploy from extension B", handler: async () => {} });',
+    '}'
+  ].join('\n')
+);
+fs.writeFileSync(
   path.join(commandsFixtureHome, '.pi/agent/prompts/global-review.md'),
   ['---', 'description: Global review prompt', '---', 'Review globally.'].join('\n')
 );
@@ -1870,11 +1888,38 @@ fs.writeFileSync(
   ['---', 'name: external-skill', 'description: External agents skill command', '---', 'Use the external skill.'].join('\n')
 );
 const fixtureCommands = JSON.parse(run(
-  ['commands', '--skill', 'explicit/skills', '--prompt-template', 'explicit/prompts'],
+  [
+    'commands',
+    '--skill',
+    'explicit/skills',
+    '--prompt-template',
+    'explicit/prompts',
+    '--extension',
+    'extensions/commands-a.mjs',
+    '--extension',
+    'extensions/commands-b.mjs'
+  ],
   undefined,
   { cwd: commandsFixtureRoot, env: commandsFixtureEnv }
 ));
 if (
+  !fixtureCommands.commands.some((command) =>
+    command.name === 'deploy:1' &&
+    command.description === 'Deploy from extension A' &&
+    command.source === 'extension' &&
+    command.sourceInfo?.source === 'extension' &&
+    command.sourceInfo?.scope === 'temporary'
+  ) ||
+  !fixtureCommands.commands.some((command) =>
+    command.name === 'review' &&
+    command.description === 'Review from extension A' &&
+    command.source === 'extension'
+  ) ||
+  !fixtureCommands.commands.some((command) =>
+    command.name === 'deploy:2' &&
+    command.description === 'Deploy from extension B' &&
+    command.source === 'extension'
+  ) ||
   !fixtureCommands.commands.some((command) =>
     command.name === 'fix-tests' &&
     command.description === 'Fix failing tests' &&
@@ -2068,7 +2113,20 @@ if (
   throw new Error('commands smoke did not discover ancestor .agents/skills from nested cwd');
 }
 const fixtureRpcCommandsOutput = run(
-  ['--mode', 'rpc', '--session', 'zig-out/pi-zig-rpc-commands.jsonl', '--skill', 'explicit/skills', '--prompt-template', 'explicit/prompts'],
+  [
+    '--mode',
+    'rpc',
+    '--session',
+    'zig-out/pi-zig-rpc-commands.jsonl',
+    '--skill',
+    'explicit/skills',
+    '--prompt-template',
+    'explicit/prompts',
+    '--extension',
+    'extensions/commands-a.mjs',
+    '--extension',
+    'extensions/commands-b.mjs'
+  ],
   `${JSON.stringify({ id: 'cmds', type: 'get_commands' })}\n`,
   { cwd: commandsFixtureRoot, env: commandsFixtureEnv }
 );
@@ -2076,6 +2134,9 @@ const fixtureRpcCommands = fixtureRpcCommandsOutput.trim().split('\n').filter(Bo
 const rpcCommandsResponse = fixtureRpcCommands.find((response) => response.id === 'cmds');
 if (
   !rpcCommandsResponse?.success ||
+  !rpcCommandsResponse.data.commands.some((command) => command.name === 'deploy:1' && command.source === 'extension') ||
+  !rpcCommandsResponse.data.commands.some((command) => command.name === 'review' && command.source === 'extension') ||
+  !rpcCommandsResponse.data.commands.some((command) => command.name === 'deploy:2' && command.source === 'extension') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'fix-tests' && command.source === 'prompt') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'global-review' && command.sourceInfo?.scope === 'user') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'project-settings' && command.sourceInfo?.scope === 'project') ||

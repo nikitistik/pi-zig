@@ -89,7 +89,14 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "commands")) {
         const parsed = pi.cli.parse(args[2..]);
-        return pi.commands.writeCommandsJsonWithOptions(init.io, init.gpa, commandOptionsFromParsed(init, &parsed));
+        var runtime_extensions = try pi.extensions.discoverRuntimePaths(init.io, init.gpa, init.environ_map, .{
+            .no_extensions = parsed.no_extensions,
+            .explicit_paths = parsed.extensions[0..parsed.extensions_len],
+        });
+        defer runtime_extensions.deinit(init.gpa);
+        var command_options = commandOptionsFromParsed(init, &parsed);
+        command_options.extension_paths = runtime_extensions.paths;
+        return pi.commands.writeCommandsJsonWithOptions(init.io, init.gpa, command_options);
     }
 
     if (std.mem.eql(u8, command, "rpc")) {
@@ -261,6 +268,7 @@ fn commandOptionsFromParsed(init: std.process.Init, parsed: *const pi.cli.Parsed
         .home = init.environ_map.get("HOME"),
         .additional_skill_paths = parsed.skills[0..parsed.skills_len],
         .additional_prompt_paths = parsed.prompt_templates[0..parsed.prompt_templates_len],
+        .extension_paths = parsed.extensions[0..parsed.extensions_len],
         .no_skills = parsed.no_skills,
         .no_prompt_templates = parsed.no_prompt_templates,
     };

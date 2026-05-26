@@ -105,8 +105,10 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         defer path.deinit(init.gpa);
         var runtime_extensions = try discoverRuntimeExtensionPaths(init.io, init.gpa, init.environ_map, parsed);
         defer runtime_extensions.deinit(init.gpa);
+        var command_options = commandOptionsFromParsed(init, &parsed);
+        command_options.extension_paths = runtime_extensions.paths;
         return rpc.run(init.io, init.gpa, init.environ_map, path.path, .{
-            .command_options = commandOptionsFromParsed(init, &parsed),
+            .command_options = command_options,
             .extension_paths = runtime_extensions.paths,
             .tool_set = toolSetFromParsed(parsed),
             .custom_tools_enabled = !parsed.no_tools,
