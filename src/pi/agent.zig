@@ -7,6 +7,8 @@ pub const ToolEndCallback = *const fn (ctx: *anyopaque, result: ToolResult) anye
 pub const TextDeltaCallback = ai_client.StreamTextCallback;
 pub const BeforeToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!BeforeToolCallResult;
 pub const AfterToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall, result: ToolResult) anyerror!AfterToolCallResult;
+pub const PrepareNextTurnCallback = *const fn (ctx: *anyopaque, turn: TurnContext) anyerror!PrepareNextTurnResult;
+pub const ShouldStopAfterTurnCallback = *const fn (ctx: *anyopaque, turn: TurnContext) anyerror!bool;
 
 pub const RunOptions = struct {
     provider: []const u8,
@@ -24,6 +26,9 @@ pub const RunOptions = struct {
     tool_hook_context: ?*anyopaque = null,
     before_tool_call: ?BeforeToolCallCallback = null,
     after_tool_call: ?AfterToolCallCallback = null,
+    turn_lifecycle_context: ?*anyopaque = null,
+    prepare_next_turn: ?PrepareNextTurnCallback = null,
+    should_stop_after_turn: ?ShouldStopAfterTurnCallback = null,
     text_event_context: ?*anyopaque = null,
     on_text_delta: ?TextDeltaCallback = null,
 };
@@ -46,6 +51,29 @@ pub const AfterToolCallResult = struct {
 
     pub fn deinit(self: AfterToolCallResult, allocator: std.mem.Allocator) void {
         if (self.content) |content| allocator.free(content);
+    }
+};
+
+pub const TurnContext = struct {
+    turn_index: usize,
+    assistant_text: []const u8,
+    tool_results: []const ToolResult,
+    system_prompt: []const u8,
+    provider: []const u8,
+    model: []const u8,
+};
+
+pub const PrepareNextTurnResult = struct {
+    system_prompt: ?[]u8 = null,
+    provider: ?[]u8 = null,
+    model: ?[]u8 = null,
+    api_key: ?[]u8 = null,
+
+    pub fn deinit(self: PrepareNextTurnResult, allocator: std.mem.Allocator) void {
+        if (self.system_prompt) |system_prompt| allocator.free(system_prompt);
+        if (self.provider) |provider| allocator.free(provider);
+        if (self.model) |model| allocator.free(model);
+        if (self.api_key) |api_key| allocator.free(api_key);
     }
 };
 
@@ -244,15 +272,21 @@ pub fn runPrompt(
 
     var tool_definitions_buf: [all_tool_definitions.len]ai_client.ChatToolDefinition = undefined;
     const tool_definitions = enabledToolDefinitions(options.tool_set, &tool_definitions_buf);
+    var active_provider: ?[]u8 = null;
+    defer if (active_provider) |provider| allocator.free(provider);
+    var active_model: ?[]u8 = null;
+    defer if (active_model) |model| allocator.free(model);
+    var active_api_key: ?[]u8 = null;
+    defer if (active_api_key) |api_key| allocator.free(api_key);
     var turn: usize = 0;
     while (turn < options.max_turns) : (turn += 1) {
         const borrowed = try borrowMessages(allocator, messages.items);
         defer allocator.free(borrowed);
 
         const request: ai_client.ChatTurnRequest = .{
-            .provider = options.provider,
-            .model = options.model,
-            .api_key = options.api_key,
+            .provider = active_provider orelse options.provider,
+            .model = active_model orelse options.model,
+            .api_key = active_api_key orelse options.api_key,
             .messages = borrowed,
             .tools = tool_definitions,
         };
@@ -277,6 +311,7 @@ pub fn runPrompt(
         response.tool_calls = &.{};
 
         var terminating_results: usize = 0;
+        const batch_results_start = tool_results.items.len;
         for (tool_calls) |call| {
             if (options.on_tool_start) |callback| {
                 if (options.tool_event_context) |context| try callback(context, call);
@@ -306,6 +341,22 @@ pub fn runPrompt(
             tool_execution.arguments_json = null;
             tool_results_count += 1;
             if (traced_tool_result.terminate) terminating_results += 1;
+        }
+
+        const should_stop = try finishTurnLifecycle(allocator, &messages, options, .{
+            .turn_index = turn,
+            .assistant_text = messages.items[messages.items.len - 1].content,
+            .tool_results = tool_results.items[batch_results_start..],
+            .system_prompt = currentSystemPrompt(messages.items),
+            .provider = active_provider orelse options.provider,
+            .model = active_model orelse options.model,
+        }, &active_provider, &active_model, &active_api_key);
+        if (should_stop) {
+            return .{
+                .final_text = try allocator.dupe(u8, ""),
+                .tool_results = try tool_results.toOwnedSlice(allocator),
+                .tool_results_count = tool_results_count,
+            };
         }
 
         if (terminating_results == tool_calls.len) {
@@ -389,6 +440,84 @@ fn appendAssistantToolCallMessage(
         .content = content,
         .tool_calls = response.tool_calls,
     });
+}
+
+fn finishTurnLifecycle(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(OwnedMessage),
+    options: RunOptions,
+    turn_context: TurnContext,
+    active_provider: *?[]u8,
+    active_model: *?[]u8,
+    active_api_key: *?[]u8,
+) !bool {
+    if (options.prepare_next_turn) |callback| {
+        if (options.turn_lifecycle_context) |context| {
+            var update = try callback(context, turn_context);
+            defer update.deinit(allocator);
+
+            if (update.system_prompt) |system_prompt| {
+                try applySystemPromptUpdate(allocator, messages, system_prompt);
+                allocator.free(system_prompt);
+                update.system_prompt = null;
+            }
+            if (update.provider) |provider| {
+                replaceOwnedString(allocator, active_provider, provider);
+                update.provider = null;
+            }
+            if (update.model) |model| {
+                replaceOwnedString(allocator, active_model, model);
+                update.model = null;
+            }
+            if (update.api_key) |api_key| {
+                replaceOwnedString(allocator, active_api_key, api_key);
+                update.api_key = null;
+            }
+        }
+    }
+
+    if (options.should_stop_after_turn) |callback| {
+        if (options.turn_lifecycle_context) |context| {
+            const updated_turn_context: TurnContext = .{
+                .turn_index = turn_context.turn_index,
+                .assistant_text = turn_context.assistant_text,
+                .tool_results = turn_context.tool_results,
+                .system_prompt = currentSystemPrompt(messages.items),
+                .provider = active_provider.* orelse options.provider,
+                .model = active_model.* orelse options.model,
+            };
+            return try callback(context, updated_turn_context);
+        }
+    }
+
+    return false;
+}
+
+fn applySystemPromptUpdate(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(OwnedMessage),
+    system_prompt: []const u8,
+) !void {
+    const trimmed = std.mem.trim(u8, system_prompt, " \t\r\n");
+    if (messages.items.len > 0 and messages.items[0].role == .system) {
+        allocator.free(messages.items[0].content);
+        messages.items[0].content = try allocator.dupe(u8, trimmed);
+        return;
+    }
+    try messages.insert(allocator, 0, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, trimmed),
+    });
+}
+
+fn currentSystemPrompt(messages: []const OwnedMessage) []const u8 {
+    if (messages.len > 0 and messages[0].role == .system) return messages[0].content;
+    return "";
+}
+
+fn replaceOwnedString(allocator: std.mem.Allocator, target: *?[]u8, value: []u8) void {
+    if (target.*) |previous| allocator.free(previous);
+    target.* = value;
 }
 
 fn createToolResultTrace(
@@ -829,4 +958,113 @@ test "after tool hook can override content error state and termination" {
     try std.testing.expect(result.terminate);
     try std.testing.expectEqualStrings("patched by after hook", result.content);
     try std.testing.expectEqual(@as(usize, 1), ctx.after_calls);
+}
+
+test "prepare next turn can update request state before should-stop runs" {
+    const LifecycleContext = struct {
+        allocator: std.mem.Allocator,
+        prepare_calls: usize = 0,
+        stop_calls: usize = 0,
+    };
+    const Hooks = struct {
+        fn prepare(ctx_ptr: *anyopaque, turn: TurnContext) anyerror!PrepareNextTurnResult {
+            const ctx: *LifecycleContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.prepare_calls += 1;
+            try std.testing.expectEqual(@as(usize, 3), turn.turn_index);
+            try std.testing.expectEqualStrings("first system", turn.system_prompt);
+            try std.testing.expectEqualStrings("openai", turn.provider);
+            try std.testing.expectEqualStrings("first-model", turn.model);
+            return .{
+                .system_prompt = try ctx.allocator.dupe(u8, "second system"),
+                .provider = try ctx.allocator.dupe(u8, "openrouter"),
+                .model = try ctx.allocator.dupe(u8, "second-model"),
+                .api_key = try ctx.allocator.dupe(u8, "second-key"),
+            };
+        }
+
+        fn shouldStop(ctx_ptr: *anyopaque, turn: TurnContext) anyerror!bool {
+            const ctx: *LifecycleContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.stop_calls += 1;
+            try std.testing.expectEqualStrings("second system", turn.system_prompt);
+            try std.testing.expectEqualStrings("openrouter", turn.provider);
+            try std.testing.expectEqualStrings("second-model", turn.model);
+            try std.testing.expectEqualStrings("assistant asked for a tool", turn.assistant_text);
+            try std.testing.expectEqual(@as(usize, 1), turn.tool_results.len);
+            try std.testing.expectEqualStrings("call_lifecycle", turn.tool_results[0].tool_call_id);
+            return true;
+        }
+    };
+
+    var messages: std.ArrayList(OwnedMessage) = .empty;
+    defer {
+        for (messages.items) |message| message.deinit(std.testing.allocator);
+        messages.deinit(std.testing.allocator);
+    }
+    try messages.append(std.testing.allocator, .{
+        .role = .system,
+        .content = try std.testing.allocator.dupe(u8, "first system"),
+    });
+    try messages.append(std.testing.allocator, .{
+        .role = .assistant,
+        .content = try std.testing.allocator.dupe(u8, "assistant asked for a tool"),
+    });
+
+    var tool_results = [_]ToolResult{.{
+        .tool_call_id = try std.testing.allocator.dupe(u8, "call_lifecycle"),
+        .tool_name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{}"),
+        .content = try std.testing.allocator.dupe(u8, "ok"),
+    }};
+    defer tool_results[0].deinit(std.testing.allocator);
+    var lifecycle = LifecycleContext{ .allocator = std.testing.allocator };
+    var active_provider: ?[]u8 = null;
+    defer if (active_provider) |provider| std.testing.allocator.free(provider);
+    var active_model: ?[]u8 = null;
+    defer if (active_model) |model| std.testing.allocator.free(model);
+    var active_api_key: ?[]u8 = null;
+    defer if (active_api_key) |api_key| std.testing.allocator.free(api_key);
+
+    const should_stop = try finishTurnLifecycle(std.testing.allocator, &messages, .{
+        .provider = "openai",
+        .model = "first-model",
+        .api_key = "first-key",
+        .prompt = "",
+        .turn_lifecycle_context = &lifecycle,
+        .prepare_next_turn = Hooks.prepare,
+        .should_stop_after_turn = Hooks.shouldStop,
+    }, .{
+        .turn_index = 3,
+        .assistant_text = messages.items[1].content,
+        .tool_results = &tool_results,
+        .system_prompt = currentSystemPrompt(messages.items),
+        .provider = "openai",
+        .model = "first-model",
+    }, &active_provider, &active_model, &active_api_key);
+
+    try std.testing.expect(should_stop);
+    try std.testing.expectEqual(@as(usize, 1), lifecycle.prepare_calls);
+    try std.testing.expectEqual(@as(usize, 1), lifecycle.stop_calls);
+    try std.testing.expectEqualStrings("second system", messages.items[0].content);
+    try std.testing.expectEqualStrings("openrouter", active_provider.?);
+    try std.testing.expectEqualStrings("second-model", active_model.?);
+    try std.testing.expectEqualStrings("second-key", active_api_key.?);
+}
+
+test "prepare next turn inserts a system prompt when the transcript has none" {
+    var messages: std.ArrayList(OwnedMessage) = .empty;
+    defer {
+        for (messages.items) |message| message.deinit(std.testing.allocator);
+        messages.deinit(std.testing.allocator);
+    }
+    try messages.append(std.testing.allocator, .{
+        .role = .user,
+        .content = try std.testing.allocator.dupe(u8, "hello"),
+    });
+
+    try applySystemPromptUpdate(std.testing.allocator, &messages, " inserted system ");
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expect(messages.items[0].role == .system);
+    try std.testing.expect(messages.items[1].role == .user);
+    try std.testing.expectEqualStrings("inserted system", messages.items[0].content);
 }

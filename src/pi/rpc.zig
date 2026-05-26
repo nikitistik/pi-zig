@@ -1193,6 +1193,8 @@ fn writeAgentToolResultsJson(w: *std.Io.Writer, results: []const agent.ToolResul
         try writeJsonString(w, result.content);
         try w.writeAll(",\"isError\":");
         try w.writeAll(if (result.is_error) "true" else "false");
+        try w.writeAll(",\"terminate\":");
+        try w.writeAll(if (result.terminate) "true" else "false");
         try w.writeByte('}');
     }
     try w.writeByte(']');

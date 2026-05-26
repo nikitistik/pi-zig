@@ -781,6 +781,8 @@ fn writeToolExecutionEndJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !
     try writeToolResultPayloadJson(w, tool_result);
     try w.writeAll(",\"isError\":");
     try w.writeAll(if (tool_result.is_error) "true" else "false");
+    try w.writeAll(",\"terminate\":");
+    try w.writeAll(if (tool_result.terminate) "true" else "false");
     try w.writeByte('}');
 }
 
@@ -793,13 +795,17 @@ fn writeToolResultMessageJson(w: *std.Io.Writer, tool_result: agent.ToolResult) 
     try writeJsonString(w, tool_result.content);
     try w.writeAll("}],\"isError\":");
     try w.writeAll(if (tool_result.is_error) "true" else "false");
+    try w.writeAll(",\"terminate\":");
+    try w.writeAll(if (tool_result.terminate) "true" else "false");
     try w.writeByte('}');
 }
 
 fn writeToolResultPayloadJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {
     try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
     try writeJsonString(w, tool_result.content);
-    try w.writeAll("}]}");
+    try w.writeAll("}],\"terminate\":");
+    try w.writeAll(if (tool_result.terminate) "true" else "false");
+    try w.writeByte('}');
 }
 
 fn writeRawJsonObjectOrString(w: *std.Io.Writer, value: []const u8) !void {
