@@ -128,16 +128,16 @@ fn discover(
         var global_settings = try loadSettings(io, allocator, global_settings_path);
         defer global_settings.deinit();
 
-        try addSettingsExtensionEntries(io, allocator, &entries, project_settings.value, project_base, "project");
+        try addSettingsExtensionEntries(io, allocator, env, &entries, project_settings.value, project_base, "project");
         try addAutoExtensionEntries(io, allocator, &entries, project_settings.value, project_base, "project");
-        try addSettingsExtensionEntries(io, allocator, &entries, global_settings.value, agent_dir, "user");
+        try addSettingsExtensionEntries(io, allocator, env, &entries, global_settings.value, agent_dir, "user");
         try addAutoExtensionEntries(io, allocator, &entries, global_settings.value, agent_dir, "user");
-        try addPackageExtensionEntries(io, allocator, &entries, project_settings.value, cwd, agent_dir, project_base, "project");
-        try addPackageExtensionEntries(io, allocator, &entries, global_settings.value, cwd, agent_dir, agent_dir, "user");
+        try addPackageExtensionEntries(io, allocator, env, &entries, project_settings.value, cwd, agent_dir, project_base, "project");
+        try addPackageExtensionEntries(io, allocator, env, &entries, global_settings.value, cwd, agent_dir, agent_dir, "user");
     }
 
     for (options.explicit_paths.items) |raw| {
-        const resolved = try resolvePath(allocator, cwd, raw);
+        const resolved = try resolvePath(allocator, env, cwd, raw);
         defer allocator.free(resolved);
         try addExplicitPath(io, allocator, &entries, resolved, cwd);
     }
@@ -148,6 +148,7 @@ fn discover(
 fn addSettingsExtensionEntries(
     io: std.Io,
     allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
     entries: *std.ArrayList(Entry),
     settings: std.json.Value,
     base_dir: []const u8,
@@ -173,7 +174,7 @@ fn addSettingsExtensionEntries(
     var collected: std.ArrayList([]const u8) = .empty;
     defer collected.deinit(allocator);
     for (plain.items) |raw| {
-        const resolved = try resolvePath(allocator, base_dir, raw);
+        const resolved = try resolvePath(allocator, env, base_dir, raw);
         defer allocator.free(resolved);
         try collectExtensionFilesFromPath(io, allocator, &collected, resolved);
     }
@@ -205,6 +206,7 @@ fn addAutoExtensionEntries(
 fn addPackageExtensionEntries(
     io: std.Io,
     allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
     entries: *std.ArrayList(Entry),
     settings: std.json.Value,
     cwd: []const u8,
@@ -218,7 +220,7 @@ fn addPackageExtensionEntries(
 
     for (packages.array.items) |item| {
         const source = packageSource(item) orelse continue;
-        const package_root = try packageRoot(allocator, cwd, agent_dir, base_dir, source, scope);
+        const package_root = try packageRoot(allocator, env, cwd, agent_dir, base_dir, source, scope);
         defer allocator.free(package_root);
         if (!pathExists(io, package_root)) continue;
         const filter = packageFilter(item, "extensions");
@@ -507,6 +509,7 @@ fn packageFilter(value: std.json.Value, name: []const u8) ?[]const std.json.Valu
 
 fn packageRoot(
     allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
     cwd: []const u8,
     agent_dir: []const u8,
     base_dir: []const u8,
@@ -530,7 +533,7 @@ fn packageRoot(
         }
         return std.fs.path.join(allocator, &.{ agent_dir, "git", git.host, git.path });
     }
-    return resolvePath(allocator, base_dir, source);
+    return resolvePath(allocator, env, base_dir, source);
 }
 
 const GitParts = struct {
@@ -598,15 +601,15 @@ fn npmPackageName(spec: []const u8) []const u8 {
 }
 
 fn resolvePackagePath(allocator: std.mem.Allocator, root: []const u8, path: []const u8) ![]u8 {
-    return resolvePath(allocator, root, path);
+    if (std.fs.path.isAbsolute(path)) return std.fs.path.resolve(allocator, &.{path});
+    return std.fs.path.resolve(allocator, &.{ root, path });
 }
 
-fn resolvePath(allocator: std.mem.Allocator, base_dir: []const u8, raw: []const u8) ![]u8 {
-    if (std.mem.eql(u8, raw, "~") or std.mem.startsWith(u8, raw, "~/")) {
-        return std.fs.path.resolve(allocator, &.{raw});
-    }
-    if (std.fs.path.isAbsolute(raw)) return std.fs.path.resolve(allocator, &.{raw});
-    return std.fs.path.resolve(allocator, &.{ base_dir, raw });
+fn resolvePath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, base_dir: []const u8, raw: []const u8) ![]u8 {
+    const expanded = try expandMaybeTilde(allocator, env, raw);
+    defer allocator.free(expanded);
+    if (std.fs.path.isAbsolute(expanded)) return std.fs.path.resolve(allocator, &.{expanded});
+    return std.fs.path.resolve(allocator, &.{ base_dir, expanded });
 }
 
 fn isEnabledByJsonPatterns(path: []const u8, base_dir: []const u8, patterns: []const std.json.Value) bool {

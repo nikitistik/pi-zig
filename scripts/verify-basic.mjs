@@ -812,7 +812,8 @@ fs.writeFileSync(path.join(extensionsFixtureProject, 'packages/disabled-package/
 fs.writeFileSync(path.join(extensionsFixtureProject, 'explicit-package/package.json'), JSON.stringify({ pi: { extensions: ['./custom.ts'] } }));
 fs.writeFileSync(path.join(extensionsFixtureProject, 'explicit-package/custom.ts'), 'export default function(){}');
 fs.writeFileSync(path.join(extensionsFixtureHome, '.pi/agent/global-settings.ts'), 'export default function(){}');
-fs.writeFileSync(path.join(extensionsFixtureHome, '.pi/agent/settings.json'), JSON.stringify({ extensions: ['./global-settings.ts'] }, null, 2));
+fs.writeFileSync(path.join(extensionsFixtureHome, 'home-explicit.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureHome, '.pi/agent/settings.json'), JSON.stringify({ extensions: ['./global-settings.ts', '~/home-explicit.ts'] }, null, 2));
 fs.writeFileSync(path.join(extensionsFixtureHome, '.pi/agent/extensions/global.ts'), 'export default function(){}');
 const extensions = JSON.parse(run(
   ['extensions', '--json', '--extension', './explicit-package'],
@@ -830,6 +831,7 @@ if (
   extensionEntry('/.pi/extensions/prefer-index/index.js') ||
   !extensionEntry('/.pi/extensions/manifest/src/main.ts') ||
   !extensionEntry('/.pi/agent/global-settings.ts', (entry) => entry.sourceInfo.source === 'local' && entry.sourceInfo.scope === 'user') ||
+  !extensionEntry('/home-explicit.ts', (entry) => entry.sourceInfo.source === 'local' && entry.sourceInfo.scope === 'user') ||
   !extensionEntry('/.pi/agent/extensions/global.ts', (entry) => entry.sourceInfo.source === 'auto' && entry.sourceInfo.scope === 'user') ||
   !extensionEntry('/packages/ext-package/entry.ts', (entry) => entry.sourceInfo.origin === 'package') ||
   !extensionEntry('/packages/disabled-package/extensions/disabled.ts', (entry) => entry.enabled === false) ||
