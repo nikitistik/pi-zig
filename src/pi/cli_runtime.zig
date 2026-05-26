@@ -835,7 +835,22 @@ fn writeToolResultPayloadJson(w: *std.Io.Writer, tool_result: agent.ToolResult) 
 fn writeToolUpdatePayloadJson(w: *std.Io.Writer, update: agent.ToolUpdate) !void {
     try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
     try writeJsonString(w, update.content);
-    try w.writeAll("}],\"isError\":");
+    try w.writeAll("}]");
+    if (update.truncated or update.full_output_path != null) {
+        try w.writeAll(",\"details\":{");
+        var needs_comma = false;
+        if (update.truncated) {
+            try w.writeAll("\"truncated\":true");
+            needs_comma = true;
+        }
+        if (update.full_output_path) |path| {
+            if (needs_comma) try w.writeByte(',');
+            try w.writeAll("\"fullOutputPath\":");
+            try writeJsonString(w, path);
+        }
+        try w.writeByte('}');
+    }
+    try w.writeAll(",\"isError\":");
     try w.writeAll(if (update.is_error) "true" else "false");
     try w.writeAll(",\"terminate\":");
     try w.writeAll(if (update.terminate) "true" else "false");

@@ -226,6 +226,51 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'multi tool loop complete' } }] }));
       return;
     }
+    if (user.includes('slow bash updates')) {
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        if (body.stream === true) {
+          writeStreamEvents([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_slow_bash_updates_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'printf slow-first; sleep 0.2; printf slow-second' }) } }] } }] }
+          ]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_slow_bash_updates_1',
+                type: 'function',
+                function: {
+                  name: 'bash',
+                  arguments: JSON.stringify({ command: 'printf slow-first; sleep 0.2; printf slow-second' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_slow_bash_updates_1' || toolOutput !== 'slow-firstslow-second') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unexpected slow bash update output', toolOutput }));
+        return;
+      }
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content: 'slow bash updates complete: ' + toolOutput } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'slow bash updates complete: ' + toolOutput } }] }));
+      return;
+    }
     if (user.includes('tool loop')) {
       if (!hasBashTool) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2111,6 +2156,33 @@ try {
   const providerJsonAssistantStartIndex = providerJsonToolLines.findIndex((line) => line.type === 'message_start' && line.message?.role === 'assistant');
   if (providerJsonToolStartIndex < 0 || providerJsonAssistantStartIndex < 0 || providerJsonToolStartIndex > providerJsonAssistantStartIndex) {
     throw new Error('top-level JSON mode smoke did not emit live tool events before final assistant output');
+  }
+
+  const providerJsonBashUpdateLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-bash-updates-model', '-p', 'please run slow bash updates'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const slowBashUpdates = providerJsonBashUpdateLines.filter(
+    (line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_slow_bash_updates_1'
+  );
+  const slowBashUpdateTexts = slowBashUpdates.map((line) => line.partialResult?.content?.[0]?.text ?? '');
+  const slowFirstIndex = slowBashUpdateTexts.findIndex((text) => text === 'slow-first');
+  const slowCombinedIndex = slowBashUpdateTexts.findIndex((text) => text.includes('slow-firstslow-second'));
+  if (
+    !providerJsonBashUpdateLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_slow_bash_updates_1') ||
+    slowBashUpdates.length < 3 ||
+    slowFirstIndex < 0 ||
+    slowCombinedIndex < 0 ||
+    slowFirstIndex > slowCombinedIndex ||
+    !providerJsonBashUpdateLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('slow-firstslow-second')) ||
+    !providerJsonBashUpdateLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('slow bash updates complete: slow-firstslow-second'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not emit intermediate bash output update snapshots');
   }
 
   const providerJsonStreamingToolLines = run(

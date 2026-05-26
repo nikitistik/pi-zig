@@ -149,6 +149,8 @@ pub const ToolUpdate = struct {
     content: []const u8,
     is_error: bool = false,
     terminate: bool = false,
+    truncated: bool = false,
+    full_output_path: ?[]const u8 = null,
 };
 
 const ToolExecutionResult = struct {
@@ -554,6 +556,18 @@ fn emitToolUpdate(
     is_error: bool,
     terminate: bool,
 ) !void {
+    try emitToolUpdateWithDetails(options, call, content, is_error, terminate, false, null);
+}
+
+fn emitToolUpdateWithDetails(
+    options: ?RunOptions,
+    call: ai_client.ChatToolCall,
+    content: []const u8,
+    is_error: bool,
+    terminate: bool,
+    truncated: bool,
+    full_output_path: ?[]const u8,
+) !void {
     if (options) |run_options| {
         if (run_options.on_tool_update) |callback| {
             if (run_options.tool_event_context) |context| {
@@ -564,10 +578,22 @@ fn emitToolUpdate(
                     .content = content,
                     .is_error = is_error,
                     .terminate = terminate,
+                    .truncated = truncated,
+                    .full_output_path = full_output_path,
                 });
             }
         }
     }
+}
+
+const BashShellUpdateContext = struct {
+    options: ?RunOptions,
+    call: ai_client.ChatToolCall,
+};
+
+fn handleBashShellUpdate(ctx_ptr: *anyopaque, update: tools.ShellUpdate) anyerror!void {
+    const ctx: *BashShellUpdateContext = @ptrCast(@alignCast(ctx_ptr));
+    try emitToolUpdateWithDetails(ctx.options, ctx.call, update.output, false, false, update.truncated, update.full_output_path);
 }
 
 fn createToolResultTrace(
@@ -723,7 +749,14 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
     const command = requiredString(parsed.value, "command") orelse return toolError(try allocator.dupe(u8, "bash tool arguments are missing command."));
 
     try emitToolUpdate(options, call, "", false, false);
-    const shell_result = tools.runShellCapture(io, allocator, command) catch |err| {
+    var update_context = BashShellUpdateContext{
+        .options = options,
+        .call = call,
+    };
+    const shell_result = tools.runShellCaptureWithUpdates(io, allocator, command, .{
+        .update_context = &update_context,
+        .on_update = handleBashShellUpdate,
+    }) catch |err| {
         return toolError(try std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)}));
     };
     defer allocator.free(shell_result.output);
@@ -731,7 +764,6 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
     const content = try allocator.dupe(u8, shell_result.output);
     errdefer allocator.free(content);
     const is_error = shell_result.exit_code == null or shell_result.exit_code.? != 0;
-    try emitToolUpdate(options, call, content, is_error, false);
     return .{
         .content = content,
         .is_error = is_error,
@@ -1031,22 +1063,29 @@ test "after tool hook can override content error state and termination" {
 
 test "bash tool emits execution update callbacks" {
     const UpdateContext = struct {
+        allocator: std.mem.Allocator,
         updates: usize = 0,
-        last_content: []const u8 = "",
+        last_content: []u8 = &.{},
         saw_empty_start: bool = false,
+
+        fn deinit(self: *@This()) void {
+            if (self.last_content.len > 0) self.allocator.free(self.last_content);
+        }
     };
     const Hooks = struct {
         fn update(ctx_ptr: *anyopaque, update_event: ToolUpdate) anyerror!void {
             const ctx: *UpdateContext = @ptrCast(@alignCast(ctx_ptr));
             ctx.updates += 1;
             if (update_event.content.len == 0) ctx.saw_empty_start = true;
-            ctx.last_content = update_event.content;
+            if (ctx.last_content.len > 0) ctx.allocator.free(ctx.last_content);
+            ctx.last_content = try ctx.allocator.dupe(u8, update_event.content);
             try std.testing.expectEqualStrings("bash", update_event.tool_name);
             try std.testing.expectEqualStrings("call_bash_updates", update_event.tool_call_id);
         }
     };
 
-    var ctx = UpdateContext{};
+    var ctx = UpdateContext{ .allocator = std.testing.allocator };
+    defer ctx.deinit();
     var call = ai_client.ChatToolCall{
         .id = try std.testing.allocator.dupe(u8, "call_bash_updates"),
         .name = try std.testing.allocator.dupe(u8, "bash"),
@@ -1069,6 +1108,51 @@ test "bash tool emits execution update callbacks" {
     try std.testing.expect(ctx.updates >= 2);
     try std.testing.expect(ctx.saw_empty_start);
     try std.testing.expectEqualStrings("update-ok", ctx.last_content);
+}
+
+test "bash tool emits intermediate output update snapshots" {
+    const UpdateContext = struct {
+        updates: usize = 0,
+        saw_empty_start: bool = false,
+        saw_first_snapshot: bool = false,
+        saw_combined_snapshot: bool = false,
+    };
+    const Hooks = struct {
+        fn update(ctx_ptr: *anyopaque, update_event: ToolUpdate) anyerror!void {
+            const ctx: *UpdateContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.updates += 1;
+            if (update_event.content.len == 0) ctx.saw_empty_start = true;
+            if (std.mem.eql(u8, update_event.content, "slow-first")) ctx.saw_first_snapshot = true;
+            if (std.mem.indexOf(u8, update_event.content, "slow-firstslow-second") != null) ctx.saw_combined_snapshot = true;
+            try std.testing.expectEqualStrings("bash", update_event.tool_name);
+            try std.testing.expectEqualStrings("call_bash_intermediate_updates", update_event.tool_call_id);
+        }
+    };
+
+    var ctx = UpdateContext{};
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_bash_intermediate_updates"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"command\":\"printf slow-first; sleep 0.2; printf slow-second\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .tool_event_context = &ctx,
+        .on_tool_update = Hooks.update,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("slow-firstslow-second", result.content);
+    try std.testing.expect(ctx.updates >= 3);
+    try std.testing.expect(ctx.saw_empty_start);
+    try std.testing.expect(ctx.saw_first_snapshot);
+    try std.testing.expect(ctx.saw_combined_snapshot);
 }
 
 test "prepare next turn can update request state before should-stop runs" {

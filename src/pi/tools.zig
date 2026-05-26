@@ -7,6 +7,8 @@ const default_read_max_lines = 2000;
 const default_read_max_bytes = 50 * 1024;
 const default_bash_max_lines = 2000;
 const default_bash_max_bytes = 50 * 1024;
+const default_bash_update_throttle_ms = 100;
+const default_bash_update_min_bytes = 4096;
 const max_bash_capture_bytes = 8 * 1024 * 1024;
 const bash_full_output_path = "zig-out/pi-zig-bash-full-output.log";
 const grep_max_line_chars = 500;
@@ -19,6 +21,21 @@ pub const ShellResult = struct {
     cancelled: bool = false,
     truncated: bool = false,
     full_output_path: ?[]const u8 = null,
+};
+
+pub const ShellUpdate = struct {
+    output: []const u8,
+    truncated: bool = false,
+    full_output_path: ?[]const u8 = null,
+};
+
+pub const ShellUpdateCallback = *const fn (ctx: *anyopaque, update: ShellUpdate) anyerror!void;
+
+pub const ShellCaptureOptions = struct {
+    update_context: ?*anyopaque = null,
+    on_update: ?ShellUpdateCallback = null,
+    update_throttle_ms: i64 = default_bash_update_throttle_ms,
+    update_min_bytes: usize = default_bash_update_min_bytes,
 };
 
 pub const GrepOptions = struct {
@@ -530,12 +547,85 @@ pub fn runShellCapture(io: std.Io, allocator: std.mem.Allocator, command: []cons
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    const raw_output = try allocator.alloc(u8, result.stdout.len + result.stderr.len);
+    const raw_output = try combineShellOutput(allocator, result.stdout, result.stderr);
     defer allocator.free(raw_output);
-    @memcpy(raw_output[0..result.stdout.len], result.stdout);
-    @memcpy(raw_output[result.stdout.len..], result.stderr);
 
     const exit_code: ?u8 = switch (result.term) {
+        .exited => |code| code,
+        else => null,
+    };
+    const formatted = try formatShellOutput(allocator, io, raw_output, exit_code);
+    errdefer allocator.free(formatted.output);
+
+    return .{
+        .output = formatted.output,
+        .exit_code = exit_code,
+        .truncated = formatted.truncated,
+        .full_output_path = formatted.full_output_path,
+    };
+}
+
+pub fn runShellCaptureWithUpdates(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    command: []const u8,
+    options: ShellCaptureOptions,
+) !ShellResult {
+    const argv = [_][]const u8{ "sh", "-lc", command };
+    var child = try std.process.spawn(io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .create_no_window = true,
+    });
+    defer child.kill(io);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+    var last_update_len: usize = 0;
+    var last_update_ms: ?i64 = null;
+    var dirty = false;
+
+    while (multi_reader.fill(64, .none)) |_| {
+        if (stdout_reader.buffered().len > max_bash_capture_bytes) return error.StreamTooLong;
+        if (stderr_reader.buffered().len > max_bash_capture_bytes) return error.StreamTooLong;
+
+        dirty = true;
+        const stdout = stdout_reader.buffered();
+        const stderr = stderr_reader.buffered();
+        if (shouldEmitShellUpdate(io, stdout.len + stderr.len, last_update_len, last_update_ms, options)) {
+            try emitShellUpdateSnapshot(io, allocator, stdout, stderr, options);
+            last_update_len = stdout.len + stderr.len;
+            last_update_ms = nowMilliseconds(io);
+            dirty = false;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
+    const term = try child.wait(io);
+
+    const stdout_slice = try multi_reader.toOwnedSlice(0);
+    defer allocator.free(stdout_slice);
+    const stderr_slice = try multi_reader.toOwnedSlice(1);
+    defer allocator.free(stderr_slice);
+
+    if (dirty and stdout_slice.len + stderr_slice.len > 0 and stdout_slice.len + stderr_slice.len != last_update_len) {
+        try emitShellUpdateSnapshot(io, allocator, stdout_slice, stderr_slice, options);
+    }
+
+    const raw_output = try combineShellOutput(allocator, stdout_slice, stderr_slice);
+    defer allocator.free(raw_output);
+
+    const exit_code: ?u8 = switch (term) {
         .exited => |code| code,
         else => null,
     };
@@ -759,6 +849,67 @@ fn formatShellOutput(allocator: std.mem.Allocator, io: std.Io, raw_output: []con
         .truncated = truncation.truncated,
         .full_output_path = if (truncation.truncated) bash_full_output_path else null,
     };
+}
+
+fn formatShellOutputSnapshot(allocator: std.mem.Allocator, io: std.Io, raw_output: []const u8) !ShellOutput {
+    const truncation = try truncateTail(allocator, raw_output, default_bash_max_lines, default_bash_max_bytes);
+    defer allocator.free(truncation.content);
+
+    if (truncation.truncated) try writeFile(io, bash_full_output_path, raw_output);
+
+    return .{
+        .output = try allocator.dupe(u8, truncation.content),
+        .truncated = truncation.truncated,
+        .full_output_path = if (truncation.truncated) bash_full_output_path else null,
+    };
+}
+
+fn combineShellOutput(allocator: std.mem.Allocator, stdout: []const u8, stderr: []const u8) ![]u8 {
+    const raw_output = try allocator.alloc(u8, stdout.len + stderr.len);
+    @memcpy(raw_output[0..stdout.len], stdout);
+    @memcpy(raw_output[stdout.len..], stderr);
+    return raw_output;
+}
+
+fn emitShellUpdateSnapshot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    stdout: []const u8,
+    stderr: []const u8,
+    options: ShellCaptureOptions,
+) !void {
+    const callback = options.on_update orelse return;
+    const context = options.update_context orelse return;
+
+    const raw_output = try combineShellOutput(allocator, stdout, stderr);
+    defer allocator.free(raw_output);
+    const snapshot = try formatShellOutputSnapshot(allocator, io, raw_output);
+    defer allocator.free(snapshot.output);
+
+    try callback(context, .{
+        .output = snapshot.output,
+        .truncated = snapshot.truncated,
+        .full_output_path = snapshot.full_output_path,
+    });
+}
+
+fn shouldEmitShellUpdate(
+    io: std.Io,
+    output_len: usize,
+    last_update_len: usize,
+    last_update_ms: ?i64,
+    options: ShellCaptureOptions,
+) bool {
+    if (output_len == 0 or options.on_update == null or options.update_context == null) return false;
+    if (last_update_ms == null) return true;
+    const min_bytes = if (options.update_min_bytes == 0) 1 else options.update_min_bytes;
+    if (output_len >= last_update_len and output_len - last_update_len >= min_bytes) return true;
+    const throttle_ms = if (options.update_throttle_ms <= 0) 1 else options.update_throttle_ms;
+    return nowMilliseconds(io) - last_update_ms.? >= throttle_ms;
+}
+
+fn nowMilliseconds(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .awake).toMilliseconds();
 }
 
 fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: usize, max_bytes: usize) !Truncation {
