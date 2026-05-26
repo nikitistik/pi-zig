@@ -370,6 +370,12 @@ fn parseOpenAICompatibleStreamData(
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return error.ProviderResponseInvalid;
     defer parsed.deinit();
+    if (isResponseStreamEvent(parsed.value)) {
+        if (try responseStreamTextDelta(parsed.value)) |delta| {
+            if (delta.len > 0) try callback(callback_context, delta);
+        }
+        return;
+    }
     const delta = try firstStreamDelta(parsed.value) orelse return;
     const content = delta.object.get("content") orelse return;
     if (content == .null) return;
@@ -386,8 +392,31 @@ fn parseOpenAICompatibleStreamResultData(
 ) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return error.ProviderResponseInvalid;
     defer parsed.deinit();
+    if (isResponseStreamEvent(parsed.value)) {
+        if (try responseStreamTextDelta(parsed.value)) |delta| {
+            try accumulator.appendTextDelta(delta, text_callback_context, text_callback);
+        }
+        return;
+    }
     const delta = try firstStreamDelta(parsed.value) orelse return;
     try accumulator.appendDelta(delta, text_callback_context, text_callback);
+}
+
+fn isResponseStreamEvent(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const event_type = value.object.get("type") orelse return false;
+    if (event_type != .string) return false;
+    return std.mem.startsWith(u8, event_type.string, "response.");
+}
+
+fn responseStreamTextDelta(value: std.json.Value) !?[]const u8 {
+    if (value != .object) return error.ProviderResponseInvalid;
+    const event_type = value.object.get("type") orelse return null;
+    if (event_type != .string) return error.ProviderResponseInvalid;
+    if (!std.mem.eql(u8, event_type.string, "response.output_text.delta")) return null;
+    const delta = value.object.get("delta") orelse return error.ProviderResponseInvalid;
+    if (delta != .string) return error.ProviderResponseInvalid;
+    return delta.string;
 }
 
 fn firstStreamDelta(value: std.json.Value) !?std.json.Value {
@@ -450,16 +479,25 @@ const StreamChatAccumulator = struct {
         const content = delta.object.get("content") orelse .null;
         if (content != .null) {
             if (content != .string) return error.ProviderResponseInvalid;
-            try self.text.writer.writeAll(content.string);
-            if (content.string.len > 0) {
-                if (text_callback) |callback| {
-                    if (text_callback_context) |context| try callback(context, content.string);
-                }
-            }
+            try self.appendTextDelta(content.string, text_callback_context, text_callback);
         }
 
         if (delta.object.get("tool_calls")) |tool_calls| {
             try self.appendToolCallDeltas(tool_calls);
+        }
+    }
+
+    fn appendTextDelta(
+        self: *StreamChatAccumulator,
+        delta: []const u8,
+        text_callback_context: ?*anyopaque,
+        text_callback: ?StreamTextCallback,
+    ) !void {
+        try self.text.writer.writeAll(delta);
+        if (delta.len > 0) {
+            if (text_callback) |callback| {
+                if (text_callback_context) |context| try callback(context, delta);
+            }
         }
     }
 
@@ -819,6 +857,24 @@ test "assembles streamed OpenAI-compatible tool call deltas" {
     try std.testing.expectEqualStrings("call_stream", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"command\":\"printf stream-ok\"}", result.tool_calls[0].arguments_json);
+}
+
+test "assembles OpenAI Responses output text deltas" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"response.output_text.delta","delta":"response "}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"response.output_text.done","text":"response "}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"response.output_text.delta","delta":"delta"}
+    , &accumulator, null, null);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("response delta", result.text.?);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
 }
 
 test "provider base URL appends chat completions endpoint" {

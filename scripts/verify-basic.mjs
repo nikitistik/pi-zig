@@ -3070,6 +3070,8 @@ try {
       JSON.stringify({ id: 'rpc-retry-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
       JSON.stringify({ id: 'rpc-retry-prompt', type: 'prompt', message: 'rpc retry transient' }),
       JSON.stringify({ id: 'rpc-retry-state', type: 'get_state' }),
+      JSON.stringify({ id: 'rpc-retry-abort', type: 'abort_retry' }),
+      JSON.stringify({ id: 'rpc-retry-after-abort', type: 'get_state' }),
       JSON.stringify({ id: 'rpc-retry-messages', type: 'get_messages' }),
       ''
     ].join('\n'),
@@ -3078,6 +3080,7 @@ try {
   const rpcProviderRetryResponses = rpcProviderRetryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const rpcProviderRetryPrompt = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-prompt');
   const rpcProviderRetryState = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-state');
+  const rpcProviderRetryAfterAbort = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-after-abort');
   const rpcProviderRetryMessages = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-messages');
   if (
     !rpcProviderRetryPrompt?.success ||
@@ -3089,6 +3092,9 @@ try {
     rpcProviderRetryState?.data?.autoRetryMaxAttempts !== 2 ||
     rpcProviderRetryState?.data?.autoRetryBaseDelayMs !== 0 ||
     rpcProviderRetryState?.data?.autoRetryMaxDelayMs !== 5 ||
+    rpcProviderRetryAfterAbort?.data?.autoRetryEnabled !== false ||
+    rpcProviderRetryAfterAbort?.data?.lastRetryAttempts !== 0 ||
+    rpcProviderRetryAfterAbort?.data?.lastRetryDelayMs !== 0 ||
     rpcProviderRetryMessages?.data?.messages?.filter((message) => message.role === 'user').length !== 1 ||
     rpcProviderRetryMessages?.data?.messages?.filter((message) => message.role === 'assistant').length !== 1
   ) {
