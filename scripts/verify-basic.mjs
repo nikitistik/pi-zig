@@ -2336,6 +2336,7 @@ fs.mkdirSync(path.join(extensionsFixtureProject, 'packages/disabled-package/exte
 fs.mkdirSync(path.join(extensionsFixtureProject, 'explicit-package'), { recursive: true });
 fs.mkdirSync(path.join(extensionsFixtureHome, '.pi/agent/extensions'), { recursive: true });
 fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/direct.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/module.mjs'), 'export default function(){}');
 fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/drop.ts'), 'export default function(){}');
 fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/prefer-index/index.ts'), 'export default function(){}');
 fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/prefer-index/index.js'), 'export default function(){}');
@@ -2369,6 +2370,7 @@ function extensionEntry(suffix, predicate = () => true) {
 if (
   !extensionEntry('/.pi/settings-ext.ts', (entry) => entry.sourceInfo.source === 'local' && entry.sourceInfo.scope === 'project') ||
   !extensionEntry('/.pi/extensions/direct.ts', (entry) => entry.enabled === true && entry.sourceInfo.source === 'auto') ||
+  !extensionEntry('/.pi/extensions/module.mjs', (entry) => entry.enabled === true && entry.sourceInfo.source === 'auto') ||
   !extensionEntry('/.pi/extensions/drop.ts', (entry) => entry.enabled === false) ||
   !extensionEntry('/.pi/extensions/prefer-index/index.ts') ||
   extensionEntry('/.pi/extensions/prefer-index/index.js') ||
@@ -2908,10 +2910,14 @@ if (
 
 const fakeProvider = await startFakeProviderServer();
 try {
+  const providerRuntimeAgentDir = path.resolve('zig-out/pi-zig-provider-runtime-agent');
+  fs.rmSync(providerRuntimeAgentDir, { recursive: true, force: true });
+  fs.mkdirSync(providerRuntimeAgentDir, { recursive: true });
   const providerEnv = {
     ...process.env,
     OPENAI_API_KEY: 'fake-provider-key',
-    PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl
+    PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl,
+    PI_CODING_AGENT_DIR: providerRuntimeAgentDir
   };
   const extensionHookFixture = path.resolve('zig-out/pi-zig-extension-hook-fixture');
   fs.rmSync(extensionHookFixture, { recursive: true, force: true });
@@ -2954,6 +2960,11 @@ export default function(pi) {
   });
 }
 `);
+  const discoveredExtensionProject = path.resolve('zig-out/pi-zig-discovered-extension-project');
+  fs.rmSync(discoveredExtensionProject, { recursive: true, force: true });
+  fs.mkdirSync(path.join(discoveredExtensionProject, '.pi/extensions'), { recursive: true });
+  fs.copyFileSync(extensionHookPath, path.join(discoveredExtensionProject, '.pi/extensions/hook.mjs'));
+  fs.copyFileSync(extensionToolPath, path.join(discoveredExtensionProject, '.pi/extensions/tool.mjs'));
   const providerPrint = run(
     [
       '--provider', 'openai',
@@ -3244,6 +3255,54 @@ export default function(pi) {
     !providerJsonExtensionToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension tool complete: ext-echo: registered-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const providerJsonDiscoveredExtensionHookLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-discovered-extension-hook-model', '-p', 'please run extension hook events'],
+    undefined,
+    { cwd: discoveredExtensionProject, env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonDiscoveredExtensionHookLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('extension-result-patched')) ||
+    !providerJsonDiscoveredExtensionHookLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_hook_1' && JSON.stringify(result).includes('extension-result-patched'))) ||
+    !providerJsonDiscoveredExtensionHookLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension hook complete: extension-result-patched'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not bind discovered extension tool_call/tool_result hooks');
+  }
+
+  const providerJsonDiscoveredExtensionToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-discovered-extension-tool-model', '-p', 'please run extension registered tool'],
+    undefined,
+    { cwd: discoveredExtensionProject, env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonDiscoveredExtensionToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'ext_echo' && line.toolCallId === 'call_extension_tool_1') ||
+    !providerJsonDiscoveredExtensionToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_echo' && JSON.stringify(line.result).includes('ext-echo: registered-ok')) ||
+    !providerJsonDiscoveredExtensionToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_tool_1' && JSON.stringify(result).includes('ext-echo: registered-ok'))) ||
+    !providerJsonDiscoveredExtensionToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension tool complete: ext-echo: registered-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not expose and execute a discovered registered extension tool');
+  }
+
+  const providerJsonNoExtensionsExplicitToolLines = run(
+    ['--mode', 'json', '--no-session', '--no-extensions', '--extension', extensionToolPath, '--provider', 'openai', '--model', 'mock-json-no-extensions-explicit-tool-model', '-p', 'please run extension registered tool'],
+    undefined,
+    { cwd: discoveredExtensionProject, env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (!providerJsonNoExtensionsExplicitToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_echo' && JSON.stringify(line.result).includes('ext-echo: registered-ok'))) {
+    throw new Error('top-level JSON mode smoke did not keep explicit extension paths under --no-extensions');
   }
 
   const providerJsonResponsesToolLines = run(
@@ -3894,6 +3953,11 @@ export default function(pi) {
   });
 }
 `);
+  const rpcDiscoveredExtensionProject = path.resolve('zig-out/pi-zig-rpc-discovered-extension-project');
+  fs.rmSync(rpcDiscoveredExtensionProject, { recursive: true, force: true });
+  fs.mkdirSync(path.join(rpcDiscoveredExtensionProject, '.pi/extensions'), { recursive: true });
+  fs.copyFileSync(rpcExtensionHookPath, path.join(rpcDiscoveredExtensionProject, '.pi/extensions/hook.mjs'));
+  fs.copyFileSync(rpcExtensionToolPath, path.join(rpcDiscoveredExtensionProject, '.pi/extensions/tool.mjs'));
   const rpcProviderContextFixture = path.resolve('zig-out/pi-zig-rpc-provider-context-fixture');
   const rpcProviderContextCwd = path.join(rpcProviderContextFixture, 'project');
   const rpcProviderContextSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-context-smoke.jsonl');
@@ -4343,6 +4407,52 @@ export default function(pi) {
     !rpcProviderExtensionToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-registered-ok')
   ) {
     throw new Error('rpc provider prompt smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const rpcProviderDiscoveredExtensionHookSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-discovered-extension-hook-smoke.jsonl');
+  fs.rmSync(rpcProviderDiscoveredExtensionHookSessionFile, { force: true });
+  const rpcProviderDiscoveredExtensionHookOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderDiscoveredExtensionHookSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-discovered-extension-hook-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-discovered-extension-hook-prompt', type: 'prompt', message: 'rpc extension hook events' }),
+      JSON.stringify({ id: 'rpc-discovered-extension-hook-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { cwd: rpcDiscoveredExtensionProject, env: rpcProviderEnv }
+  );
+  const rpcProviderDiscoveredExtensionHookResponses = rpcProviderDiscoveredExtensionHookOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderDiscoveredExtensionHookPrompt = rpcProviderDiscoveredExtensionHookResponses.find((response) => response.id === 'rpc-discovered-extension-hook-prompt');
+  const rpcProviderDiscoveredExtensionHookMessages = rpcProviderDiscoveredExtensionHookResponses.find((response) => response.id === 'rpc-discovered-extension-hook-messages');
+  if (
+    !rpcProviderDiscoveredExtensionHookPrompt?.success ||
+    rpcProviderDiscoveredExtensionHookPrompt?.data?.text !== 'rpc extension hook complete: extension-result-patched' ||
+    !rpcProviderDiscoveredExtensionHookMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_hook_1' && message.content === 'extension-result-patched')
+  ) {
+    throw new Error('rpc provider prompt smoke did not bind discovered extension tool_call/tool_result hooks');
+  }
+
+  const rpcProviderDiscoveredExtensionToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-discovered-extension-tool-smoke.jsonl');
+  fs.rmSync(rpcProviderDiscoveredExtensionToolSessionFile, { force: true });
+  const rpcProviderDiscoveredExtensionToolOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderDiscoveredExtensionToolSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-discovered-extension-tool-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-discovered-extension-tool-prompt', type: 'prompt', message: 'rpc extension registered tool' }),
+      JSON.stringify({ id: 'rpc-discovered-extension-tool-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { cwd: rpcDiscoveredExtensionProject, env: rpcProviderEnv }
+  );
+  const rpcProviderDiscoveredExtensionToolResponses = rpcProviderDiscoveredExtensionToolOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderDiscoveredExtensionToolPrompt = rpcProviderDiscoveredExtensionToolResponses.find((response) => response.id === 'rpc-discovered-extension-tool-prompt');
+  const rpcProviderDiscoveredExtensionToolMessages = rpcProviderDiscoveredExtensionToolResponses.find((response) => response.id === 'rpc-discovered-extension-tool-messages');
+  if (
+    !rpcProviderDiscoveredExtensionToolPrompt?.success ||
+    rpcProviderDiscoveredExtensionToolPrompt?.data?.text !== 'rpc extension tool complete: ext-echo: rpc-registered-ok' ||
+    !rpcProviderDiscoveredExtensionToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-registered-ok')
+  ) {
+    throw new Error('rpc provider prompt smoke did not expose and execute a discovered registered extension tool');
   }
 
   const rpcProviderCompactionHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-compaction-history-smoke.jsonl');

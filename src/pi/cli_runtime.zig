@@ -6,6 +6,7 @@ const cli = @import("cli.zig");
 const commands = @import("commands.zig");
 const config = @import("config.zig");
 const context_files = @import("context_files.zig");
+const extensions = @import("extensions.zig");
 const extension_runner = @import("extension_runner.zig");
 const models = @import("models.zig");
 const rpc = @import("rpc.zig");
@@ -102,9 +103,11 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         }
         const path = try resolveSessionPath(init.io, init.gpa, init.environ_map, parsed);
         defer path.deinit(init.gpa);
+        var runtime_extensions = try discoverRuntimeExtensionPaths(init.io, init.gpa, init.environ_map, parsed);
+        defer runtime_extensions.deinit(init.gpa);
         return rpc.run(init.io, init.gpa, init.environ_map, path.path, .{
             .command_options = commandOptionsFromParsed(init, &parsed),
-            .extension_paths = if (parsed.no_extensions) &.{} else parsed.extensions[0..parsed.extensions_len],
+            .extension_paths = runtime_extensions.paths,
             .tool_set = toolSetFromParsed(parsed),
             .custom_tools_enabled = !parsed.no_tools,
             .tool_allowlist = parsed.tools,
@@ -719,10 +722,12 @@ fn buildPrintResponse(
     defer shell_settings.deinit(allocator);
     const prompt_content_parts = try buildPromptContentParts(allocator, prompt, image_parts);
     defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
+    var runtime_extensions = try discoverRuntimeExtensionPaths(io, allocator, env, parsed);
+    defer runtime_extensions.deinit(allocator);
     var hooks = extension_runner.Runner{
         .io = io,
         .allocator = allocator,
-        .extension_paths = if (parsed.no_extensions) &.{} else parsed.extensions[0..parsed.extensions_len],
+        .extension_paths = runtime_extensions.paths,
     };
     const has_extension_hooks = hooks.hasExtensions();
     var extension_tool_definitions: []ai_client.ChatToolDefinition = if (has_extension_hooks)
@@ -815,6 +820,18 @@ fn extensionToolAllowed(parsed: cli.ParsedArgs, name: []const u8) bool {
     const raw = parsed.tools orelse return true;
     if (toolListContains(raw, "*") or toolListContains(raw, "all")) return true;
     return toolListContains(raw, name);
+}
+
+fn discoverRuntimeExtensionPaths(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+) !extensions.RuntimePaths {
+    return extensions.discoverRuntimePaths(io, allocator, env, .{
+        .no_extensions = parsed.no_extensions,
+        .explicit_paths = parsed.extensions[0..parsed.extensions_len],
+    });
 }
 
 fn buildPromptContentParts(

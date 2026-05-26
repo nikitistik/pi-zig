@@ -23,6 +23,21 @@ const Options = struct {
     missing_option_value: ?[]const u8 = null,
 };
 
+pub const RuntimeDiscoveryOptions = struct {
+    no_extensions: bool = false,
+    explicit_paths: []const []const u8 = &.{},
+};
+
+pub const RuntimePaths = struct {
+    paths: []const []const u8 = &.{},
+
+    pub fn deinit(self: *RuntimePaths, allocator: std.mem.Allocator) void {
+        for (self.paths) |path| allocator.free(path);
+        allocator.free(self.paths);
+        self.* = .{};
+    }
+};
+
 pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, args: []const []const u8) !bool {
     if (args.len == 0 or !std.mem.eql(u8, args[0], "extensions")) return false;
     var options = try parse(allocator, args[1..]);
@@ -46,7 +61,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
     }
 
     var entries = try discover(io, allocator, env, options);
-    defer entries.deinit(allocator);
+    defer deinitEntries(allocator, &entries);
     sortEntries(entries.items);
 
     if (options.json) {
@@ -55,6 +70,33 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
         try writeText(io, entries.items);
     }
     return true;
+}
+
+pub fn discoverRuntimePaths(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    runtime_options: RuntimeDiscoveryOptions,
+) !RuntimePaths {
+    var options = Options{ .no_extensions = runtime_options.no_extensions };
+    defer options.explicit_paths.deinit(allocator);
+    for (runtime_options.explicit_paths) |path| try options.explicit_paths.append(allocator, path);
+
+    var entries = try discover(io, allocator, env, options);
+    defer deinitEntries(allocator, &entries);
+    sortEntries(entries.items);
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    for (entries.items) |entry| {
+        if (!entry.enabled or !entry.exists or !isRunnableExtensionFile(entry.path)) continue;
+        if (pathListContains(paths.items, entry.path)) continue;
+        try paths.append(allocator, try allocator.dupe(u8, entry.path));
+    }
+    return .{ .paths = try paths.toOwnedSlice(allocator) };
 }
 
 fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Options {
@@ -114,9 +156,12 @@ fn discover(
     options: Options,
 ) !std.ArrayList(Entry) {
     var entries: std.ArrayList(Entry) = .empty;
+    errdefer deinitEntries(allocator, &entries);
 
     const cwd = try currentPathOwned(io, allocator);
+    defer allocator.free(cwd);
     const agent_dir = try agentDir(allocator, env);
+    defer allocator.free(agent_dir);
     const project_base = try std.fs.path.join(allocator, &.{ cwd, ".pi" });
     defer allocator.free(project_base);
 
@@ -172,7 +217,7 @@ fn addSettingsExtensionEntries(
     }
 
     var collected: std.ArrayList([]const u8) = .empty;
-    defer collected.deinit(allocator);
+    defer deinitStringList(allocator, &collected);
     for (plain.items) |raw| {
         const resolved = try resolvePath(allocator, env, base_dir, raw);
         defer allocator.free(resolved);
@@ -194,7 +239,7 @@ fn addAutoExtensionEntries(
     const dir = try std.fs.path.join(allocator, &.{ base_dir, "extensions" });
     defer allocator.free(dir);
     var discovered: std.ArrayList([]const u8) = .empty;
-    defer discovered.deinit(allocator);
+    defer deinitStringList(allocator, &discovered);
     try collectAutoExtensionEntries(io, allocator, &discovered, dir);
 
     const overrides = settingsArray(settings, "extensions");
@@ -222,7 +267,7 @@ fn addPackageExtensionEntries(
         const source = packageSource(item) orelse continue;
         const package_root = try packageRoot(allocator, env, cwd, agent_dir, base_dir, source, scope);
         defer allocator.free(package_root);
-        if (!pathExists(io, package_root)) continue;
+        if (!pathIsDirectory(io, package_root)) continue;
         const filter = packageFilter(item, "extensions");
         try collectPackageExtensions(io, allocator, entries, package_root, filter, source, scope);
     }
@@ -236,7 +281,7 @@ fn addExplicitPath(
     cwd: []const u8,
 ) !void {
     var collected: std.ArrayList([]const u8) = .empty;
-    defer collected.deinit(allocator);
+    defer deinitStringList(allocator, &collected);
     try collectExtensionFilesFromPath(io, allocator, &collected, path);
     if (collected.items.len == 0) {
         try addEntry(allocator, entries, path, true, "cli", "temporary", "top-level", cwd, pathExists(io, path));
@@ -257,7 +302,7 @@ fn collectPackageExtensions(
     scope: []const u8,
 ) !void {
     var collected: std.ArrayList([]const u8) = .empty;
-    defer collected.deinit(allocator);
+    defer deinitStringList(allocator, &collected);
 
     if (try readManifestExtensions(io, allocator, &collected, package_root)) {
         // Manifest entries define package extension sources. Package filters
@@ -314,7 +359,7 @@ fn collectAutoExtensionEntries(io: std.Io, allocator: std.mem.Allocator, out: *s
     defer dir.close(io);
 
     var names: std.ArrayList([]const u8) = .empty;
-    defer names.deinit(allocator);
+    defer deinitStringList(allocator, &names);
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (std.mem.startsWith(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "node_modules")) continue;
@@ -359,6 +404,7 @@ fn readManifestExtensions(io: std.Io, allocator: std.mem.Allocator, out: *std.Ar
     defer allocator.free(package_json);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, package_json, allocator, .limited(max_manifest_bytes)) catch |err| switch (err) {
         error.FileNotFound => return false,
+        error.NotDir => return false,
         else => return err,
     };
     defer allocator.free(bytes);
@@ -452,6 +498,22 @@ fn writeText(io: std.Io, entries: []Entry) !void {
         try writeStdout(io, "]\n");
     }
     if (emitted == 0) try writeStdout(io, "No extensions discovered.\n");
+}
+
+fn deinitEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
+    for (entries.items) |entry| {
+        allocator.free(entry.path);
+        allocator.free(entry.source);
+        allocator.free(entry.scope);
+        allocator.free(entry.origin);
+        allocator.free(entry.base_dir);
+    }
+    entries.deinit(allocator);
+}
+
+fn deinitStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |item| allocator.free(item);
+    list.deinit(allocator);
 }
 
 fn sortEntries(entries: []Entry) void {
@@ -727,12 +789,28 @@ fn isOverridePattern(value: []const u8) bool {
 }
 
 fn isExtensionFile(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".ts") or std.mem.endsWith(u8, path, ".js");
+    return std.mem.endsWith(u8, path, ".ts") or std.mem.endsWith(u8, path, ".js") or std.mem.endsWith(u8, path, ".mjs");
+}
+
+fn isRunnableExtensionFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".js") or std.mem.endsWith(u8, path, ".mjs");
+}
+
+fn pathListContains(paths: []const []const u8, needle: []const u8) bool {
+    for (paths) |path| {
+        if (std.mem.eql(u8, path, needle)) return true;
+    }
+    return false;
 }
 
 fn pathExists(io: std.Io, path: []const u8) bool {
     _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return true;
+}
+
+fn pathIsDirectory(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return stat.kind == .directory;
 }
 
 fn agentDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
