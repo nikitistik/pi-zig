@@ -661,7 +661,9 @@ fn updateConfiguredPackagesForScope(
         switch (parsed.kind) {
             .local => {},
             .npm => {
-                if (!parsed.pinned) try installNpm(io, allocator, env, agent_dir, parsed, local, true);
+                if (!parsed.pinned and try shouldUpdateNpmSource(io, allocator, env, agent_dir, base_dir, parsed)) {
+                    try installNpm(io, allocator, env, agent_dir, parsed, local, true);
+                }
             },
             .git => try updateGit(io, allocator, env, cwd, agent_dir, parsed, local),
         }
@@ -823,6 +825,73 @@ fn installedPath(io: std.Io, allocator: std.mem.Allocator, env: *const std.proce
         allocator.free(path);
         return null;
     }
+}
+
+fn shouldUpdateNpmSource(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+    base_dir: []const u8,
+    parsed: ParsedSource,
+) !bool {
+    const installed_path = try std.fs.path.join(allocator, &.{ base_dir, "npm", "node_modules", parsed.name });
+    defer allocator.free(installed_path);
+    const installed_version = (try readInstalledNpmVersion(io, allocator, installed_path)) orelse return true;
+    defer allocator.free(installed_version);
+
+    const latest_version = latestNpmVersion(io, allocator, env, agent_dir, parsed.name) catch return true;
+    defer allocator.free(latest_version);
+    return !std.mem.eql(u8, installed_version, latest_version);
+}
+
+fn readInstalledNpmVersion(io: std.Io, allocator: std.mem.Allocator, installed_path: []const u8) !?[]u8 {
+    const package_json = try std.fs.path.join(allocator, &.{ installed_path, "package.json" });
+    defer allocator.free(package_json);
+    const content = std.Io.Dir.cwd().readFileAlloc(io, package_json, allocator, .limited(128 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const version = parsed.value.object.get("version") orelse return null;
+    if (version != .string or version.string.len == 0) return null;
+    return try allocator.dupe(u8, version.string);
+}
+
+fn latestNpmVersion(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+    package_name: []const u8,
+) ![]u8 {
+    var argv = try npmBaseArgv(io, allocator, env, agent_dir);
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "view");
+    try argv.append(allocator, package_name);
+    try argv.append(allocator, "version");
+    try argv.append(allocator, "--json");
+
+    const stdout = try runCommandCapture(io, allocator, argv.items, null);
+    defer allocator.free(stdout);
+    return parseNpmVersionOutput(allocator, stdout);
+}
+
+fn parseNpmVersionOutput(allocator: std.mem.Allocator, stdout: []const u8) ![]u8 {
+    const raw = std.mem.trim(u8, stdout, " \t\r\n");
+    if (raw.len == 0) return error.PackageCommandFailed;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        return allocator.dupe(u8, raw);
+    };
+    defer parsed.deinit();
+    if (parsed.value == .string and parsed.value.string.len > 0) {
+        return allocator.dupe(u8, parsed.value.string);
+    }
+    return allocator.dupe(u8, raw);
 }
 
 fn installNpm(
@@ -1138,6 +1207,28 @@ fn runCommand(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8
     switch (result.term) {
         .exited => |code| {
             if (code == 0) return;
+            if (result.stdout.len > 0) try writeStderr(io, result.stdout);
+            if (result.stderr.len > 0) try writeStderr(io, result.stderr);
+            return error.PackageCommandFailed;
+        },
+        else => return error.PackageCommandFailed,
+    }
+}
+
+fn runCommandCapture(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) ![]u8 {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+        .expand_arg0 = .expand,
+    });
+    errdefer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return result.stdout;
             if (result.stdout.len > 0) try writeStderr(io, result.stdout);
             if (result.stderr.len > 0) try writeStderr(io, result.stderr);
             return error.PackageCommandFailed;
