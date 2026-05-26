@@ -3,6 +3,7 @@ const ai_client = @import("ai_client.zig");
 const tools = @import("tools.zig");
 
 pub const ToolStartCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!void;
+pub const ToolUpdateCallback = *const fn (ctx: *anyopaque, update: ToolUpdate) anyerror!void;
 pub const ToolEndCallback = *const fn (ctx: *anyopaque, result: ToolResult) anyerror!void;
 pub const TextDeltaCallback = ai_client.StreamTextCallback;
 pub const BeforeToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!BeforeToolCallResult;
@@ -23,6 +24,7 @@ pub const RunOptions = struct {
     stream_turns: bool = false,
     tool_event_context: ?*anyopaque = null,
     on_tool_start: ?ToolStartCallback = null,
+    on_tool_update: ?ToolUpdateCallback = null,
     on_tool_end: ?ToolEndCallback = null,
     tool_hook_context: ?*anyopaque = null,
     before_tool_call: ?BeforeToolCallCallback = null,
@@ -138,6 +140,15 @@ pub const ToolResult = struct {
         if (self.arguments_json.len > 0) allocator.free(self.arguments_json);
         if (self.content.len > 0) allocator.free(self.content);
     }
+};
+
+pub const ToolUpdate = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+    content: []const u8,
+    is_error: bool = false,
+    terminate: bool = false,
 };
 
 const ToolExecutionResult = struct {
@@ -536,6 +547,29 @@ fn checkCancellation(options: RunOptions) !void {
     }
 }
 
+fn emitToolUpdate(
+    options: ?RunOptions,
+    call: ai_client.ChatToolCall,
+    content: []const u8,
+    is_error: bool,
+    terminate: bool,
+) !void {
+    if (options) |run_options| {
+        if (run_options.on_tool_update) |callback| {
+            if (run_options.tool_event_context) |context| {
+                try callback(context, .{
+                    .tool_call_id = call.id,
+                    .tool_name = call.name,
+                    .arguments_json = call.arguments_json,
+                    .content = content,
+                    .is_error = is_error,
+                    .terminate = terminate,
+                });
+            }
+        }
+    }
+}
+
 fn createToolResultTrace(
     allocator: std.mem.Allocator,
     call: ai_client.ChatToolCall,
@@ -593,7 +627,7 @@ fn executeToolCallWithHooks(
     }
 
     try checkCancellation(options);
-    var result = try executeToolCall(io, allocator, effective_call);
+    var result = try executeToolCallWithUpdates(io, allocator, effective_call, options);
     errdefer result.deinit(allocator);
     try checkCancellation(options);
 
@@ -639,8 +673,17 @@ fn executeToolCall(
     allocator: std.mem.Allocator,
     call: ai_client.ChatToolCall,
 ) !ToolExecutionResult {
+    return executeToolCallWithUpdates(io, allocator, call, null);
+}
+
+fn executeToolCallWithUpdates(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    call: ai_client.ChatToolCall,
+    options: ?RunOptions,
+) !ToolExecutionResult {
     if (std.mem.eql(u8, call.name, "read")) return executeReadTool(io, allocator, call.arguments_json);
-    if (std.mem.eql(u8, call.name, "bash")) return executeBashTool(io, allocator, call.arguments_json);
+    if (std.mem.eql(u8, call.name, "bash")) return executeBashTool(io, allocator, call, options);
     if (std.mem.eql(u8, call.name, "edit")) return executeEditTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "write")) return executeWriteTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "grep")) return executeGrepTool(io, allocator, call.arguments_json);
@@ -672,21 +715,26 @@ fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []c
     return toolOk(content);
 }
 
-fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
-    var parsed = parseArguments(allocator, "bash", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "bash", err));
+fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.ChatToolCall, options: ?RunOptions) !ToolExecutionResult {
+    var parsed = parseArguments(allocator, "bash", call.arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "bash", err));
     defer parsed.deinit();
 
     if (parsed.value != .object) return toolError(try allocator.dupe(u8, "bash tool arguments must be a JSON object."));
     const command = requiredString(parsed.value, "command") orelse return toolError(try allocator.dupe(u8, "bash tool arguments are missing command."));
 
+    try emitToolUpdate(options, call, "", false, false);
     const shell_result = tools.runShellCapture(io, allocator, command) catch |err| {
         return toolError(try std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)}));
     };
     defer allocator.free(shell_result.output);
 
+    const content = try allocator.dupe(u8, shell_result.output);
+    errdefer allocator.free(content);
+    const is_error = shell_result.exit_code == null or shell_result.exit_code.? != 0;
+    try emitToolUpdate(options, call, content, is_error, false);
     return .{
-        .content = try allocator.dupe(u8, shell_result.output),
-        .is_error = shell_result.exit_code == null or shell_result.exit_code.? != 0,
+        .content = content,
+        .is_error = is_error,
     };
 }
 
@@ -979,6 +1027,48 @@ test "after tool hook can override content error state and termination" {
     try std.testing.expect(result.terminate);
     try std.testing.expectEqualStrings("patched by after hook", result.content);
     try std.testing.expectEqual(@as(usize, 1), ctx.after_calls);
+}
+
+test "bash tool emits execution update callbacks" {
+    const UpdateContext = struct {
+        updates: usize = 0,
+        last_content: []const u8 = "",
+        saw_empty_start: bool = false,
+    };
+    const Hooks = struct {
+        fn update(ctx_ptr: *anyopaque, update_event: ToolUpdate) anyerror!void {
+            const ctx: *UpdateContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.updates += 1;
+            if (update_event.content.len == 0) ctx.saw_empty_start = true;
+            ctx.last_content = update_event.content;
+            try std.testing.expectEqualStrings("bash", update_event.tool_name);
+            try std.testing.expectEqualStrings("call_bash_updates", update_event.tool_call_id);
+        }
+    };
+
+    var ctx = UpdateContext{};
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_bash_updates"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"command\":\"printf update-ok\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .tool_event_context = &ctx,
+        .on_tool_update = Hooks.update,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("update-ok", result.content);
+    try std.testing.expect(ctx.updates >= 2);
+    try std.testing.expect(ctx.saw_empty_start);
+    try std.testing.expectEqualStrings("update-ok", ctx.last_content);
 }
 
 test "prepare next turn can update request state before should-stop runs" {

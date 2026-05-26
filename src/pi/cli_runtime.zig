@@ -165,7 +165,7 @@ fn runTextPrintFoundation(
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, false, null, null, null, null, null);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, false, null, null, null, null, null, null);
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -212,6 +212,7 @@ fn runJsonPrintFoundation(
         true,
         &tool_event_context,
         handleJsonToolStart,
+        handleJsonToolUpdate,
         handleJsonToolEnd,
         &tool_event_context,
         handleJsonAgentTextDelta,
@@ -364,6 +365,15 @@ fn handleJsonToolStart(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall) anyerr
     var line: std.Io.Writer.Allocating = .init(ctx.allocator);
     defer line.deinit();
     try writeToolCallExecutionStartJson(&line.writer, call);
+    try line.writer.writeByte('\n');
+    try writeStreamingJsonLine(ctx.io, ctx.allocator, line.written());
+}
+
+fn handleJsonToolUpdate(ctx_ptr: *anyopaque, update: agent.ToolUpdate) anyerror!void {
+    const ctx: *JsonToolEventContext = @ptrCast(@alignCast(ctx_ptr));
+    var line: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer line.deinit();
+    try writeToolExecutionUpdateJson(&line.writer, update);
     try line.writer.writeByte('\n');
     try writeStreamingJsonLine(ctx.io, ctx.allocator, line.written());
 }
@@ -624,6 +634,7 @@ fn buildPrintResponse(
     stream_turns: bool,
     tool_event_context: ?*anyopaque,
     on_tool_start: ?agent.ToolStartCallback,
+    on_tool_update: ?agent.ToolUpdateCallback,
     on_tool_end: ?agent.ToolEndCallback,
     text_event_context: ?*anyopaque,
     on_text_delta: ?agent.TextDeltaCallback,
@@ -658,6 +669,7 @@ fn buildPrintResponse(
         .stream_turns = stream_turns,
         .tool_event_context = tool_event_context,
         .on_tool_start = on_tool_start,
+        .on_tool_update = on_tool_update,
         .on_tool_end = on_tool_end,
         .text_event_context = text_event_context,
         .on_text_delta = on_text_delta,
@@ -772,6 +784,18 @@ fn writeToolCallExecutionStartJson(w: *std.Io.Writer, call: ai_client.ChatToolCa
     try w.writeByte('}');
 }
 
+fn writeToolExecutionUpdateJson(w: *std.Io.Writer, update: agent.ToolUpdate) !void {
+    try w.writeAll("{\"type\":\"tool_execution_update\",\"toolCallId\":");
+    try writeJsonString(w, update.tool_call_id);
+    try w.writeAll(",\"toolName\":");
+    try writeJsonString(w, update.tool_name);
+    try w.writeAll(",\"args\":");
+    try writeRawJsonObjectOrString(w, update.arguments_json);
+    try w.writeAll(",\"partialResult\":");
+    try writeToolUpdatePayloadJson(w, update);
+    try w.writeByte('}');
+}
+
 fn writeToolExecutionEndJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {
     try w.writeAll("{\"type\":\"tool_execution_end\",\"toolCallId\":");
     try writeJsonString(w, tool_result.tool_call_id);
@@ -805,6 +829,16 @@ fn writeToolResultPayloadJson(w: *std.Io.Writer, tool_result: agent.ToolResult) 
     try writeJsonString(w, tool_result.content);
     try w.writeAll("}],\"terminate\":");
     try w.writeAll(if (tool_result.terminate) "true" else "false");
+    try w.writeByte('}');
+}
+
+fn writeToolUpdatePayloadJson(w: *std.Io.Writer, update: agent.ToolUpdate) !void {
+    try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, update.content);
+    try w.writeAll("}],\"isError\":");
+    try w.writeAll(if (update.is_error) "true" else "false");
+    try w.writeAll(",\"terminate\":");
+    try w.writeAll(if (update.terminate) "true" else "false");
     try w.writeByte('}');
 }
 

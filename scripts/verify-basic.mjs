@@ -2099,6 +2099,7 @@ try {
     .map((line) => JSON.parse(line));
   if (
     !providerJsonToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_tool_loop_1') ||
+    !providerJsonToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_tool_loop_1' && JSON.stringify(line.partialResult).includes('tool-loop-ok')) ||
     !providerJsonToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('tool-loop-ok')) ||
     !providerJsonToolLines.some((line) => line.type === 'message_end' && line.message?.role === 'toolResult' && line.message?.toolCallId === 'call_tool_loop_1') ||
     !providerJsonToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_tool_loop_1')) ||
@@ -2123,6 +2124,7 @@ try {
     .map((line) => JSON.parse(line));
   if (
     !providerJsonStreamingToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_stream_tool_1') ||
+    !providerJsonStreamingToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_stream_tool_1' && JSON.stringify(line.partialResult).includes('stream-tool-ok')) ||
     !providerJsonStreamingToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('stream-tool-ok')) ||
     !providerJsonStreamingToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_stream_tool_1')) ||
     !providerJsonStreamingToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'streaming tool ') ||
