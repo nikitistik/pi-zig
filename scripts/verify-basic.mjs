@@ -22,6 +22,14 @@ function runFail(args, input, options = {}) {
   }
 }
 
+function envWithoutAnthropicAuth(extra = {}) {
+  const env = { ...process.env, ...extra };
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_OAUTH_TOKEN;
+  delete env.PI_ZIG_PROVIDER_BASE_URL;
+  return env;
+}
+
 async function startFakeProviderServer() {
   const child = spawn(
     process.execPath,
@@ -2207,10 +2215,85 @@ if (fs.readFileSync(editOverlapFixture, 'utf8') !== 'abcdef') {
   throw new Error('tool-edit overlap failure mutated the file');
 }
 
+const rpcProviderSessionFile = 'zig-out/pi-zig-rpc-provider-smoke.jsonl';
+const rpcProviderAuthDir = path.resolve('zig-out/pi-zig-rpc-provider-auth');
+fs.rmSync(rpcProviderSessionFile, { force: true });
+fs.rmSync(rpcProviderAuthDir, { recursive: true, force: true });
+const rpcFakeProvider = await startFakeProviderServer();
+try {
+  const rpcProviderEnv = {
+    ...process.env,
+    OPENAI_API_KEY: 'fake-provider-key',
+    PI_ZIG_PROVIDER_BASE_URL: rpcFakeProvider.baseUrl,
+    PI_CODING_AGENT_DIR: rpcProviderAuthDir
+  };
+  const rpcProviderOutput = run(
+    ['rpc', rpcProviderSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-provider-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-provider-prompt', type: 'prompt', message: 'please run the tool loop' }),
+      JSON.stringify({ id: 'rpc-provider-last', type: 'get_last_assistant_text' }),
+      JSON.stringify({ id: 'rpc-provider-messages', type: 'get_messages' }),
+      JSON.stringify({ id: 'rpc-provider-stats', type: 'get_session_stats' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderResponses = rpcProviderOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderPrompt = rpcProviderResponses.find((response) => response.id === 'rpc-provider-prompt');
+  if (
+    !rpcProviderPrompt?.success ||
+    !rpcProviderPrompt?.data?.text?.includes('tool loop complete: tool-loop-ok') ||
+    rpcProviderPrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_tool_loop_1' ||
+    rpcProviderPrompt?.data?.toolResults?.[0]?.toolName !== 'bash' ||
+    !rpcProviderPrompt?.data?.toolResults?.[0]?.content?.includes('tool-loop-ok')
+  ) {
+    throw new Error('rpc provider prompt smoke did not execute the provider-backed tool loop');
+  }
+  const rpcProviderLast = rpcProviderResponses.find((response) => response.id === 'rpc-provider-last');
+  if (!rpcProviderLast?.data?.text?.includes('tool loop complete: tool-loop-ok')) {
+    throw new Error('rpc get_last_assistant_text smoke did not return provider-backed assistant text');
+  }
+  const rpcProviderMessages = rpcProviderResponses.find((response) => response.id === 'rpc-provider-messages');
+  if (
+    rpcProviderMessages?.data?.messages?.[0]?.role !== 'user' ||
+    rpcProviderMessages?.data?.messages?.[1]?.role !== 'tool' ||
+    !rpcProviderMessages?.data?.messages?.[1]?.content?.includes('tool-loop-ok') ||
+    rpcProviderMessages?.data?.messages?.[2]?.role !== 'assistant' ||
+    !rpcProviderMessages?.data?.messages?.[2]?.content?.includes('tool loop complete: tool-loop-ok')
+  ) {
+    throw new Error('rpc get_messages smoke did not include provider-backed user/tool/assistant turns');
+  }
+  const rpcProviderStats = rpcProviderResponses.find((response) => response.id === 'rpc-provider-stats');
+  if (
+    rpcProviderStats?.data?.userMessages !== 1 ||
+    rpcProviderStats?.data?.assistantMessages !== 1 ||
+    rpcProviderStats?.data?.toolCalls !== 0 ||
+    rpcProviderStats?.data?.toolResults !== 1 ||
+    rpcProviderStats?.data?.totalMessages !== 3
+  ) {
+    throw new Error('rpc provider session stats did not count user/tool/assistant turns');
+  }
+  const rpcProviderJsonl = fs.readFileSync(rpcProviderSessionFile, 'utf8');
+  if (
+    !rpcProviderJsonl.includes('"provider":"openai"') ||
+    !rpcProviderJsonl.includes('"modelId":"gpt-4o"') ||
+    !rpcProviderJsonl.includes('"role":"tool"') ||
+    !rpcProviderJsonl.includes('"tool-loop-ok"') ||
+    !rpcProviderJsonl.includes('"role":"assistant"')
+  ) {
+    throw new Error('rpc provider durable JSONL did not persist provider-backed tool and assistant messages');
+  }
+} finally {
+  rpcFakeProvider.stop();
+}
+
 const rpcSessionFile = 'zig-out/pi-zig-rpc-smoke.jsonl';
 const rpcExportFile = 'zig-out/pi-zig-rpc-smoke.html';
 fs.rmSync(rpcSessionFile, { force: true });
 fs.rmSync(rpcExportFile, { force: true });
+const rpcLocalAuthDir = path.resolve('zig-out/pi-zig-rpc-local-auth');
+fs.rmSync(rpcLocalAuthDir, { recursive: true, force: true });
 const rpcOutput = run(
   ['rpc', rpcSessionFile],
   [
@@ -2231,7 +2314,8 @@ const rpcOutput = run(
     JSON.stringify({ id: 'state-2', type: 'get_state' }),
     JSON.stringify({ id: 'bash-long-1', type: 'bash', command: "node -e \"for (let i = 0; i < 2105; i++) console.log('rpc-bash-line-' + String(i).padStart(4, '0'))\"" }),
     ''
-  ].join('\n')
+  ].join('\n'),
+  { env: envWithoutAnthropicAuth({ PI_CODING_AGENT_DIR: rpcLocalAuthDir }) }
 );
 const rpcResponses = rpcOutput
   .trim()

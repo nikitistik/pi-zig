@@ -64,7 +64,7 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         }
         const path = try resolveSessionPath(init.io, init.gpa, init.environ_map, parsed);
         defer path.deinit(init.gpa);
-        return rpc.run(init.io, init.gpa, path.path, commandOptionsFromParsed(init, &parsed));
+        return rpc.run(init.io, init.gpa, init.environ_map, path.path, commandOptionsFromParsed(init, &parsed));
     }
 
     const prompt = try buildPrompt(init.io, init.gpa, parsed);

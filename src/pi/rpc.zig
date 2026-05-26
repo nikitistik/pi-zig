@@ -1,4 +1,6 @@
 const std = @import("std");
+const agent = @import("agent.zig");
+const auth = @import("auth.zig");
 const commands = @import("commands.zig");
 const models = @import("models.zig");
 const session = @import("session.zig");
@@ -97,9 +99,18 @@ const Runtime = struct {
     auto_compaction_enabled: bool = false,
     auto_retry_enabled: bool = false,
     command_options: commands.Options = .{},
+    env: ?*const std.process.Environ.Map = null,
 
-    fn init(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, session_file: []const u8, command_options: commands.Options) !void {
+    fn init(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        env: *const std.process.Environ.Map,
+        session_file: []const u8,
+        command_options: commands.Options,
+    ) !void {
         self.resetInMemory();
+        self.env = env;
         self.command_options = command_options;
         self.store = try session.PersistentStore.init(io, allocator, session_file);
         try self.loadSessionEntries(io, allocator);
@@ -397,9 +408,75 @@ const Runtime = struct {
         return null;
     }
 
+    fn runAgentIfAuthenticated(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, prompt: []const u8) !?agent.RunResult {
+        const model = self.selected_model orelse return null;
+        const env = self.env orelse return null;
+        const api_key = try auth.resolveProviderApiKey(io, allocator, env, model.provider) orelse return null;
+        defer allocator.free(api_key);
+
+        return try agent.runPrompt(io, allocator, env, .{
+            .provider = model.provider,
+            .model = model.id,
+            .api_key = api_key,
+            .prompt = prompt,
+            .tool_set = .all,
+        });
+    }
+
+    fn addAgentResultMessages(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, result: agent.RunResult) !void {
+        for (result.tool_results[0..result.tool_results_count]) |tool_result| {
+            try self.addMessage(io, allocator, .tool, tool_result.content);
+        }
+        try self.addMessage(io, allocator, .assistant, result.final_text);
+    }
+
+    fn writePromptAgentResult(
+        self: *Runtime,
+        w: *std.Io.Writer,
+        id: ?[]const u8,
+        command: []const u8,
+        result: agent.RunResult,
+    ) !void {
+        try writeResponseHead(w, id, command, true);
+        try w.writeAll(",\"data\":{\"text\":");
+        try writeJsonString(w, result.final_text);
+        try w.writeAll(",\"toolResults\":");
+        try writeAgentToolResultsJson(w, result.tool_results[0..result.tool_results_count]);
+        if (self.selected_model) |model| {
+            try w.writeAll(",\"model\":");
+            try models.writeModelJson(w, model);
+        }
+        try w.writeAll("}}\n");
+    }
+
     fn sessionName(self: *const Runtime) ?[]const u8 {
         if (!self.has_session_name) return null;
         return self.session_name[0..self.session_name_len];
+    }
+
+    fn handlePromptLikeCommand(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
+        id: ?[]const u8,
+        command: []const u8,
+        message: []const u8,
+    ) !void {
+        self.addMessage(io, allocator, .user, message) catch |err| {
+            return writeError(w, id, command, @errorName(err));
+        };
+
+        const maybe_run_result = self.runAgentIfAuthenticated(io, allocator, message) catch |err| {
+            return writeError(w, id, command, @errorName(err));
+        };
+        const run_result = maybe_run_result orelse return writeSuccess(w, id, command);
+        defer run_result.deinit(allocator);
+
+        self.addAgentResultMessages(io, allocator, run_result) catch |err| {
+            return writeError(w, id, command, @errorName(err));
+        };
+        return self.writePromptAgentResult(w, id, command, run_result);
     }
 
     fn handleValue(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, value: std.json.Value) !void {
@@ -412,30 +489,21 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "prompt requires a string message");
             };
-            self.addMessage(io, allocator, .user, message) catch |err| {
-                return writeError(w, id, command, @errorName(err));
-            };
-            return writeSuccess(w, id, command);
+            return self.handlePromptLikeCommand(io, allocator, w, id, command, message);
         }
 
         if (std.mem.eql(u8, command, "steer")) {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "steer requires a string message");
             };
-            self.addMessage(io, allocator, .user, message) catch |err| {
-                return writeError(w, id, command, @errorName(err));
-            };
-            return writeSuccess(w, id, command);
+            return self.handlePromptLikeCommand(io, allocator, w, id, command, message);
         }
 
         if (std.mem.eql(u8, command, "follow_up")) {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "follow_up requires a string message");
             };
-            self.addMessage(io, allocator, .user, message) catch |err| {
-                return writeError(w, id, command, @errorName(err));
-            };
-            return writeSuccess(w, id, command);
+            return self.handlePromptLikeCommand(io, allocator, w, id, command, message);
         }
 
         if (std.mem.eql(u8, command, "abort")) {
@@ -815,9 +883,15 @@ const Runtime = struct {
     }
 };
 
-pub fn run(io: std.Io, allocator: std.mem.Allocator, session_file: []const u8, command_options: commands.Options) !void {
+pub fn run(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    session_file: []const u8,
+    command_options: commands.Options,
+) !void {
     var runtime: Runtime = .{};
-    try runtime.init(io, allocator, session_file, command_options);
+    try runtime.init(io, allocator, env, session_file, command_options);
 
     var in_buf: [16 * 1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &in_buf);
@@ -928,6 +1002,25 @@ fn writeBashResultJson(w: *std.Io.Writer, result: tools.ShellResult) !void {
         try writeJsonString(w, full_path);
     }
     try w.writeByte('}');
+}
+
+fn writeAgentToolResultsJson(w: *std.Io.Writer, results: []const agent.ToolResult) !void {
+    try w.writeByte('[');
+    for (results, 0..) |result, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"toolCallId\":");
+        try writeJsonString(w, result.tool_call_id);
+        try w.writeAll(",\"toolName\":");
+        try writeJsonString(w, result.tool_name);
+        try w.writeAll(",\"arguments\":");
+        try writeJsonString(w, result.arguments_json);
+        try w.writeAll(",\"content\":");
+        try writeJsonString(w, result.content);
+        try w.writeAll(",\"isError\":");
+        try w.writeAll(if (result.is_error) "true" else "false");
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
 }
 
 fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
@@ -1055,8 +1148,10 @@ test "json string escaping covers control characters" {
 
 test "runtime stores prompt messages and resets sessions" {
     std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-test.jsonl") catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
     var runtime: Runtime = .{};
-    try runtime.init(std.testing.io, std.testing.allocator, "zig-out/pi-zig-rpc-test.jsonl", .{});
+    try runtime.init(std.testing.io, std.testing.allocator, &env, "zig-out/pi-zig-rpc-test.jsonl", .{});
     try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "hello");
     try std.testing.expectEqual(@as(usize, 1), runtime.message_count);
     try runtime.clearSession(std.testing.io, std.testing.allocator, null);
