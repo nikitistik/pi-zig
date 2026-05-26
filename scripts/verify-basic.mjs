@@ -39,6 +39,39 @@ async function startFakeProviderServer() {
       `
 import http from 'node:http';
 const requestCounts = new Map();
+function eventStreamU32(value) {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt32BE(value);
+  return buffer;
+}
+function eventStreamHeaderString(name, value) {
+  const nameBuffer = Buffer.from(name);
+  const valueBuffer = Buffer.from(value);
+  return Buffer.concat([
+    Buffer.from([nameBuffer.length]),
+    nameBuffer,
+    Buffer.from([7]),
+    Buffer.from([valueBuffer.length >> 8, valueBuffer.length & 0xff]),
+    valueBuffer
+  ]);
+}
+function bedrockEventFrame(eventType, payload) {
+  const headers = Buffer.concat([
+    eventStreamHeaderString(':message-type', 'event'),
+    eventStreamHeaderString(':event-type', eventType),
+    eventStreamHeaderString(':content-type', 'application/json')
+  ]);
+  const body = Buffer.from(JSON.stringify(payload));
+  const total = 12 + headers.length + body.length + 4;
+  return Buffer.concat([
+    eventStreamU32(total),
+    eventStreamU32(headers.length),
+    eventStreamU32(0),
+    headers,
+    body,
+    eventStreamU32(0)
+  ]);
+}
 const server = http.createServer((req, res) => {
   const chunks = [];
   req.on('data', (chunk) => chunks.push(chunk));
@@ -161,6 +194,75 @@ const server = http.createServer((req, res) => {
       }
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'unknown native google request', body }));
+      return;
+    }
+    const isBedrockConverseStream = req.method === 'POST' &&
+      requestUrl.pathname.includes('/model/') &&
+      requestUrl.pathname.endsWith('/converse-stream');
+    if (isBedrockConverseStream) {
+      if (req.headers.authorization !== 'Bearer fake-bedrock-token') {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bedrock auth', headers: req.headers }));
+        return;
+      }
+      const body = JSON.parse(rawBody);
+      const decodedPath = decodeURIComponent(requestUrl.pathname);
+      const bedrockBlockText = (block) => {
+        if (block?.text) return block.text;
+        if (block?.toolResult?.content) return block.toolResult.content.map((item) => item?.text ?? '').join('\\n');
+        return '';
+      };
+      const bedrockMessageText = (message) => Array.isArray(message?.content)
+        ? message.content.map(bedrockBlockText).join('\\n')
+        : '';
+      const userText = body.messages?.filter((message) => message.role === 'user').map(bedrockMessageText).join('\\n') ?? '';
+      const toolResults = body.messages?.flatMap((message) => Array.isArray(message.content) ? message.content.filter((block) => block?.toolResult) : []) ?? [];
+      const hasBashTool = body.toolConfig?.tools?.some((tool) => tool?.toolSpec?.name === 'bash' && tool?.toolSpec?.inputSchema?.json?.type === 'object') ?? false;
+      const writeBedrockEvents = (events) => {
+        res.writeHead(200, {
+          'content-type': 'application/vnd.amazon.eventstream',
+          connection: 'close'
+        });
+        for (const [eventType, payload] of events) {
+          res.write(bedrockEventFrame(eventType, payload));
+        }
+        res.end();
+      };
+      if (userText.includes('native bedrock stream tool events')) {
+        if (!decodedPath.includes('/model/anthropic.claude-test-v1:0/converse-stream') || !Array.isArray(body.system) || !hasBashTool || body.modelId) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native bedrock request shape mismatch', body, pathname: requestUrl.pathname }));
+          return;
+        }
+        if (toolResults.length === 0) {
+          writeBedrockEvents([
+            ['messageStart', { messageStart: { role: 'assistant' } }],
+            ['contentBlockStart', { contentBlockStart: { contentBlockIndex: 0, start: { toolUse: { toolUseId: 'callbedrock1', name: 'bash' } } } }],
+            ['contentBlockDelta', { contentBlockDelta: { contentBlockIndex: 0, delta: { toolUse: { input: '{"command":"printf ' } } } }],
+            ['contentBlockDelta', { contentBlockDelta: { contentBlockIndex: 0, delta: { toolUse: { input: 'native-bedrock-ok"}' } } } }],
+            ['contentBlockStop', { contentBlockStop: { contentBlockIndex: 0 } }],
+            ['messageStop', { messageStop: { stopReason: 'tool_use' } }]
+          ]);
+          return;
+        }
+        const lastTool = toolResults.at(-1)?.toolResult;
+        const toolText = lastTool?.content?.map((item) => item?.text ?? '').join('\\n') ?? '';
+        if (lastTool?.toolUseId !== 'callbedrock1' || toolText.trim() !== 'native-bedrock-ok') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native Bedrock tool result mismatch', toolResults }));
+          return;
+        }
+        writeBedrockEvents([
+          ['messageStart', { messageStart: { role: 'assistant' } }],
+          ['contentBlockDelta', { contentBlockDelta: { contentBlockIndex: 0, delta: { text: 'native bedrock ' } } }],
+          ['contentBlockDelta', { contentBlockDelta: { contentBlockIndex: 0, delta: { text: 'tool complete: native-bedrock-ok' } } }],
+          ['contentBlockStop', { contentBlockStop: { contentBlockIndex: 0 } }],
+          ['messageStop', { messageStop: { stopReason: 'end_turn' } }]
+        ]);
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unknown native bedrock request', body, pathname: requestUrl.pathname }));
       return;
     }
     if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
@@ -3004,6 +3106,32 @@ try {
     !providerJsonNativeMistralToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('native mistral tool complete: native-mistral-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not run native Mistral streamed tool calls');
+  }
+
+  const nativeBedrockEnv = {
+    ...envWithoutAnthropicAuth(),
+    AWS_BEARER_TOKEN_BEDROCK: 'fake-bedrock-token',
+    PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl
+  };
+  const providerJsonNativeBedrockToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'amazon-bedrock', '--model', 'anthropic.claude-test-v1:0', '-p', 'please run native bedrock stream tool events'],
+    undefined,
+    { env: nativeBedrockEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonNativeBedrockToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'callbedrock1') ||
+    !providerJsonNativeBedrockToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'callbedrock1' && JSON.stringify(line.partialResult).includes('native-bedrock-ok')) ||
+    !providerJsonNativeBedrockToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('native-bedrock-ok')) ||
+    !providerJsonNativeBedrockToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'callbedrock1')) ||
+    !providerJsonNativeBedrockToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'native bedrock ') ||
+    !providerJsonNativeBedrockToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'tool complete: native-bedrock-ok') ||
+    !providerJsonNativeBedrockToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('native bedrock tool complete: native-bedrock-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not run native Bedrock streamed tool calls');
   }
 
   const providerJsonToolErrorLines = run(

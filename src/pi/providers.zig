@@ -9,6 +9,7 @@ const anthropic_keys = [_][]const u8{ "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KE
 const github_copilot_keys = [_][]const u8{"COPILOT_GITHUB_TOKEN"};
 const openai_keys = [_][]const u8{"OPENAI_API_KEY"};
 const azure_openai_keys = [_][]const u8{"AZURE_OPENAI_API_KEY"};
+const amazon_bedrock_keys = [_][]const u8{"AWS_BEARER_TOKEN_BEDROCK"};
 const deepseek_keys = [_][]const u8{"DEEPSEEK_API_KEY"};
 const google_keys = [_][]const u8{"GEMINI_API_KEY"};
 const google_vertex_keys = [_][]const u8{"GOOGLE_CLOUD_API_KEY"};
@@ -38,6 +39,7 @@ pub const env_mappings = [_]EnvMapping{
     .{ .provider = "github-copilot", .keys = &github_copilot_keys },
     .{ .provider = "openai", .keys = &openai_keys },
     .{ .provider = "azure-openai-responses", .keys = &azure_openai_keys },
+    .{ .provider = "amazon-bedrock", .keys = &amazon_bedrock_keys },
     .{ .provider = "deepseek", .keys = &deepseek_keys },
     .{ .provider = "google", .keys = &google_keys },
     .{ .provider = "google-vertex", .keys = &google_vertex_keys },
@@ -100,3 +102,6 @@ test "provider env map includes OpenRouter and Groq" {
     try std.testing.expectEqualStrings("GROQ_API_KEY", envKeysFor("groq").?[0]);
 }
 
+test "provider env map includes Bedrock bearer token" {
+    try std.testing.expectEqualStrings("AWS_BEARER_TOKEN_BEDROCK", envKeysFor("amazon-bedrock").?[0]);
+}

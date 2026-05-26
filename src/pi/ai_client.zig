@@ -138,6 +138,9 @@ pub fn runChatTurn(
     if (isMistralProvider(request.provider)) {
         return runMistralChatTurn(io, allocator, env, request);
     }
+    if (isBedrockProvider(request.provider)) {
+        return runBedrockConverseTurn(io, allocator, env, request);
+    }
 
     const endpoint = try endpointForProvider(allocator, env, request.provider);
     defer allocator.free(endpoint);
@@ -240,6 +243,9 @@ fn streamChatTurnData(
     }
     if (isMistralProvider(request.provider)) {
         return streamMistralChatData(io, allocator, env, request, callback_context, callback);
+    }
+    if (isBedrockProvider(request.provider)) {
+        return streamBedrockConverseData(io, allocator, env, request, callback_context, callback);
     }
 
     const endpoint = try endpointForProvider(allocator, env, request.provider);
@@ -349,6 +355,10 @@ fn isGoogleGenerativeProvider(provider: []const u8) bool {
 
 fn isMistralProvider(provider: []const u8) bool {
     return std.mem.eql(u8, provider, "mistral");
+}
+
+fn isBedrockProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "amazon-bedrock");
 }
 
 fn runAnthropicMessagesTurn(
@@ -665,6 +675,89 @@ fn streamMistralChatData(
     try readDoneTerminatedSseStream(reader, callback_context, callback);
 }
 
+fn runBedrockConverseTurn(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+) ChatCompletionError!ChatCompletionResult {
+    var accumulator = StreamChatAccumulator.init(allocator);
+    errdefer accumulator.deinit();
+    var result_context = StreamResultContext{
+        .allocator = allocator,
+        .accumulator = &accumulator,
+        .text_callback_context = null,
+        .text_callback = null,
+    };
+    streamBedrockConverseData(io, allocator, env, request, &result_context, handleStreamResultData) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedProvider => return error.UnsupportedProvider,
+        error.ProviderRequestFailed => return error.ProviderRequestFailed,
+        error.ProviderResponseInvalid => return error.ProviderResponseInvalid,
+        else => return error.ProviderRequestFailed,
+    };
+    return accumulator.toResult() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ProviderResponseInvalid,
+    };
+}
+
+fn streamBedrockConverseData(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    const endpoint = try bedrockConverseStreamEndpointForProvider(allocator, env, request.model);
+    defer allocator.free(endpoint);
+
+    const payload = try buildBedrockConversePayload(allocator, request);
+    defer allocator.free(payload);
+
+    const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
+    defer allocator.free(authorization);
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    var request_handle = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .authorization = .{ .override = authorization },
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+            .accept_encoding = .{ .override = "identity" },
+        },
+    });
+    defer request_handle.deinit();
+
+    request_handle.transfer_encoding = .{ .content_length = payload.len };
+    var body_writer = try request_handle.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try request_handle.connection.?.flush();
+
+    var response = try request_handle.receiveHead(&.{});
+    if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
+        var transfer_buffer: [1024]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        _ = reader.discardRemaining() catch {};
+        return error.ProviderRequestFailed;
+    }
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    try readBedrockEventStream(allocator, reader, callback_context, callback);
+}
+
 const AnthropicAuthHeader = struct {
     authorization: ?[]u8 = null,
     oauth: bool = false,
@@ -737,6 +830,35 @@ fn googleGenerateContentEndpointForProvider(
 fn mistralChatEndpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
     const base_url = env.get("PI_ZIG_PROVIDER_BASE_URL") orelse "https://api.mistral.ai/v1";
     return endpointFromBaseUrlWithPath(allocator, base_url, "/chat/completions");
+}
+
+fn bedrockConverseStreamEndpointForProvider(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    model: []const u8,
+) ![]u8 {
+    const base_url = if (env.get("PI_ZIG_PROVIDER_BASE_URL")) |value|
+        value
+    else if (env.get("AWS_BEDROCK_RUNTIME_BASE_URL")) |value|
+        value
+    else blk: {
+        const region = env.get("AWS_REGION") orelse env.get("AWS_DEFAULT_REGION") orelse "us-east-1";
+        break :blk try std.fmt.allocPrint(allocator, "https://bedrock-runtime.{s}.amazonaws.com", .{region});
+    };
+    const should_free_base = env.get("PI_ZIG_PROVIDER_BASE_URL") == null and env.get("AWS_BEDROCK_RUNTIME_BASE_URL") == null;
+    defer if (should_free_base) allocator.free(base_url);
+
+    var end = base_url.len;
+    while (end > 0 and base_url[end - 1] == '/') end -= 1;
+    const trimmed = base_url[0..end];
+    if (std.mem.endsWith(u8, trimmed, "/converse-stream")) return allocator.dupe(u8, trimmed);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.print("{s}/model/", .{trimmed});
+    try writeUriPathSegment(&out.writer, model);
+    try out.writer.writeAll("/converse-stream");
+    return out.toOwnedSlice();
 }
 
 fn endpointFromBaseUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
@@ -885,6 +1007,43 @@ fn buildMistralChatPayload(allocator: std.mem.Allocator, request: ChatTurnReques
             try writeMistralToolDefinition(w, tool);
         }
         try w.writeAll("],\"tool_choice\":\"auto\"");
+    }
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn buildBedrockConversePayload(allocator: std.mem.Allocator, request: ChatTurnRequest) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    try w.writeAll("{\"messages\":[");
+    var emitted: usize = 0;
+    var index: usize = 0;
+    while (index < request.messages.len) {
+        const message = request.messages[index];
+        if (message.role == .system) {
+            index += 1;
+            continue;
+        }
+        if (emitted != 0) try w.writeByte(',');
+        if (message.role == .tool) {
+            try writeBedrockToolResultMessage(w, request.messages, &index);
+        } else {
+            try writeBedrockMessage(w, message);
+            index += 1;
+        }
+        emitted += 1;
+    }
+    try w.writeByte(']');
+    try writeBedrockSystem(w, request.messages);
+    if (request.tools.len > 0) {
+        try w.writeAll(",\"toolConfig\":{\"tools\":[");
+        for (request.tools, 0..) |tool, tool_index| {
+            if (tool_index != 0) try w.writeByte(',');
+            try writeBedrockToolDefinition(w, tool);
+        }
+        try w.writeAll("],\"toolChoice\":{\"auto\":{}}}");
     }
     try w.writeByte('}');
     return out.toOwnedSlice();
@@ -1195,6 +1354,119 @@ fn writeMistralToolCall(w: *std.Io.Writer, call: ChatToolCall) !void {
     try w.writeAll("}}");
 }
 
+fn writeBedrockSystem(w: *std.Io.Writer, messages: []const ChatMessage) !void {
+    var emitted: usize = 0;
+    for (messages) |message| {
+        if (message.role != .system or std.mem.trim(u8, message.content, " \t\r\n").len == 0) continue;
+        if (emitted == 0) try w.writeAll(",\"system\":[") else try w.writeByte(',');
+        try w.writeAll("{\"text\":");
+        try writeJsonString(w, message.content);
+        try w.writeByte('}');
+        emitted += 1;
+    }
+    if (emitted != 0) try w.writeByte(']');
+}
+
+fn writeBedrockMessage(w: *std.Io.Writer, message: ChatMessage) !void {
+    try w.writeAll("{\"role\":");
+    try writeJsonString(w, if (message.role == .assistant) "assistant" else "user");
+    try w.writeAll(",\"content\":[");
+    var emitted: usize = 0;
+    if (message.role == .assistant and message.content.len > 0) {
+        try writeBedrockTextBlock(w, message.content, &emitted);
+    } else if (message.content_parts.len > 0) {
+        for (message.content_parts) |part| {
+            if (emitted != 0) try w.writeByte(',');
+            try writeBedrockContentPart(w, part);
+            emitted += 1;
+        }
+    } else if (message.content.len > 0) {
+        try writeBedrockTextBlock(w, message.content, &emitted);
+    }
+    if (message.role == .assistant and message.tool_calls.len > 0) {
+        for (message.tool_calls) |call| {
+            if (emitted != 0) try w.writeByte(',');
+            try writeBedrockToolUseBlock(w, call);
+            emitted += 1;
+        }
+    }
+    try w.writeAll("]}");
+}
+
+fn writeBedrockToolResultMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize) !void {
+    try w.writeAll("{\"role\":\"user\",\"content\":[");
+    var emitted: usize = 0;
+    while (index.* < messages.len and messages[index.*].role == .tool) : (index.* += 1) {
+        if (emitted != 0) try w.writeByte(',');
+        const message = messages[index.*];
+        try w.writeAll("{\"toolResult\":{\"toolUseId\":");
+        try writeJsonString(w, message.tool_call_id orelse "");
+        try w.writeAll(",\"content\":[{\"text\":");
+        try writeJsonString(w, if (message.content.len > 0) message.content else "(no tool output)");
+        try w.writeAll("}],\"status\":\"success\"}}");
+        emitted += 1;
+    }
+    try w.writeAll("]}");
+}
+
+fn writeBedrockTextBlock(w: *std.Io.Writer, text: []const u8, emitted: *usize) !void {
+    if (emitted.* != 0) try w.writeByte(',');
+    try w.writeAll("{\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+    emitted.* += 1;
+}
+
+fn writeBedrockContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
+    switch (part) {
+        .text => |text| {
+            try w.writeAll("{\"text\":");
+            try writeJsonString(w, text);
+            try w.writeByte('}');
+        },
+        .image => |image| {
+            try w.writeAll("{\"image\":{\"format\":");
+            try writeJsonString(w, bedrockImageFormatFromMime(image.mime_type));
+            try w.writeAll(",\"source\":{\"bytes\":");
+            try writeJsonString(w, image.data);
+            try w.writeAll("}}}");
+        },
+    }
+}
+
+fn writeBedrockToolUseBlock(w: *std.Io.Writer, call: ChatToolCall) !void {
+    try w.writeAll("{\"toolUse\":{\"toolUseId\":");
+    try writeJsonString(w, call.id);
+    try w.writeAll(",\"name\":");
+    try writeJsonString(w, call.name);
+    try w.writeAll(",\"input\":");
+    if (std.mem.trim(u8, call.arguments_json, " \t\r\n").len == 0) {
+        try w.writeAll("{}");
+    } else {
+        try w.writeAll(call.arguments_json);
+    }
+    try w.writeAll("}}");
+}
+
+fn writeBedrockToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void {
+    try w.writeAll("{\"toolSpec\":{\"name\":");
+    try writeJsonString(w, tool.name);
+    try w.writeAll(",\"description\":");
+    try writeJsonString(w, tool.description);
+    try w.writeAll(",\"inputSchema\":{\"json\":");
+    try w.writeAll(tool.parameters_json);
+    try w.writeAll("}}}");
+}
+
+fn bedrockImageFormatFromMime(mime_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, mime_type, "image/jpeg") or std.mem.eql(u8, mime_type, "image/jpg")) return "jpeg";
+    if (std.mem.eql(u8, mime_type, "image/png")) return "png";
+    if (std.mem.eql(u8, mime_type, "image/gif")) return "gif";
+    if (std.mem.eql(u8, mime_type, "image/webp")) return "webp";
+    if (std.mem.startsWith(u8, mime_type, "image/")) return mime_type["image/".len..];
+    return "png";
+}
+
 fn readAnthropicSseStream(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -1267,6 +1539,104 @@ fn readGoogleSseStream(
         saw_data = true;
     }
     if (!saw_data) return error.ProviderResponseInvalid;
+}
+
+fn readBedrockEventStream(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    var saw_event = false;
+    while (true) {
+        const prelude = reader.takeArray(12) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return error.ProviderResponseInvalid,
+        };
+        const total_len = std.mem.readInt(u32, prelude[0..4], .big);
+        const headers_len = std.mem.readInt(u32, prelude[4..8], .big);
+        if (total_len < 16 or headers_len > total_len - 16) return error.ProviderResponseInvalid;
+
+        const rest_len: usize = @intCast(total_len - 12);
+        const rest = try reader.readAlloc(allocator, rest_len);
+        defer allocator.free(rest);
+        if (rest.len != rest_len) return error.ProviderResponseInvalid;
+
+        const headers_end: usize = @intCast(headers_len);
+        const payload_len: usize = @intCast(total_len - 16 - headers_len);
+        const payload_end = headers_end + payload_len;
+        if (payload_end + 4 != rest.len) return error.ProviderResponseInvalid;
+
+        const headers = rest[0..headers_end];
+        const payload = rest[headers_end..payload_end];
+        const message_type = try bedrockEventStreamHeader(headers, ":message-type");
+        if (message_type) |kind| {
+            if (std.mem.eql(u8, kind, "exception")) return error.ProviderRequestFailed;
+        }
+        const event_type = try bedrockEventStreamHeader(headers, ":event-type");
+        if (event_type) |kind| {
+            if (std.mem.endsWith(u8, kind, "Exception") or std.mem.endsWith(u8, kind, "Error")) {
+                return error.ProviderRequestFailed;
+            }
+        }
+        if (payload.len == 0) continue;
+        try callback(callback_context, payload);
+        saw_event = true;
+    }
+    if (!saw_event) return error.ProviderResponseInvalid;
+}
+
+fn bedrockEventStreamHeader(headers: []const u8, wanted: []const u8) !?[]const u8 {
+    var index: usize = 0;
+    while (index < headers.len) {
+        if (index + 2 > headers.len) return error.ProviderResponseInvalid;
+        const name_len = headers[index];
+        index += 1;
+        if (index + name_len + 1 > headers.len) return error.ProviderResponseInvalid;
+        const name = headers[index .. index + name_len];
+        index += name_len;
+        const header_type = headers[index];
+        index += 1;
+        switch (header_type) {
+            0, 1 => {
+                if (std.mem.eql(u8, name, wanted)) return null;
+            },
+            2 => {
+                if (index + 1 > headers.len) return error.ProviderResponseInvalid;
+                index += 1;
+            },
+            3 => {
+                if (index + 2 > headers.len) return error.ProviderResponseInvalid;
+                index += 2;
+            },
+            4 => {
+                if (index + 4 > headers.len) return error.ProviderResponseInvalid;
+                index += 4;
+            },
+            5, 8 => {
+                if (index + 8 > headers.len) return error.ProviderResponseInvalid;
+                index += 8;
+            },
+            6, 7 => {
+                if (index + 2 > headers.len) return error.ProviderResponseInvalid;
+                const len = std.mem.readInt(u16, headers[index..][0..2], .big);
+                index += 2;
+                if (index + len > headers.len) return error.ProviderResponseInvalid;
+                const value = headers[index .. index + len];
+                index += len;
+                if (std.mem.eql(u8, name, wanted)) {
+                    if (header_type != 7) return error.ProviderResponseInvalid;
+                    return value;
+                }
+            },
+            9 => {
+                if (index + 16 > headers.len) return error.ProviderResponseInvalid;
+                index += 16;
+            },
+            else => return error.ProviderResponseInvalid,
+        }
+    }
+    return null;
 }
 
 const AnthropicSseEventKind = enum {
@@ -1430,6 +1800,10 @@ fn parseOpenAICompatibleStreamData(
         try parseMistralStreamTextDeltas(parsed.value, callback_context, callback);
         return;
     }
+    if (isBedrockStreamEvent(parsed.value)) {
+        try parseBedrockStreamTextDeltas(parsed.value, callback_context, callback);
+        return;
+    }
     const delta = try firstStreamDelta(parsed.value) orelse return;
     const content = delta.object.get("content") orelse return;
     if (content == .null) return;
@@ -1460,6 +1834,10 @@ fn parseOpenAICompatibleStreamResultData(
     }
     if (isMistralStreamChunk(parsed.value)) {
         try accumulator.appendMistralStreamChunk(parsed.value, text_callback_context, text_callback);
+        return;
+    }
+    if (isBedrockStreamEvent(parsed.value)) {
+        try accumulator.appendBedrockStreamEvent(parsed.value, text_callback_context, text_callback);
         return;
     }
     const delta = try firstStreamDelta(parsed.value) orelse return;
@@ -1569,6 +1947,32 @@ fn parseMistralContentDelta(
             }
         },
         else => return error.ProviderResponseInvalid,
+    }
+}
+
+fn isBedrockStreamEvent(value: std.json.Value) bool {
+    if (value != .object) return false;
+    return value.object.get("messageStart") != null or
+        value.object.get("contentBlockStart") != null or
+        value.object.get("contentBlockDelta") != null or
+        value.object.get("contentBlockStop") != null or
+        value.object.get("messageStop") != null or
+        value.object.get("metadata") != null;
+}
+
+fn parseBedrockStreamTextDeltas(
+    value: std.json.Value,
+    callback_context: *anyopaque,
+    callback: StreamTextCallback,
+) !void {
+    if (value != .object) return error.ProviderResponseInvalid;
+    const event = value.object.get("contentBlockDelta") orelse return;
+    if (event != .object) return error.ProviderResponseInvalid;
+    const delta = event.object.get("delta") orelse return;
+    if (delta != .object) return error.ProviderResponseInvalid;
+    if (delta.object.get("text")) |text| {
+        if (text != .string) return error.ProviderResponseInvalid;
+        if (text.string.len > 0) try callback(callback_context, text.string);
     }
 }
 
@@ -1752,6 +2156,44 @@ const StreamChatAccumulator = struct {
             try self.appendMistralToolCallDeltas(tool_calls);
         } else if (delta.object.get("tool_calls")) |tool_calls| {
             try self.appendToolCallDeltas(tool_calls);
+        }
+    }
+
+    fn appendBedrockStreamEvent(
+        self: *StreamChatAccumulator,
+        value: std.json.Value,
+        text_callback_context: ?*anyopaque,
+        text_callback: ?StreamTextCallback,
+    ) !void {
+        if (value != .object) return error.ProviderResponseInvalid;
+        if (value.object.get("contentBlockStart")) |event| {
+            if (event != .object) return error.ProviderResponseInvalid;
+            const start = event.object.get("start") orelse return;
+            if (start != .object) return error.ProviderResponseInvalid;
+            if (start.object.get("toolUse")) |tool_use| {
+                const index = try bedrockContentBlockIndex(event);
+                try self.startBedrockToolUse(index, tool_use);
+            }
+            return;
+        }
+        if (value.object.get("contentBlockDelta")) |event| {
+            if (event != .object) return error.ProviderResponseInvalid;
+            const delta = event.object.get("delta") orelse return error.ProviderResponseInvalid;
+            if (delta != .object) return error.ProviderResponseInvalid;
+            if (delta.object.get("text")) |text| {
+                if (text != .string) return error.ProviderResponseInvalid;
+                try self.appendTextDelta(text.string, text_callback_context, text_callback);
+            }
+            if (delta.object.get("toolUse")) |tool_use_delta| {
+                if (tool_use_delta != .object) return error.ProviderResponseInvalid;
+                const index = try bedrockContentBlockIndex(event);
+                if (index >= self.tool_calls.items.len or !self.tool_calls.items[index].seen) return;
+                if (tool_use_delta.object.get("input")) |input| {
+                    if (input != .string) return error.ProviderResponseInvalid;
+                    try self.tool_calls.items[index].arguments_json.writer.writeAll(input.string);
+                }
+            }
+            return;
         }
     }
 
@@ -1950,6 +2392,21 @@ const StreamChatAccumulator = struct {
         }
     }
 
+    fn startBedrockToolUse(self: *StreamChatAccumulator, index: usize, tool_use: std.json.Value) !void {
+        if (tool_use != .object) return error.ProviderResponseInvalid;
+        const call = try self.ensureToolCall(index);
+        call.seen = true;
+        try call.id.writer.writeAll(try requiredObjectString(tool_use, "toolUseId"));
+        try call.name.writer.writeAll(try requiredObjectString(tool_use, "name"));
+        if (tool_use.object.get("input")) |input| {
+            if (try shouldSerializeInitialToolInput(input)) {
+                const arguments_json = try jsonValueToOwnedString(self.allocator, input);
+                defer self.allocator.free(arguments_json);
+                try call.arguments_json.writer.writeAll(arguments_json);
+            }
+        }
+    }
+
     fn hasToolCallId(self: *StreamChatAccumulator, id: []const u8) bool {
         for (self.tool_calls.items) |*call| {
             if (std.mem.eql(u8, call.id.written(), id)) return true;
@@ -2057,6 +2514,12 @@ fn firstGoogleCandidateParts(value: std.json.Value) !?[]std.json.Value {
 fn anthropicEventIndex(value: std.json.Value) !usize {
     if (value != .object) return error.ProviderResponseInvalid;
     const index = value.object.get("index") orelse return error.ProviderResponseInvalid;
+    return streamToolCallIndex(index);
+}
+
+fn bedrockContentBlockIndex(value: std.json.Value) !usize {
+    if (value != .object) return error.ProviderResponseInvalid;
+    const index = value.object.get("contentBlockIndex") orelse return error.ProviderResponseInvalid;
     return streamToolCallIndex(index);
 }
 
@@ -2282,9 +2745,51 @@ fn writeJsonStringFragment(w: *std.Io.Writer, value: []const u8) !void {
     }
 }
 
+fn writeUriPathSegment(w: *std.Io.Writer, value: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (value) |byte| {
+        switch (byte) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => try w.writeByte(byte),
+            else => {
+                try w.writeByte('%');
+                try w.writeByte(hex[byte >> 4]);
+                try w.writeByte(hex[byte & 0x0f]);
+            },
+        }
+    }
+}
+
 fn stripTrailingCarriageReturn(value: []const u8) []const u8 {
     if (value.len > 0 and value[value.len - 1] == '\r') return value[0 .. value.len - 1];
     return value;
+}
+
+fn writeBedrockTestFrame(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    event_type: []const u8,
+    payload: []const u8,
+) !void {
+    var headers: std.Io.Writer.Allocating = .init(allocator);
+    defer headers.deinit();
+    try writeBedrockTestHeaderString(&headers.writer, ":message-type", "event");
+    try writeBedrockTestHeaderString(&headers.writer, ":event-type", event_type);
+    try writeBedrockTestHeaderString(&headers.writer, ":content-type", "application/json");
+    const total_len: u32 = @intCast(12 + headers.written().len + payload.len + 4);
+    try w.writeInt(u32, total_len, .big);
+    try w.writeInt(u32, @intCast(headers.written().len), .big);
+    try w.writeInt(u32, 0, .big);
+    try w.writeAll(headers.written());
+    try w.writeAll(payload);
+    try w.writeInt(u32, 0, .big);
+}
+
+fn writeBedrockTestHeaderString(w: *std.Io.Writer, name: []const u8, value: []const u8) !void {
+    try w.writeByte(@intCast(name.len));
+    try w.writeAll(name);
+    try w.writeByte(7);
+    try w.writeInt(u16, @intCast(value.len), .big);
+    try w.writeAll(value);
 }
 
 test "parses OpenAI-compatible chat completion text" {
@@ -2413,6 +2918,39 @@ test "serializes Mistral chat payload with images tools and tool results" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf ok\\\"}\"}}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tool_call_id\":\"call_1\",\"name\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"run shell\",\"parameters\":{\"type\":\"object\"},\"strict\":false}}]") != null);
+}
+
+test "serializes Bedrock converse payload with images tools and tool results" {
+    const parts = [_]ChatContentPart{
+        .{ .text = "inspect this" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const tool_calls = [_]ChatToolCall{
+        .{ .id = @constCast("call_1"), .name = @constCast("bash"), .arguments_json = @constCast("{\"command\":\"printf ok\"}") },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "be terse" },
+        .{ .role = .user, .content_parts = parts[0..] },
+        .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
+        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1" },
+    };
+    const tools = [_]ChatToolDefinition{
+        .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
+    };
+    const payload = try buildBedrockConversePayload(std.testing.allocator, .{
+        .provider = "amazon-bedrock",
+        .model = "anthropic.claude-test-v1:0",
+        .api_key = "bedrock-test",
+        .messages = messages[0..],
+        .tools = tools[0..],
+    });
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"system\":[{\"text\":\"be terse\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"image\":{\"format\":\"png\",\"source\":{\"bytes\":\"aGVsbG8=\"}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"toolUse\":{\"toolUseId\":\"call_1\",\"name\":\"bash\",\"input\":{\"command\":\"printf ok\"}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"toolResult\":{\"toolUseId\":\"call_1\",\"content\":[{\"text\":\"ok\"}],\"status\":\"success\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"toolConfig\":{\"tools\":[{\"toolSpec\":{\"name\":\"bash\",\"description\":\"run shell\",\"inputSchema\":{\"json\":{\"type\":\"object\"}}}}],\"toolChoice\":{\"auto\":{}}}") != null);
 }
 
 test "parses OpenAI-compatible tool calls" {
@@ -2587,6 +3125,37 @@ test "parses native Google SSE frames without done sentinel" {
     try std.testing.expectEqualStrings("native google", result.text.?);
 }
 
+test "parses native Bedrock event stream frames" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    var context = StreamResultContext{
+        .allocator = std.testing.allocator,
+        .accumulator = &accumulator,
+        .text_callback_context = null,
+        .text_callback = null,
+    };
+    var stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stream.deinit();
+    try writeBedrockTestFrame(std.testing.allocator, &stream.writer, "messageStart",
+        \\{"messageStart":{"role":"assistant"}}
+    );
+    try writeBedrockTestFrame(std.testing.allocator, &stream.writer, "contentBlockDelta",
+        \\{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"native "}}}
+    );
+    try writeBedrockTestFrame(std.testing.allocator, &stream.writer, "contentBlockDelta",
+        \\{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"text":"bedrock"}}}
+    );
+    try writeBedrockTestFrame(std.testing.allocator, &stream.writer, "messageStop",
+        \\{"messageStop":{"stopReason":"end_turn"}}
+    );
+
+    var reader = std.Io.Reader.fixed(stream.written());
+    try readBedrockEventStream(std.testing.allocator, &reader, &context, handleStreamResultData);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("native bedrock", result.text.?);
+}
+
 test "parses Mistral camelCase stream tool calls and content arrays" {
     var accumulator = StreamChatAccumulator.init(std.testing.allocator);
     errdefer accumulator.deinit();
@@ -2615,6 +3184,30 @@ test "parses Mistral camelCase stream tool calls and content arrays" {
     try std.testing.expectEqualStrings("call_mistral", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"command\":\"printf mistral-ok\"}", result.tool_calls[0].arguments_json);
+}
+
+test "assembles Bedrock tool use stream events" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"contentBlockStart":{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"call_bedrock","name":"bash"}}}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"command\":\"printf "}}}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"contentBlockDelta":{"contentBlockIndex":0,"delta":{"toolUse":{"input":"bedrock-ok\"}"}}}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"contentBlockStop":{"contentBlockIndex":0}}
+    , &accumulator, null, null);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.text == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_bedrock", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf bedrock-ok\"}", result.tool_calls[0].arguments_json);
 }
 
 test "assembles Anthropic tool use stream events" {
@@ -2722,4 +3315,14 @@ test "Mistral provider base URL appends chat completions endpoint once" {
     const endpoint_from_full = try mistralChatEndpointForProvider(std.testing.allocator, &env);
     defer std.testing.allocator.free(endpoint_from_full);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/chat/completions", endpoint_from_full);
+}
+
+test "Bedrock provider base URL appends encoded converse stream endpoint" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put("PI_ZIG_PROVIDER_BASE_URL", "http://127.0.0.1:43123/");
+    const endpoint = try bedrockConverseStreamEndpointForProvider(std.testing.allocator, &env, "anthropic.claude-test-v1:0");
+    defer std.testing.allocator.free(endpoint);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43123/model/anthropic.claude-test-v1%3A0/converse-stream", endpoint);
 }
