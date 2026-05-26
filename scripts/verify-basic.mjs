@@ -3074,6 +3074,7 @@ const rpcOutput = run(
     JSON.stringify({ id: 'state-2', type: 'get_state' }),
     JSON.stringify({ id: 'bash-long-1', type: 'bash', command: "node -e \"for (let i = 0; i < 2105; i++) console.log('rpc-bash-line-' + String(i).padStart(4, '0'))\"" }),
     JSON.stringify({ id: 'messages-after-long-bash', type: 'get_messages' }),
+    JSON.stringify({ id: 'abort-bash-1', type: 'abort_bash' }),
     ''
   ].join('\n'),
   { env: envWithoutAnthropicAuth({ PI_CODING_AGENT_DIR: rpcLocalAuthDir }) }
@@ -3139,6 +3140,10 @@ if (
 const rpcBashFullOutput = fs.readFileSync('zig-out/pi-zig-bash-full-output.log', 'utf8');
 if (!rpcBashFullOutput.includes('rpc-bash-line-0000') || !rpcBashFullOutput.includes('rpc-bash-line-2104')) {
   throw new Error('rpc long bash smoke did not persist complete full output');
+}
+const abortBashResponse = rpcResponses.find((response) => response.id === 'abort-bash-1');
+if (!abortBashResponse?.success || abortBashResponse?.command !== 'abort_bash') {
+  throw new Error('rpc abort_bash smoke did not return upstream-shaped success response');
 }
 const rpcTimeoutSessionFile = 'zig-out/pi-zig-rpc-bash-timeout-smoke.jsonl';
 fs.rmSync(rpcTimeoutSessionFile, { force: true });
