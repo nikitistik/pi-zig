@@ -54,6 +54,7 @@ const server = http.createServer((req, res) => {
     }
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     const user = [...body.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+    const userMessages = body.messages.filter((message) => message.role === 'user').map((message) => message.content);
     const system = body.messages.find((message) => message.role === 'system')?.content ?? '';
     const toolMessages = body.messages.filter((message) => message.role === 'tool');
     const hasTool = (name) => body.tools?.some((tool) => tool?.function?.name === name) ?? false;
@@ -332,6 +333,32 @@ const server = http.createServer((req, res) => {
           }
         }]
       }));
+      return;
+    }
+    if (userMessages.includes('rpc steer start')) {
+      const content = userMessages.includes('rpc steer two')
+        ? 'handled rpc steer two'
+        : userMessages.includes('rpc steer one')
+          ? 'handled rpc steer one'
+          : 'missing rpc steer';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
+    if (userMessages.includes('rpc follow start')) {
+      const content = userMessages.includes('rpc follow two')
+        ? 'batched rpc follow response'
+        : 'rpc follow base complete';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
       return;
     }
     if (user.includes('second rpc history')) {
@@ -2542,6 +2569,84 @@ try {
     rpcProviderHistoryMessages?.data?.messages?.filter((message) => message.role === 'assistant').length !== 2
   ) {
     throw new Error('rpc provider history smoke did not persist both user/assistant turns');
+  }
+
+  const rpcProviderQueueSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-queue-smoke.jsonl');
+  fs.rmSync(rpcProviderQueueSessionFile, { force: true });
+  const rpcProviderQueueOutput = run(
+    ['rpc', rpcProviderQueueSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-queue-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-queue-steer-mode', type: 'set_steering_mode', mode: 'one-at-a-time' }),
+      JSON.stringify({ id: 'rpc-queue-steer-one', type: 'steer', message: 'rpc steer one' }),
+      JSON.stringify({ id: 'rpc-queue-steer-two', type: 'steer', message: 'rpc steer two' }),
+      JSON.stringify({ id: 'rpc-queue-before', type: 'get_state' }),
+      JSON.stringify({ id: 'rpc-queue-prompt', type: 'prompt', message: 'rpc steer start' }),
+      JSON.stringify({ id: 'rpc-queue-after', type: 'get_state' }),
+      JSON.stringify({ id: 'rpc-queue-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderQueueResponses = rpcProviderQueueOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderQueueBefore = rpcProviderQueueResponses.find((response) => response.id === 'rpc-queue-before');
+  const rpcProviderQueuePrompt = rpcProviderQueueResponses.find((response) => response.id === 'rpc-queue-prompt');
+  const rpcProviderQueueAfter = rpcProviderQueueResponses.find((response) => response.id === 'rpc-queue-after');
+  const rpcProviderQueueMessages = rpcProviderQueueResponses.find((response) => response.id === 'rpc-queue-messages');
+  if (
+    rpcProviderQueueBefore?.data?.pendingMessageCount !== 2 ||
+    rpcProviderQueueBefore?.data?.pendingSteeringCount !== 2 ||
+    rpcProviderQueuePrompt?.data?.text !== 'handled rpc steer two' ||
+    rpcProviderQueueAfter?.data?.pendingMessageCount !== 0
+  ) {
+    throw new Error('rpc provider queue smoke did not drain one-at-a-time steering messages');
+  }
+  const rpcQueueUserTexts = rpcProviderQueueMessages?.data?.messages?.filter((message) => message.role === 'user').map((message) => message.content);
+  const rpcQueueAssistantTexts = rpcProviderQueueMessages?.data?.messages?.filter((message) => message.role === 'assistant').map((message) => message.content);
+  if (
+    JSON.stringify(rpcQueueUserTexts) !== JSON.stringify(['rpc steer start', 'rpc steer one', 'rpc steer two']) ||
+    JSON.stringify(rpcQueueAssistantTexts) !== JSON.stringify(['handled rpc steer one', 'handled rpc steer two'])
+  ) {
+    throw new Error('rpc provider queue smoke did not preserve queued steering message order');
+  }
+
+  const rpcProviderFollowSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-follow-queue-smoke.jsonl');
+  fs.rmSync(rpcProviderFollowSessionFile, { force: true });
+  const rpcProviderFollowOutput = run(
+    ['rpc', rpcProviderFollowSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-follow-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-follow-mode', type: 'set_follow_up_mode', mode: 'all' }),
+      JSON.stringify({ id: 'rpc-follow-one', type: 'follow_up', message: 'rpc follow one' }),
+      JSON.stringify({ id: 'rpc-follow-two', type: 'follow_up', message: 'rpc follow two' }),
+      JSON.stringify({ id: 'rpc-follow-before', type: 'get_state' }),
+      JSON.stringify({ id: 'rpc-follow-prompt', type: 'prompt', message: 'rpc follow start' }),
+      JSON.stringify({ id: 'rpc-follow-after', type: 'get_state' }),
+      JSON.stringify({ id: 'rpc-follow-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderFollowResponses = rpcProviderFollowOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderFollowBefore = rpcProviderFollowResponses.find((response) => response.id === 'rpc-follow-before');
+  const rpcProviderFollowPrompt = rpcProviderFollowResponses.find((response) => response.id === 'rpc-follow-prompt');
+  const rpcProviderFollowAfter = rpcProviderFollowResponses.find((response) => response.id === 'rpc-follow-after');
+  const rpcProviderFollowMessages = rpcProviderFollowResponses.find((response) => response.id === 'rpc-follow-messages');
+  if (
+    rpcProviderFollowBefore?.data?.pendingMessageCount !== 2 ||
+    rpcProviderFollowBefore?.data?.pendingFollowUpCount !== 2 ||
+    rpcProviderFollowPrompt?.data?.text !== 'batched rpc follow response' ||
+    rpcProviderFollowAfter?.data?.pendingMessageCount !== 0
+  ) {
+    throw new Error('rpc provider queue smoke did not drain all-mode follow-up messages');
+  }
+  const rpcFollowUserTexts = rpcProviderFollowMessages?.data?.messages?.filter((message) => message.role === 'user').map((message) => message.content);
+  const rpcFollowAssistantTexts = rpcProviderFollowMessages?.data?.messages?.filter((message) => message.role === 'assistant').map((message) => message.content);
+  if (
+    JSON.stringify(rpcFollowUserTexts) !== JSON.stringify(['rpc follow start', 'rpc follow one', 'rpc follow two']) ||
+    JSON.stringify(rpcFollowAssistantTexts) !== JSON.stringify(['rpc follow base complete', 'batched rpc follow response'])
+  ) {
+    throw new Error('rpc provider queue smoke did not preserve queued follow-up batch order');
   }
 
   const rpcProviderOutput = run(

@@ -17,6 +17,7 @@ const max_command_bytes = 4 * 1024;
 const max_session_name_bytes = 256;
 const max_session_file_bytes = 16 * 1024 * 1024;
 const max_session_path_bytes = std.Io.Dir.max_path_bytes;
+const max_pending_messages = 32;
 
 const StoredRole = enum {
     system,
@@ -88,6 +89,49 @@ const StoredMessage = struct {
     }
 };
 
+const PendingMessageQueue = struct {
+    count: usize = 0,
+    lengths: [max_pending_messages]usize = undefined,
+    messages: [max_pending_messages][max_message_bytes]u8 = undefined,
+
+    fn enqueue(self: *PendingMessageQueue, message: []const u8) !void {
+        if (message.len > max_message_bytes) return error.MessageTooLarge;
+        if (self.count >= max_pending_messages) return error.PendingMessageLimitReached;
+        self.lengths[self.count] = message.len;
+        @memcpy(self.messages[self.count][0..message.len], message);
+        self.count += 1;
+    }
+
+    fn clear(self: *PendingMessageQueue) void {
+        self.count = 0;
+    }
+
+    fn drainCount(self: *const PendingMessageQueue, mode: QueueMode) usize {
+        return switch (mode) {
+            .all => self.count,
+            .one_at_a_time => @min(self.count, 1),
+        };
+    }
+
+    fn at(self: *const PendingMessageQueue, index: usize) []const u8 {
+        return self.messages[index][0..self.lengths[index]];
+    }
+
+    fn dropPrefix(self: *PendingMessageQueue, prefix_count: usize) void {
+        if (prefix_count >= self.count) {
+            self.count = 0;
+            return;
+        }
+        const remaining = self.count - prefix_count;
+        for (0..remaining) |index| {
+            const source = index + prefix_count;
+            self.lengths[index] = self.lengths[source];
+            @memcpy(self.messages[index][0..self.lengths[source]], self.messages[source][0..self.lengths[source]]);
+        }
+        self.count = remaining;
+    }
+};
+
 const Runtime = struct {
     store: session.PersistentStore = .{},
     messages: [max_messages]StoredMessage = undefined,
@@ -100,6 +144,8 @@ const Runtime = struct {
     thinking_level: types.ThinkingLevel = .medium,
     steering_mode: QueueMode = .all,
     follow_up_mode: QueueMode = .one_at_a_time,
+    steering_queue: PendingMessageQueue = .{},
+    follow_up_queue: PendingMessageQueue = .{},
     auto_compaction_enabled: bool = false,
     auto_retry_enabled: bool = false,
     command_options: commands.Options = .{},
@@ -126,6 +172,8 @@ const Runtime = struct {
         self.has_session_name = false;
         self.selected_model = null;
         self.thinking_level = .medium;
+        self.steering_queue.clear();
+        self.follow_up_queue.clear();
         self.auto_compaction_enabled = false;
         self.auto_retry_enabled = false;
     }
@@ -475,12 +523,84 @@ const Runtime = struct {
         try w.writeAll("}}\n");
     }
 
+    fn runUserBatch(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        messages: []const []const u8,
+        last_result: *?agent.RunResult,
+    ) !void {
+        if (messages.len == 0) return;
+        for (messages) |message| {
+            try self.addMessage(io, allocator, .user, message);
+        }
+
+        const prompt = self.messages[self.message_count - 1].text();
+        const maybe_run_result = try self.runAgentIfAuthenticated(io, allocator, prompt);
+        var run_result = maybe_run_result orelse return;
+        errdefer run_result.deinit(allocator);
+
+        try self.addAgentResultMessages(io, allocator, run_result);
+        if (last_result.*) |previous| previous.deinit(allocator);
+        last_result.* = run_result;
+    }
+
+    fn drainQueueBatch(self: *Runtime, queue: *PendingMessageQueue, mode: QueueMode, batch: [][]const u8) usize {
+        _ = self;
+        const count = queue.drainCount(mode);
+        for (0..count) |index| {
+            batch[index] = queue.at(index);
+        }
+        return count;
+    }
+
+    fn drainQueuedMessages(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        last_result: *?agent.RunResult,
+    ) !void {
+        var batch: [max_pending_messages][]const u8 = undefined;
+        while (self.steering_queue.count > 0 or self.follow_up_queue.count > 0) {
+            if (self.steering_queue.count > 0) {
+                const count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, &batch);
+                try self.runUserBatch(io, allocator, batch[0..count], last_result);
+                self.steering_queue.dropPrefix(count);
+                continue;
+            }
+            const count = self.drainQueueBatch(&self.follow_up_queue, self.follow_up_mode, &batch);
+            try self.runUserBatch(io, allocator, batch[0..count], last_result);
+            self.follow_up_queue.dropPrefix(count);
+        }
+    }
+
     fn sessionName(self: *const Runtime) ?[]const u8 {
         if (!self.has_session_name) return null;
         return self.session_name[0..self.session_name_len];
     }
 
-    fn handlePromptLikeCommand(
+    fn enqueuePendingMessage(
+        self: *Runtime,
+        w: *std.Io.Writer,
+        id: ?[]const u8,
+        command: []const u8,
+        queue: *PendingMessageQueue,
+        message: []const u8,
+    ) !void {
+        queue.enqueue(message) catch |err| {
+            return writeError(w, id, command, @errorName(err));
+        };
+        try writeResponseHead(w, id, command, true);
+        try w.writeAll(",\"data\":{\"pendingMessageCount\":");
+        try w.print("{d}", .{self.steering_queue.count + self.follow_up_queue.count});
+        try w.writeAll(",\"steeringCount\":");
+        try w.print("{d}", .{self.steering_queue.count});
+        try w.writeAll(",\"followUpCount\":");
+        try w.print("{d}", .{self.follow_up_queue.count});
+        try w.writeAll("}}\n");
+    }
+
+    fn handlePromptCommand(
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
@@ -489,20 +609,23 @@ const Runtime = struct {
         command: []const u8,
         message: []const u8,
     ) !void {
-        self.addMessage(io, allocator, .user, message) catch |err| {
+        var last_result: ?agent.RunResult = null;
+        defer if (last_result) |result| result.deinit(allocator);
+
+        var initial_batch: [1 + max_pending_messages][]const u8 = undefined;
+        initial_batch[0] = message;
+        const steering_count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, initial_batch[1..]);
+        self.runUserBatch(io, allocator, initial_batch[0 .. 1 + steering_count], &last_result) catch |err| {
+            return writeError(w, id, command, @errorName(err));
+        };
+        self.steering_queue.dropPrefix(steering_count);
+
+        self.drainQueuedMessages(io, allocator, &last_result) catch |err| {
             return writeError(w, id, command, @errorName(err));
         };
 
-        const maybe_run_result = self.runAgentIfAuthenticated(io, allocator, message) catch |err| {
-            return writeError(w, id, command, @errorName(err));
-        };
-        const run_result = maybe_run_result orelse return writeSuccess(w, id, command);
-        defer run_result.deinit(allocator);
-
-        self.addAgentResultMessages(io, allocator, run_result) catch |err| {
-            return writeError(w, id, command, @errorName(err));
-        };
-        return self.writePromptAgentResult(w, id, command, run_result);
+        const result = last_result orelse return writeSuccess(w, id, command);
+        return self.writePromptAgentResult(w, id, command, result);
     }
 
     fn handleValue(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, value: std.json.Value) !void {
@@ -515,24 +638,26 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "prompt requires a string message");
             };
-            return self.handlePromptLikeCommand(io, allocator, w, id, command, message);
+            return self.handlePromptCommand(io, allocator, w, id, command, message);
         }
 
         if (std.mem.eql(u8, command, "steer")) {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "steer requires a string message");
             };
-            return self.handlePromptLikeCommand(io, allocator, w, id, command, message);
+            return self.enqueuePendingMessage(w, id, command, &self.steering_queue, message);
         }
 
         if (std.mem.eql(u8, command, "follow_up")) {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "follow_up requires a string message");
             };
-            return self.handlePromptLikeCommand(io, allocator, w, id, command, message);
+            return self.enqueuePendingMessage(w, id, command, &self.follow_up_queue, message);
         }
 
         if (std.mem.eql(u8, command, "abort")) {
+            self.steering_queue.clear();
+            self.follow_up_queue.clear();
             return writeSuccess(w, id, command);
         }
 
@@ -807,7 +932,12 @@ const Runtime = struct {
         try w.writeAll(if (self.auto_compaction_enabled) "true" else "false");
         try w.writeAll(",\"messageCount\":");
         try w.print("{d}", .{self.message_count});
-        try w.writeAll(",\"pendingMessageCount\":0");
+        try w.writeAll(",\"pendingMessageCount\":");
+        try w.print("{d}", .{self.steering_queue.count + self.follow_up_queue.count});
+        try w.writeAll(",\"pendingSteeringCount\":");
+        try w.print("{d}", .{self.steering_queue.count});
+        try w.writeAll(",\"pendingFollowUpCount\":");
+        try w.print("{d}", .{self.follow_up_queue.count});
         if (self.sessionName()) |name| {
             try w.writeAll(",\"sessionName\":");
             try writeJsonString(w, name);
