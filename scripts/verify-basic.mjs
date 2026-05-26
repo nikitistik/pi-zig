@@ -2984,6 +2984,37 @@ const rpcBashFullOutput = fs.readFileSync('zig-out/pi-zig-bash-full-output.log',
 if (!rpcBashFullOutput.includes('rpc-bash-line-0000') || !rpcBashFullOutput.includes('rpc-bash-line-2104')) {
   throw new Error('rpc long bash smoke did not persist complete full output');
 }
+const rpcTimeoutSessionFile = 'zig-out/pi-zig-rpc-bash-timeout-smoke.jsonl';
+fs.rmSync(rpcTimeoutSessionFile, { force: true });
+const rpcTimeoutOutput = run(
+  ['rpc', rpcTimeoutSessionFile],
+  [
+    JSON.stringify({ id: 'rpc-bash-timeout-1', type: 'bash', command: 'printf rpc-before-timeout; sleep 1; printf rpc-after-timeout', timeout: 0.1 }),
+    JSON.stringify({ id: 'rpc-bash-timeout-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { env: envWithoutAnthropicAuth() }
+);
+const rpcTimeoutResponses = rpcTimeoutOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcTimeoutResponse = rpcTimeoutResponses.find((response) => response.id === 'rpc-bash-timeout-1');
+if (
+  !rpcTimeoutResponse?.success ||
+  rpcTimeoutResponse?.data?.exitCode !== null ||
+  rpcTimeoutResponse?.data?.cancelled !== true ||
+  !rpcTimeoutResponse?.data?.output?.includes('rpc-before-timeout') ||
+  rpcTimeoutResponse?.data?.output?.includes('rpc-after-timeout') ||
+  !rpcTimeoutResponse?.data?.output?.includes('Command timed out after 0.100 seconds')
+) {
+  throw new Error('rpc bash timeout smoke did not return cancelled partial output');
+}
+const rpcTimeoutMessages = rpcTimeoutResponses.find((response) => response.id === 'rpc-bash-timeout-messages');
+if (
+  rpcTimeoutMessages?.data?.messages?.[0]?.role !== 'bashExecution' ||
+  rpcTimeoutMessages?.data?.messages?.[0]?.cancelled !== true ||
+  !rpcTimeoutMessages?.data?.messages?.[0]?.output?.includes('rpc-before-timeout')
+) {
+  throw new Error('rpc bash timeout smoke did not persist cancelled bashExecution message');
+}
 const compactResponse = rpcResponses.find((response) => response.id === 'compact-1');
 if (
   !compactResponse?.success ||

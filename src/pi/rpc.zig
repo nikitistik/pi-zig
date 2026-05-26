@@ -371,8 +371,8 @@ const Runtime = struct {
         self.message_count += 1;
     }
 
-    fn executeBash(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, shell_command: []const u8) !tools.ShellResult {
-        const result = try tools.runShellCapture(io, allocator, shell_command);
+    fn executeBash(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, shell_command: []const u8, timeout_ms: ?i64) !tools.ShellResult {
+        const result = try tools.runShellCaptureWithUpdates(io, allocator, shell_command, .{ .timeout_ms = timeout_ms });
         errdefer allocator.free(result.output);
         const entry_id = try self.store.appendBashExecution(io, allocator, shell_command, result);
         try self.addLoadedBash(entry_id, shell_command, result);
@@ -710,7 +710,10 @@ const Runtime = struct {
             const shell_command = getStringField(value, "command") orelse {
                 return writeError(w, id, command, "bash requires a string command");
             };
-            const result = self.executeBash(io, allocator, shell_command) catch |err| {
+            const timeout_ms = getOptionalTimeoutMillisecondsField(value, "timeout") catch {
+                return writeError(w, id, command, "bash timeout must be a non-negative finite number");
+            };
+            const result = self.executeBash(io, allocator, shell_command, timeout_ms) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             };
             defer allocator.free(result.output);
@@ -1158,6 +1161,26 @@ fn getOptionalUsizeField(value: std.json.Value, name: []const u8) ?usize {
         .float => |float| if (float >= 0 and @floor(float) == float) @intFromFloat(float) else null,
         else => null,
     };
+}
+
+fn getOptionalTimeoutMillisecondsField(value: std.json.Value, name: []const u8) !?i64 {
+    if (value != .object) return null;
+    const field = value.object.get(name) orelse return null;
+    const seconds: f64 = switch (field) {
+        .integer => |integer| blk: {
+            if (integer < 0) return error.InvalidTimeout;
+            break :blk @floatFromInt(integer);
+        },
+        .float => |float| blk: {
+            if (float < 0 or !std.math.isFinite(float)) return error.InvalidTimeout;
+            break :blk float;
+        },
+        else => return error.InvalidTimeout,
+    };
+    if (seconds <= 0) return null;
+    const milliseconds = @round(seconds * 1000.0);
+    if (milliseconds > @as(f64, @floatFromInt(std.math.maxInt(i64)))) return error.InvalidTimeout;
+    return @max(1, @as(i64, @intFromFloat(milliseconds)));
 }
 
 fn getStringFieldObject(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
