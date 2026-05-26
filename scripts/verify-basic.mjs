@@ -726,6 +726,61 @@ if (packageSelfUpdateFailure.status === 0 || !packageSelfUpdateFailure.stderr.in
   throw new Error('package self-update smoke did not fail visibly for the unimplemented self updater');
 }
 
+const authFixtureRoot = path.resolve('zig-out/pi-zig-auth-fixture');
+const authFixtureHome = path.join(authFixtureRoot, 'home');
+const authFixtureEnv = {
+  ...process.env,
+  HOME: authFixtureHome,
+  OPENAI_API_KEY: 'env-openai-key'
+};
+fs.rmSync(authFixtureRoot, { recursive: true, force: true });
+fs.mkdirSync(authFixtureHome, { recursive: true });
+const emptyAuthList = JSON.parse(run(['auth', 'list', '--json'], undefined, { env: authFixtureEnv }));
+if (emptyAuthList.providers.length !== 0) {
+  throw new Error('auth list smoke did not start with an empty auth store');
+}
+const authProviders = JSON.parse(run(['auth', 'providers', '--json'], undefined, { env: authFixtureEnv }));
+if (
+  !authProviders.providers.some((provider) => provider.id === 'anthropic') ||
+  !authProviders.providers.some((provider) => provider.id === 'github-copilot') ||
+  !authProviders.providers.some((provider) => provider.id === 'openai-codex')
+) {
+  throw new Error('auth providers smoke did not expose upstream built-in OAuth providers');
+}
+const envOpenAiStatus = JSON.parse(run(['auth', 'status', 'openai', '--json'], undefined, { env: authFixtureEnv }));
+if (envOpenAiStatus.hasAuth !== true || envOpenAiStatus.source !== 'environment' || envOpenAiStatus.label !== 'OPENAI_API_KEY') {
+  throw new Error('auth status smoke did not report provider environment fallback');
+}
+run(['auth', 'set-api-key', 'openai', '!printf command-openai-key'], undefined, { env: authFixtureEnv });
+const storedOpenAiStatus = JSON.parse(run(['auth', 'status', 'openai', '--json'], undefined, { env: authFixtureEnv }));
+if (storedOpenAiStatus.configured !== true || storedOpenAiStatus.source !== 'stored' || storedOpenAiStatus.type !== 'api_key') {
+  throw new Error('auth status smoke did not report stored API key credential');
+}
+const resolvedOpenAi = JSON.parse(run(['auth', 'resolve', 'openai', '--json'], undefined, { env: authFixtureEnv }));
+if (resolvedOpenAi.value !== 'command-openai-key') {
+  throw new Error('auth resolve smoke did not execute ! command API key');
+}
+run(['auth', 'set-api-key', 'groq', 'GROQ_API_KEY'], undefined, { env: { ...authFixtureEnv, GROQ_API_KEY: 'env-groq-key' } });
+const resolvedGroq = JSON.parse(run(['auth', 'resolve', 'groq', '--json'], undefined, { env: { ...authFixtureEnv, GROQ_API_KEY: 'env-groq-key' } }));
+if (resolvedGroq.value !== 'env-groq-key') {
+  throw new Error('auth resolve smoke did not resolve stored env-var API key');
+}
+run(['auth', 'set-oauth', 'openai-codex', 'oauth-access', 'oauth-refresh', '4102444800000'], undefined, { env: authFixtureEnv });
+const oauthOpenAiCodex = JSON.parse(run(['auth', 'resolve', 'openai-codex', '--json'], undefined, { env: authFixtureEnv }));
+if (oauthOpenAiCodex.value !== 'oauth-access') {
+  throw new Error('auth resolve smoke did not return unexpired OAuth access token');
+}
+run(['auth', 'set-oauth', 'anthropic', 'expired-access', 'expired-refresh', '1'], undefined, { env: authFixtureEnv });
+const expiredAnthropic = run(['auth', 'resolve', 'anthropic', '--json'], undefined, { env: authFixtureEnv });
+if (!expiredAnthropic.includes('"resolved":false') || !expiredAnthropic.includes('"value":null')) {
+  throw new Error('auth resolve smoke did not fail visibly for expired OAuth refresh gap');
+}
+run(['auth', 'remove', 'openai'], undefined, { env: authFixtureEnv });
+const postRemoveAuthStatus = JSON.parse(run(['auth', 'status', 'openai', '--json'], undefined, { env: authFixtureEnv }));
+if (postRemoveAuthStatus.source !== 'environment' || postRemoveAuthStatus.configured !== false) {
+  throw new Error('auth remove smoke did not remove stored credential and reveal env fallback');
+}
+
 const settingsFixtureRoot = path.resolve('zig-out/pi-zig-settings-fixture');
 const settingsFixtureHome = path.join(settingsFixtureRoot, 'home');
 const settingsFixtureProject = path.join(settingsFixtureRoot, 'project');

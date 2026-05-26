@@ -44,6 +44,11 @@ zig build run -- install --help
 zig build run -- install npm:example-package
 zig build run -- install git:github.com/user/repo --local
 zig build run -- update --extensions
+zig build run -- auth list --json
+zig build run -- auth providers --json
+zig build run -- auth status openai --json
+zig build run -- auth set-api-key openai OPENAI_API_KEY
+zig build run -- auth resolve openai --json
 zig build run -- settings --json
 zig build run -- settings paths
 zig build run -- settings get resolved.compaction.enabled
@@ -57,7 +62,7 @@ zig build run -- themes --resolved light
 zig build run -- context-files
 zig build run -- context-files --no-context-files
 zig build run -- system-prompt --date 2026-05-26 --json --no-context-files
-npm run test # includes settings-manager migration/write-safety, settings/package filters, local packages, context files, system prompt assembly, and ancestor .agents command discovery fixtures
+npm run test # includes auth storage, settings-manager migration/write-safety, settings/package filters, local packages, context files, system prompt assembly, and ancestor .agents command discovery fixtures
 printf '{"type":"get_state"}\n' | zig build run -- rpc zig-out/pi-zig-session.jsonl
 printf '{"type":"get_available_models"}\n{"type":"set_model","provider":"anthropic","modelId":"claude-haiku-4-5"}\n{"type":"get_state"}\n' | zig build run -- rpc zig-out/pi-zig-session.jsonl
 printf '{"type":"prompt","message":"hello"}\n{"type":"get_session_stats"}\n{"type":"export_html","outputPath":"zig-out/pi-zig-session.html"}\n' | zig build run -- rpc zig-out/pi-zig-session.jsonl
