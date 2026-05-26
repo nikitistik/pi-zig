@@ -30,6 +30,66 @@ const default_auto_retry_max_delay_ms = 60_000;
 const compaction_summary_prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const compaction_summary_suffix = "\n</summary>";
 
+const Mutex = struct {
+    state: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.state.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.state.unlock();
+    }
+};
+
+const RpcOutput = struct {
+    writer: *std.Io.Writer,
+    mutex: Mutex = .{},
+};
+
+const ActiveBashJob = struct {
+    runtime: *Runtime,
+    output: *RpcOutput,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    id: ?[]u8 = null,
+    command: []u8,
+    timeout_ms: ?i64 = null,
+    thread: ?std.Thread = null,
+    mutex: Mutex = .{},
+    cancel_requested: bool = false,
+    done: bool = false,
+
+    fn deinit(self: *ActiveBashJob) void {
+        if (self.id) |id| self.allocator.free(id);
+        self.allocator.free(self.command);
+    }
+
+    fn requestCancel(self: *ActiveBashJob) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cancel_requested = true;
+    }
+
+    fn shouldCancel(self: *ActiveBashJob) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.cancel_requested;
+    }
+
+    fn markDone(self: *ActiveBashJob) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.done = true;
+    }
+
+    fn isDone(self: *ActiveBashJob) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.done;
+    }
+};
+
 const StoredRole = enum {
     system,
     user,
@@ -221,6 +281,7 @@ const UserBatchMessage = struct {
 };
 
 const Runtime = struct {
+    mutex: Mutex = .{},
     store: session.PersistentStore = .{},
     messages: [max_messages]StoredMessage = undefined,
     message_count: usize = 0,
@@ -243,6 +304,7 @@ const Runtime = struct {
     last_retry_delay_ms: usize = 0,
     command_options: commands.Options = .{},
     env: ?*const std.process.Environ.Map = null,
+    active_bash: ?*ActiveBashJob = null,
 
     fn init(
         self: *Runtime,
@@ -576,21 +638,91 @@ const Runtime = struct {
         self.message_count += 1;
     }
 
-    fn executeBash(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, shell_command: []const u8, timeout_ms: ?i64) !tools.ShellResult {
+    fn captureBash(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        shell_command: []const u8,
+        timeout_ms: ?i64,
+        cancellation_context: ?*anyopaque,
+        should_cancel: ?tools.ShellCancellationCallback,
+    ) !tools.ShellResult {
         var shell_settings: settings.ShellSettings = .{};
         if (self.env) |env| shell_settings = try settings.loadShellSettings(io, allocator, env);
         defer shell_settings.deinit(allocator);
 
-        const result = try tools.runShellCaptureWithUpdates(io, allocator, shell_command, .{
+        return try tools.runShellCaptureWithUpdates(io, allocator, shell_command, .{
             .timeout_ms = timeout_ms,
+            .cancellation_context = cancellation_context,
+            .should_cancel = should_cancel,
             .shell_path = shell_settings.shell_path,
             .command_prefix = shell_settings.shell_command_prefix,
             .env = self.env,
         });
-        errdefer allocator.free(result.output);
+    }
+
+    fn recordBashResult(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, shell_command: []const u8, result: tools.ShellResult) !void {
         const entry_id = try self.store.appendBashExecution(io, allocator, shell_command, result);
         try self.addLoadedBash(entry_id, shell_command, result);
+    }
+
+    fn executeBash(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, shell_command: []const u8, timeout_ms: ?i64) !tools.ShellResult {
+        const result = try self.captureBash(io, allocator, shell_command, timeout_ms, null, null);
+        errdefer allocator.free(result.output);
+        try self.recordBashResult(io, allocator, shell_command, result);
         return result;
+    }
+
+    fn startBashAsync(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        output: *RpcOutput,
+        id: ?[]const u8,
+        shell_command: []const u8,
+        timeout_ms: ?i64,
+    ) !void {
+        self.collectActiveBash(allocator, false);
+        if (self.active_bash != null) return error.BashAlreadyRunning;
+
+        var owned_id = if (id) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (owned_id) |value| allocator.free(value);
+        var owned_command: ?[]u8 = try allocator.dupe(u8, shell_command);
+        errdefer if (owned_command) |value| allocator.free(value);
+
+        var job = try allocator.create(ActiveBashJob);
+        errdefer allocator.destroy(job);
+        job.* = .{
+            .runtime = self,
+            .output = output,
+            .io = io,
+            .allocator = allocator,
+            .id = owned_id,
+            .command = owned_command.?,
+            .timeout_ms = timeout_ms,
+        };
+        owned_id = null;
+        owned_command = null;
+        errdefer job.deinit();
+
+        const thread = try std.Thread.spawn(.{}, bashThreadMain, .{job});
+        job.thread = thread;
+        self.active_bash = job;
+    }
+
+    fn cancelActiveBash(self: *Runtime) bool {
+        const job = self.active_bash orelse return false;
+        job.requestCancel();
+        return true;
+    }
+
+    fn collectActiveBash(self: *Runtime, allocator: std.mem.Allocator, wait: bool) void {
+        const job = self.active_bash orelse return;
+        if (!wait and !job.isDone()) return;
+        if (job.thread) |thread| thread.join();
+        self.active_bash = null;
+        job.deinit();
+        allocator.destroy(job);
     }
 
     fn setSessionNameMemory(self: *Runtime, name: []const u8) !void {
@@ -1121,7 +1253,8 @@ const Runtime = struct {
         return self.writePromptAgentResult(w, id, command, result);
     }
 
-    fn handleValue(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, value: std.json.Value) !void {
+    fn handleValue(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, output: *RpcOutput, value: std.json.Value) !void {
+        const w = output.writer;
         const id = getStringField(value, "id");
         const command = getStringField(value, "type") orelse {
             return writeError(w, id, "unknown", "missing string command type");
@@ -1173,18 +1306,14 @@ const Runtime = struct {
             const timeout_ms = getOptionalTimeoutMillisecondsField(value, "timeout") catch {
                 return writeError(w, id, command, "bash timeout must be a non-negative finite number");
             };
-            const result = self.executeBash(io, allocator, shell_command, timeout_ms) catch |err| {
+            self.startBashAsync(io, allocator, output, id, shell_command, timeout_ms) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             };
-            defer allocator.free(result.output);
-            try writeResponseHead(w, id, command, true);
-            try w.writeAll(",\"data\":");
-            try writeBashResultJson(w, result);
-            try w.writeAll("}\n");
             return;
         }
 
         if (std.mem.eql(u8, command, "abort_bash")) {
+            _ = self.cancelActiveBash();
             return writeSuccess(w, id, command);
         }
 
@@ -1625,6 +1754,62 @@ const Runtime = struct {
     }
 };
 
+fn bashThreadMain(job: *ActiveBashJob) void {
+    const result = job.runtime.captureBash(
+        job.io,
+        job.allocator,
+        job.command,
+        job.timeout_ms,
+        job,
+        shouldCancelActiveBash,
+    ) catch |err| {
+        job.runtime.mutex.lock();
+        defer job.runtime.mutex.unlock();
+        job.output.mutex.lock();
+        defer job.output.mutex.unlock();
+        writeError(job.output.writer, job.id, "bash", @errorName(err)) catch {};
+        job.output.writer.flush() catch {};
+        job.markDone();
+        return;
+    };
+    defer job.allocator.free(result.output);
+
+    job.runtime.mutex.lock();
+    defer job.runtime.mutex.unlock();
+    job.output.mutex.lock();
+    defer job.output.mutex.unlock();
+
+    job.runtime.recordBashResult(job.io, job.allocator, job.command, result) catch |err| {
+        writeError(job.output.writer, job.id, "bash", @errorName(err)) catch {};
+        job.output.writer.flush() catch {};
+        job.markDone();
+        return;
+    };
+    writeResponseHead(job.output.writer, job.id, "bash", true) catch {
+        job.markDone();
+        return;
+    };
+    job.output.writer.writeAll(",\"data\":") catch {
+        job.markDone();
+        return;
+    };
+    writeBashResultJson(job.output.writer, result) catch {
+        job.markDone();
+        return;
+    };
+    job.output.writer.writeAll("}\n") catch {
+        job.markDone();
+        return;
+    };
+    job.output.writer.flush() catch {};
+    job.markDone();
+}
+
+fn shouldCancelActiveBash(ctx: *anyopaque) bool {
+    const job: *ActiveBashJob = @ptrCast(@alignCast(ctx));
+    return job.shouldCancel();
+}
+
 pub fn run(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1635,6 +1820,7 @@ pub fn run(
     var runtime: Runtime = .{};
     try runtime.init(io, allocator, env, session_file, command_options);
     defer runtime.deinit(allocator);
+    defer runtime.collectActiveBash(allocator, true);
 
     var in_buf: [16 * 1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &in_buf);
@@ -1644,9 +1830,12 @@ pub fn run(
     var stdout_writer = std.Io.File.stdout().writer(io, &out_buf);
     const w = &stdout_writer.interface;
     defer w.flush() catch {};
+    var output = RpcOutput{ .writer = w };
 
     while (true) {
         const raw_line = r.takeDelimiter('\n') catch |err| {
+            output.mutex.lock();
+            defer output.mutex.unlock();
             try writeError(w, null, "parse", @errorName(err));
             try w.flush();
             return err;
@@ -1656,15 +1845,33 @@ pub fn run(
         if (std.mem.trim(u8, line, " \t").len == 0) continue;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| {
+            output.mutex.lock();
+            defer output.mutex.unlock();
             try writeError(w, null, "parse", @errorName(err));
             try w.flush();
             continue;
         };
         defer parsed.deinit();
 
-        try runtime.handleValue(io, allocator, w, parsed.value);
-        try w.flush();
+        if (!isAbortBashCommand(parsed.value)) runtime.collectActiveBash(allocator, true);
+
+        {
+            runtime.mutex.lock();
+            defer runtime.mutex.unlock();
+            output.mutex.lock();
+            defer output.mutex.unlock();
+            try runtime.handleValue(io, allocator, &output, parsed.value);
+            try w.flush();
+        }
+        runtime.collectActiveBash(allocator, false);
     }
+
+    runtime.collectActiveBash(allocator, true);
+}
+
+fn isAbortBashCommand(value: std.json.Value) bool {
+    const command = getStringField(value, "type") orelse return false;
+    return std.mem.eql(u8, command, "abort_bash");
 }
 
 fn getStringField(value: std.json.Value, name: []const u8) ?[]const u8 {

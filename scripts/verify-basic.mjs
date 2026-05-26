@@ -3726,6 +3726,39 @@ const abortBashResponse = rpcResponses.find((response) => response.id === 'abort
 if (!abortBashResponse?.success || abortBashResponse?.command !== 'abort_bash') {
   throw new Error('rpc abort_bash smoke did not return upstream-shaped success response');
 }
+const rpcAbortBashSessionFile = 'zig-out/pi-zig-rpc-bash-abort-smoke.jsonl';
+fs.rmSync(rpcAbortBashSessionFile, { force: true });
+const rpcAbortBashOutput = run(
+  ['rpc', rpcAbortBashSessionFile],
+  [
+    JSON.stringify({ id: 'rpc-bash-abort-running', type: 'bash', command: 'sleep 2; printf rpc-after-abort' }),
+    JSON.stringify({ id: 'rpc-bash-abort-command', type: 'abort_bash' }),
+    JSON.stringify({ id: 'rpc-bash-abort-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { env: envWithoutAnthropicAuth() }
+);
+const rpcAbortBashResponses = rpcAbortBashOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcAbortBashCommand = rpcAbortBashResponses.find((response) => response.id === 'rpc-bash-abort-command');
+const rpcAbortBashRun = rpcAbortBashResponses.find((response) => response.id === 'rpc-bash-abort-running');
+if (
+  !rpcAbortBashCommand?.success ||
+  !rpcAbortBashRun?.success ||
+  rpcAbortBashRun?.data?.exitCode !== null ||
+  rpcAbortBashRun?.data?.cancelled !== true ||
+  rpcAbortBashRun?.data?.output?.includes('rpc-after-abort') ||
+  !rpcAbortBashRun?.data?.output?.includes('Command cancelled')
+) {
+  throw new Error('rpc abort_bash smoke did not cancel a running bash command');
+}
+const rpcAbortBashMessages = rpcAbortBashResponses.find((response) => response.id === 'rpc-bash-abort-messages');
+if (
+  rpcAbortBashMessages?.data?.messages?.[0]?.role !== 'bashExecution' ||
+  rpcAbortBashMessages?.data?.messages?.[0]?.cancelled !== true ||
+  rpcAbortBashMessages?.data?.messages?.[0]?.output?.includes('rpc-after-abort')
+) {
+  throw new Error('rpc abort_bash smoke did not persist the cancelled bashExecution message');
+}
 const rpcTimeoutSessionFile = 'zig-out/pi-zig-rpc-bash-timeout-smoke.jsonl';
 fs.rmSync(rpcTimeoutSessionFile, { force: true });
 const rpcTimeoutOutput = run(
