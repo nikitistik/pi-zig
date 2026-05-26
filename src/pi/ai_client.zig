@@ -29,11 +29,13 @@ pub const ChatToolCall = struct {
     id: []u8,
     name: []u8,
     arguments_json: []u8,
+    thought_signature: ?[]u8 = null,
 
     pub fn deinit(self: ChatToolCall, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
         allocator.free(self.arguments_json);
+        if (self.thought_signature) |signature| allocator.free(signature);
     }
 };
 
@@ -1488,7 +1490,12 @@ fn writeGoogleFunctionCallPart(w: *std.Io.Writer, call: ChatToolCall) !void {
     } else {
         try w.writeAll(call.arguments_json);
     }
-    try w.writeAll("}}");
+    try w.writeByte('}');
+    if (call.thought_signature) |signature| {
+        try w.writeAll(",\"thoughtSignature\":");
+        try writeJsonString(w, signature);
+    }
+    try w.writeByte('}');
 }
 
 fn writeGoogleToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void {
@@ -1961,7 +1968,7 @@ fn parseGoogleGenerateContentResult(allocator: std.mem.Allocator, body: []const 
         if (part != .object) return error.ProviderResponseInvalid;
         if (part.object.get("text")) |text_value| {
             if (text_value != .string) return error.ProviderResponseInvalid;
-            try text.writer.writeAll(text_value.string);
+            if (!isGoogleThinkingPart(part)) try text.writer.writeAll(text_value.string);
         }
         if (part.object.get("functionCall")) |function_call| {
             if (function_call != .object) return error.ProviderResponseInvalid;
@@ -1978,14 +1985,21 @@ fn parseGoogleGenerateContentResult(allocator: std.mem.Allocator, body: []const 
             else
                 try allocator.dupe(u8, "{}");
             errdefer if (arguments_json) |value| allocator.free(value);
+            var thought_signature: ?[]u8 = if (try optionalObjectString(part, "thoughtSignature")) |signature|
+                try allocator.dupe(u8, signature)
+            else
+                null;
+            errdefer if (thought_signature) |value| allocator.free(value);
             try calls.append(allocator, .{
                 .id = id.?,
                 .name = name_copy.?,
                 .arguments_json = arguments_json.?,
+                .thought_signature = thought_signature,
             });
             id = null;
             name_copy = null;
             arguments_json = null;
+            thought_signature = null;
         }
     }
 
@@ -2127,7 +2141,7 @@ fn parseGoogleStreamTextDeltas(
         if (part != .object) return error.ProviderResponseInvalid;
         if (part.object.get("text")) |text| {
             if (text != .string) return error.ProviderResponseInvalid;
-            if (text.string.len > 0) try callback(callback_context, text.string);
+            if (!isGoogleThinkingPart(part) and text.string.len > 0) try callback(callback_context, text.string);
         }
     }
 }
@@ -2219,6 +2233,7 @@ const StreamToolCallAccumulator = struct {
     id: std.Io.Writer.Allocating,
     name: std.Io.Writer.Allocating,
     arguments_json: std.Io.Writer.Allocating,
+    thought_signature: std.Io.Writer.Allocating,
     seen: bool = false,
 
     fn init(allocator: std.mem.Allocator) StreamToolCallAccumulator {
@@ -2226,6 +2241,7 @@ const StreamToolCallAccumulator = struct {
             .id = .init(allocator),
             .name = .init(allocator),
             .arguments_json = .init(allocator),
+            .thought_signature = .init(allocator),
         };
     }
 
@@ -2233,6 +2249,7 @@ const StreamToolCallAccumulator = struct {
         self.id.deinit();
         self.name.deinit();
         self.arguments_json.deinit();
+        self.thought_signature.deinit();
     }
 
     fn replaceArguments(self: *StreamToolCallAccumulator, allocator: std.mem.Allocator, arguments_json: []const u8) !void {
@@ -2362,10 +2379,10 @@ const StreamChatAccumulator = struct {
             if (part != .object) return error.ProviderResponseInvalid;
             if (part.object.get("text")) |text| {
                 if (text != .string) return error.ProviderResponseInvalid;
-                try self.appendTextDelta(text.string, text_callback_context, text_callback);
+                if (!isGoogleThinkingPart(part)) try self.appendTextDelta(text.string, text_callback_context, text_callback);
             }
             if (part.object.get("functionCall")) |function_call| {
-                try self.appendGoogleFunctionCall(function_call);
+                try self.appendGoogleFunctionCall(function_call, try optionalObjectString(part, "thoughtSignature"));
             }
         }
     }
@@ -2587,7 +2604,11 @@ const StreamChatAccumulator = struct {
         }
     }
 
-    fn appendGoogleFunctionCall(self: *StreamChatAccumulator, function_call: std.json.Value) !void {
+    fn appendGoogleFunctionCall(
+        self: *StreamChatAccumulator,
+        function_call: std.json.Value,
+        thought_signature: ?[]const u8,
+    ) !void {
         if (function_call != .object) return error.ProviderResponseInvalid;
         const index = self.tool_calls.items.len;
         const call = try self.ensureToolCall(index);
@@ -2617,6 +2638,11 @@ const StreamChatAccumulator = struct {
             }
         } else {
             try call.arguments_json.writer.writeAll("{}");
+        }
+        if (thought_signature) |signature| {
+            if (signature.len > 0 and call.thought_signature.written().len == 0) {
+                try call.thought_signature.writer.writeAll(signature);
+            }
         }
     }
 
@@ -2683,14 +2709,22 @@ const StreamChatAccumulator = struct {
                 var arguments_json: ?[]u8 = try call.arguments_json.toOwnedSlice();
                 call.arguments_json = .init(self.allocator);
                 errdefer if (arguments_json) |value| self.allocator.free(value);
+                var thought_signature: ?[]u8 = if (call.thought_signature.written().len > 0)
+                    try call.thought_signature.toOwnedSlice()
+                else
+                    null;
+                if (thought_signature != null) call.thought_signature = .init(self.allocator);
+                errdefer if (thought_signature) |value| self.allocator.free(value);
                 calls[len] = .{
                     .id = id.?,
                     .name = name.?,
                     .arguments_json = arguments_json.?,
+                    .thought_signature = thought_signature,
                 };
                 id = null;
                 name = null;
                 arguments_json = null;
+                thought_signature = null;
                 len += 1;
             }
             result.tool_calls = calls;
@@ -2737,6 +2771,12 @@ fn firstGoogleCandidateParts(value: std.json.Value) !?[]std.json.Value {
     const parts = content.object.get("parts") orelse return null;
     if (parts != .array) return error.ProviderResponseInvalid;
     return parts.array.items;
+}
+
+fn isGoogleThinkingPart(part: std.json.Value) bool {
+    if (part != .object) return false;
+    const thought = part.object.get("thought") orelse return false;
+    return thought == .bool and thought.bool;
 }
 
 fn anthropicEventIndex(value: std.json.Value) !usize {
@@ -3097,7 +3137,12 @@ test "serializes Google generate content payload with images tools and tool resu
         .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
     };
     const tool_calls = [_]ChatToolCall{
-        .{ .id = @constCast("call_1"), .name = @constCast("bash"), .arguments_json = @constCast("{\"command\":\"printf ok\"}") },
+        .{
+            .id = @constCast("call_1"),
+            .name = @constCast("bash"),
+            .arguments_json = @constCast("{\"command\":\"printf ok\"}"),
+            .thought_signature = @constCast("dGhvdWdodC1zaWduYXR1cmU="),
+        },
     };
     const messages = [_]ChatMessage{
         .{ .role = .system, .content = "be terse" },
@@ -3119,7 +3164,8 @@ test "serializes Google generate content payload with images tools and tool resu
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"systemInstruction\":{\"parts\":[{\"text\":\"be terse\"}]}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"aGVsbG8=\"}}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"functionCall\":{\"name\":\"bash\",\"args\":{\"command\":\"printf ok\"}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"functionCall\":{\"name\":\"bash\",\"args\":{\"command\":\"printf ok\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"thoughtSignature\":\"dGhvdWdodC1zaWduYXR1cmU=\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"functionResponse\":{\"name\":\"bash\",\"response\":{\"output\":\"ok\"}}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"functionDeclarations\":[{\"name\":\"bash\",\"description\":\"run shell\",\"parametersJsonSchema\":{\"type\":\"object\"}}]}]") != null);
 }
@@ -3317,6 +3363,20 @@ test "parses Google generate content result text and function call" {
     try std.testing.expectEqualStrings("{\"command\":\"printf ok\"}", result.tool_calls[0].arguments_json);
 }
 
+test "parses Google thought signatures without exposing thinking text" {
+    const body =
+        \\{"candidates":[{"content":{"parts":[{"text":"hidden thought","thought":true,"thoughtSignature":"aGlkZGVuLXNpZw=="},{"text":"visible "},{"functionCall":{"id":"call_1","name":"bash","args":{"command":"printf ok"}},"thoughtSignature":"ZnVuY3Rpb24tc2ln"}]},"finishReason":"STOP"}]}
+    ;
+    const result = try parseGoogleGenerateContentResult(std.testing.allocator, body);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("visible ", result.text.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf ok\"}", result.tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("ZnVuY3Rpb24tc2ln", result.tool_calls[0].thought_signature.?);
+}
+
 test "parses native Anthropic SSE frames without done sentinel" {
     var accumulator = StreamChatAccumulator.init(std.testing.allocator);
     errdefer accumulator.deinit();
@@ -3476,7 +3536,7 @@ test "assembles Google text stream chunks" {
     var accumulator = StreamChatAccumulator.init(std.testing.allocator);
     errdefer accumulator.deinit();
     try parseOpenAICompatibleStreamResultData(std.testing.allocator,
-        \\{"candidates":[{"content":{"parts":[{"text":"google "}]}}]}
+        \\{"candidates":[{"content":{"parts":[{"text":"hidden","thought":true},{"text":"google "}]}}]}
     , &accumulator, null, null);
     try parseOpenAICompatibleStreamResultData(std.testing.allocator,
         \\{"candidates":[{"content":{"parts":[{"text":"text"}]},"finishReason":"STOP"}]}
@@ -3491,7 +3551,7 @@ test "assembles Google function call stream chunks" {
     var accumulator = StreamChatAccumulator.init(std.testing.allocator);
     errdefer accumulator.deinit();
     try parseOpenAICompatibleStreamResultData(std.testing.allocator,
-        \\{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_google","name":"bash","args":{"command":"printf google-ok"}}}]},"finishReason":"STOP"}]}
+        \\{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_google","name":"bash","args":{"command":"printf google-ok"}},"thoughtSignature":"Z29vZ2xlLXNpZw=="}]},"finishReason":"STOP"}]}
     , &accumulator, null, null);
     const result = try accumulator.toResult();
     defer result.deinit(std.testing.allocator);
@@ -3500,6 +3560,7 @@ test "assembles Google function call stream chunks" {
     try std.testing.expectEqualStrings("call_google", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"command\":\"printf google-ok\"}", result.tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("Z29vZ2xlLXNpZw==", result.tool_calls[0].thought_signature.?);
 }
 
 test "provider base URL appends chat completions endpoint" {

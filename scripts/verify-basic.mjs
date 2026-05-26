@@ -181,8 +181,14 @@ const server = http.createServer((req, res) => {
         }
         if (functionResponses.length === 0) {
           writeVertexEvents([
-            { candidates: [{ content: { parts: [{ functionCall: { id: 'call_native_vertex_stream_1', name: 'bash', args: { command: 'printf native-vertex-ok' } } }] }, finishReason: 'STOP' }] }
+            { candidates: [{ content: { parts: [{ text: 'vertex private thought', thought: true }, { functionCall: { id: 'call_native_vertex_stream_1', name: 'bash', args: { command: 'printf native-vertex-ok' } }, thoughtSignature: 'dmVydGV4LXNpZw==' }] }, finishReason: 'STOP' }] }
           ]);
+          return;
+        }
+        const assistantFunctionCalls = body.contents?.flatMap((content) => Array.isArray(content.parts) ? content.parts.filter((part) => part?.functionCall) : []) ?? [];
+        if (!assistantFunctionCalls.some((part) => part.functionCall?.name === 'bash' && part.thoughtSignature === 'dmVydGV4LXNpZw==')) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native Vertex thought signature was not replayed', contents: body.contents }));
           return;
         }
         const lastResponse = functionResponses.at(-1)?.functionResponse;
@@ -237,8 +243,14 @@ const server = http.createServer((req, res) => {
         }
         if (functionResponses.length === 0) {
           writeGoogleEvents([
-            { candidates: [{ content: { parts: [{ functionCall: { id: 'call_native_google_stream_1', name: 'bash', args: { command: 'printf native-google-ok' } } }] }, finishReason: 'STOP' }] }
+            { candidates: [{ content: { parts: [{ text: 'google private thought', thought: true }, { functionCall: { id: 'call_native_google_stream_1', name: 'bash', args: { command: 'printf native-google-ok' } }, thoughtSignature: 'Z29vZ2xlLXNpZw==' }] }, finishReason: 'STOP' }] }
           ]);
+          return;
+        }
+        const assistantFunctionCalls = body.contents?.flatMap((content) => Array.isArray(content.parts) ? content.parts.filter((part) => part?.functionCall) : []) ?? [];
+        if (!assistantFunctionCalls.some((part) => part.functionCall?.name === 'bash' && part.thoughtSignature === 'Z29vZ2xlLXNpZw==')) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native Google thought signature was not replayed', contents: body.contents }));
           return;
         }
         const lastResponse = functionResponses.at(-1)?.functionResponse;

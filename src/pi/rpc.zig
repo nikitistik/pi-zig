@@ -22,6 +22,7 @@ const max_tool_calls_per_message = 16;
 const max_tool_call_id_bytes = 128;
 const max_tool_name_bytes = 64;
 const max_tool_arguments_bytes = 4 * 1024;
+const max_tool_thought_signature_bytes = 2 * 1024;
 const max_compaction_kept_id_bytes = 32;
 const max_pending_messages = 32;
 const max_auto_retry_attempts = 3;
@@ -144,6 +145,8 @@ const StoredToolCall = struct {
     name: [max_tool_name_bytes]u8 = undefined,
     arguments_json_len: usize = 0,
     arguments_json: [max_tool_arguments_bytes]u8 = undefined,
+    thought_signature_len: usize = 0,
+    thought_signature: [max_tool_thought_signature_bytes]u8 = undefined,
 
     fn idText(self: *const StoredToolCall) []const u8 {
         return self.id[0..self.id_len];
@@ -155,6 +158,11 @@ const StoredToolCall = struct {
 
     fn argumentsJson(self: *const StoredToolCall) []const u8 {
         return self.arguments_json[0..self.arguments_json_len];
+    }
+
+    fn thoughtSignature(self: *const StoredToolCall) ?[]const u8 {
+        if (self.thought_signature_len == 0) return null;
+        return self.thought_signature[0..self.thought_signature_len];
     }
 };
 
@@ -403,6 +411,7 @@ const Runtime = struct {
                                 .id = @constCast(call.idText()),
                                 .name = @constCast(call.nameText()),
                                 .arguments_json = @constCast(call.argumentsJson()),
+                                .thought_signature = if (call.thoughtSignature()) |signature| @constCast(signature) else null,
                             };
                         }
                         _ = try new_store.appendAssistantToolCallMessage(io, allocator, message.text(), calls[0..message.tool_calls_count]);
@@ -998,6 +1007,7 @@ const Runtime = struct {
                     .id = try allocator.dupe(u8, call.idText()),
                     .name = try allocator.dupe(u8, call.nameText()),
                     .arguments_json = try allocator.dupe(u8, call.argumentsJson()),
+                    .thought_signature = if (call.thoughtSignature()) |signature| try allocator.dupe(u8, signature) else null,
                 };
                 copied += 1;
             }
@@ -1097,6 +1107,10 @@ const Runtime = struct {
             try copyBounded(&slot.tool_calls[index].id, &slot.tool_calls[index].id_len, call.id);
             try copyBounded(&slot.tool_calls[index].name, &slot.tool_calls[index].name_len, call.name);
             try copyBounded(&slot.tool_calls[index].arguments_json, &slot.tool_calls[index].arguments_json_len, call.arguments_json);
+            slot.tool_calls[index].thought_signature_len = 0;
+            if (call.thought_signature) |signature| {
+                try copyBounded(&slot.tool_calls[index].thought_signature, &slot.tool_calls[index].thought_signature_len, signature);
+            }
         }
         slot.tool_calls_count = tool_calls.len;
     }
@@ -1675,6 +1689,10 @@ const Runtime = struct {
                     try writeJsonString(w, call.nameText());
                     try w.writeAll(",\"argumentsJson\":");
                     try writeJsonString(w, call.argumentsJson());
+                    if (call.thoughtSignature()) |signature| {
+                        try w.writeAll(",\"thoughtSignature\":");
+                        try writeJsonString(w, signature);
+                    }
                     try w.writeByte('}');
                 }
                 try w.writeByte(']');
@@ -2312,6 +2330,10 @@ fn copyToolCallsFromMessage(object: std.json.ObjectMap, message: *StoredMessage)
         try copyBounded(&target.id, &target.id_len, id);
         try copyBounded(&target.name, &target.name_len, name);
         try copyBounded(&target.arguments_json, &target.arguments_json_len, arguments_json);
+        target.thought_signature_len = 0;
+        if (getStringFieldObject(item.object, "thoughtSignature")) |signature| {
+            try copyBounded(&target.thought_signature, &target.thought_signature_len, signature);
+        }
         message.tool_calls_count += 1;
     }
 }

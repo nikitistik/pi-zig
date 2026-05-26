@@ -512,6 +512,7 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai_client.Ch
             .id = try allocator.dupe(u8, call.id),
             .name = try allocator.dupe(u8, call.name),
             .arguments_json = try allocator.dupe(u8, call.arguments_json),
+            .thought_signature = if (call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
         };
         len += 1;
     }

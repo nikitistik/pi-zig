@@ -337,6 +337,10 @@ pub const PersistentStore = struct {
             try writeJsonString(w, call.name);
             try w.writeAll(",\"argumentsJson\":");
             try writeJsonString(w, call.arguments_json);
+            if (call.thought_signature) |signature| {
+                try w.writeAll(",\"thoughtSignature\":");
+                try writeJsonString(w, signature);
+            }
             if (std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{})) |parsed_arguments| {
                 defer parsed_arguments.deinit();
                 try w.writeAll(",\"arguments\":");
