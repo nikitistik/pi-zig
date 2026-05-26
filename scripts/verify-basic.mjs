@@ -4973,6 +4973,12 @@ try {
     const exposedAssistant = messagesResponse?.data?.messages
       ?.filter((message) => message.role === 'assistant')
       ?.at(-1);
+    const abortLifecycle = lines
+      .filter((line) => ['message_start', 'message_end', 'turn_end', 'agent_end'].includes(line.type))
+      .map((line) => {
+        if (line.type === 'agent_end') return `agent_end:${line.messages?.[0]?.stopReason}`;
+        return `${line.type}:${line.message?.stopReason}`;
+      });
 
     if (
       !abortResponse?.success ||
@@ -4982,6 +4988,12 @@ try {
       exposedAssistant?.errorMessage !== 'Request was aborted' ||
       persistedAssistant?.stopReason !== 'aborted' ||
       persistedAssistant?.errorMessage !== 'Request was aborted' ||
+      JSON.stringify(abortLifecycle) !== JSON.stringify([
+        'message_start:aborted',
+        'message_end:aborted',
+        'turn_end:aborted',
+        'agent_end:aborted'
+      ]) ||
       stdout.includes('rpc provider abort unexpectedly completed')
     ) {
       throw new Error(`rpc provider abort in-flight smoke did not cancel the active prompt\nstdout:\n${stdout}\nstderr:\n${stderr}`);
