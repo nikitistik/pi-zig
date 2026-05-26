@@ -27,9 +27,27 @@ pub const ShellUpdate = struct {
     output: []const u8,
     truncated: bool = false,
     full_output_path: ?[]const u8 = null,
+    truncation: ?ShellTruncationDetails = null,
 };
 
 pub const ShellUpdateCallback = *const fn (ctx: *anyopaque, update: ShellUpdate) anyerror!void;
+
+pub const ShellTruncatedBy = enum {
+    lines,
+    bytes,
+};
+
+pub const ShellTruncationDetails = struct {
+    truncated_by: ?ShellTruncatedBy = null,
+    total_lines: usize,
+    total_bytes: usize,
+    output_lines: usize,
+    output_bytes: usize,
+    last_line_partial: bool = false,
+    first_line_exceeds_limit: bool = false,
+    max_lines: usize = default_bash_max_lines,
+    max_bytes: usize = default_bash_max_bytes,
+};
 
 pub const ShellCaptureOptions = struct {
     update_context: ?*anyopaque = null,
@@ -689,6 +707,7 @@ const Truncation = struct {
     truncated_by: TruncatedBy,
     output_lines: usize,
     total_lines: usize = 0,
+    total_bytes: usize = 0,
     output_bytes: usize = 0,
     last_line_partial: bool = false,
     first_line_exceeds_limit: bool = false,
@@ -698,6 +717,7 @@ const ShellOutput = struct {
     output: []u8,
     truncated: bool,
     full_output_path: ?[]const u8 = null,
+    truncation: ?ShellTruncationDetails = null,
 };
 
 const GrepLineInfo = struct {
@@ -878,6 +898,7 @@ fn formatShellOutputWithStatus(
         .output = try out.toOwnedSlice(),
         .truncated = truncation.truncated,
         .full_output_path = if (truncation.truncated) bash_full_output_path else null,
+        .truncation = shellTruncationDetails(truncation, default_bash_max_lines, default_bash_max_bytes),
     };
 }
 
@@ -918,6 +939,26 @@ fn formatShellOutputSnapshot(allocator: std.mem.Allocator, io: std.Io, raw_outpu
         .output = try allocator.dupe(u8, truncation.content),
         .truncated = truncation.truncated,
         .full_output_path = if (truncation.truncated) bash_full_output_path else null,
+        .truncation = shellTruncationDetails(truncation, default_bash_max_lines, default_bash_max_bytes),
+    };
+}
+
+fn shellTruncationDetails(truncation: Truncation, max_lines: usize, max_bytes: usize) ?ShellTruncationDetails {
+    if (!truncation.truncated) return null;
+    return .{
+        .truncated_by = switch (truncation.truncated_by) {
+            .lines => .lines,
+            .bytes => .bytes,
+            .none => null,
+        },
+        .total_lines = truncation.total_lines,
+        .total_bytes = truncation.total_bytes,
+        .output_lines = truncation.output_lines,
+        .output_bytes = truncation.output_bytes,
+        .last_line_partial = truncation.last_line_partial,
+        .first_line_exceeds_limit = truncation.first_line_exceeds_limit,
+        .max_lines = max_lines,
+        .max_bytes = max_bytes,
     };
 }
 
@@ -947,6 +988,7 @@ fn emitShellUpdateSnapshot(
         .output = snapshot.output,
         .truncated = snapshot.truncated,
         .full_output_path = snapshot.full_output_path,
+        .truncation = snapshot.truncation,
     });
 }
 
@@ -978,6 +1020,7 @@ fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: us
             .truncated_by = .none,
             .output_lines = total_lines,
             .total_lines = total_lines,
+            .total_bytes = content.len,
             .output_bytes = content.len,
         };
     }
@@ -1002,6 +1045,7 @@ fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: us
                     .truncated_by = .bytes,
                     .output_lines = 0,
                     .total_lines = total_lines,
+                    .total_bytes = content.len,
                     .output_bytes = 0,
                     .first_line_exceeds_limit = true,
                 };
@@ -1020,6 +1064,7 @@ fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: us
         .truncated_by = truncated_by,
         .output_lines = output_lines,
         .total_lines = total_lines,
+        .total_bytes = content.len,
         .output_bytes = out.written().len,
     };
 }
@@ -1034,6 +1079,7 @@ fn truncateTail(allocator: std.mem.Allocator, content: []const u8, max_lines: us
             .truncated_by = .none,
             .output_lines = total_lines,
             .total_lines = total_lines,
+            .total_bytes = total_bytes,
             .output_bytes = trimTrailingNewline(content).len,
         };
     }
@@ -1077,6 +1123,7 @@ fn truncateTail(allocator: std.mem.Allocator, content: []const u8, max_lines: us
         .truncated_by = truncated_by,
         .output_lines = output_lines,
         .total_lines = total_lines,
+        .total_bytes = total_bytes,
         .output_bytes = output_bytes,
         .last_line_partial = last_line_partial,
     };

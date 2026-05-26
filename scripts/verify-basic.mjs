@@ -314,6 +314,47 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'timeout bash complete' } }] }));
       return;
     }
+    if (user.includes('long bash updates')) {
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        const command = 'node -e ' + JSON.stringify("for (let i = 0; i < 2105; i++) console.log('json-update-line-' + String(i).padStart(4, '0'))");
+        const toolCall = {
+          index: 0,
+          id: 'call_long_bash_updates_1',
+          type: 'function',
+          function: { name: 'bash', arguments: JSON.stringify({ command }) }
+        };
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { tool_calls: [toolCall] } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCall] } }] }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content;
+      if (
+        toolMessages.at(-1).tool_call_id !== 'call_long_bash_updates_1' ||
+        toolOutput.includes('json-update-line-0000') ||
+        !toolOutput.includes('json-update-line-2104') ||
+        !toolOutput.includes('Full output: zig-out/pi-zig-bash-full-output.log')
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unexpected long bash update output', toolOutput }));
+        return;
+      }
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content: 'long bash updates complete' } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'long bash updates complete' } }] }));
+      return;
+    }
     if (user.includes('tool loop')) {
       if (!hasBashTool) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2250,6 +2291,36 @@ try {
     !providerJsonTimeoutToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('timeout bash complete'))
   ) {
     throw new Error('top-level JSON mode smoke did not preserve partial output from a timed out bash tool call');
+  }
+
+  const providerJsonLongBashUpdateLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-long-bash-updates-model', '-p', 'please run long bash updates'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const longBashTruncatedUpdate = providerJsonLongBashUpdateLines.find(
+    (line) => line.type === 'tool_execution_update' &&
+      line.toolName === 'bash' &&
+      line.toolCallId === 'call_long_bash_updates_1' &&
+      line.partialResult?.details?.truncation?.truncated === true
+  );
+  if (
+    longBashTruncatedUpdate?.partialResult?.details?.truncation?.truncatedBy !== 'lines' ||
+    longBashTruncatedUpdate?.partialResult?.details?.truncation?.totalLines !== 2105 ||
+    longBashTruncatedUpdate?.partialResult?.details?.truncation?.outputLines !== 2000 ||
+    longBashTruncatedUpdate?.partialResult?.details?.truncation?.maxLines !== 2000 ||
+    longBashTruncatedUpdate?.partialResult?.details?.truncation?.maxBytes !== 50 * 1024 ||
+    longBashTruncatedUpdate?.partialResult?.details?.fullOutputPath !== 'zig-out/pi-zig-bash-full-output.log' ||
+    longBashTruncatedUpdate?.partialResult?.content?.[0]?.text?.includes('json-update-line-0000') ||
+    !longBashTruncatedUpdate?.partialResult?.content?.[0]?.text?.includes('json-update-line-2104') ||
+    !providerJsonLongBashUpdateLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('Full output: zig-out/pi-zig-bash-full-output.log')) ||
+    !providerJsonLongBashUpdateLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('long bash updates complete'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not emit upstream-shaped bash truncation update details');
   }
 
   const providerJsonStreamingToolLines = run(

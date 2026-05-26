@@ -10,6 +10,7 @@ const models = @import("models.zig");
 const rpc = @import("rpc.zig");
 const session = @import("session.zig");
 const system_prompt = @import("system_prompt.zig");
+const tools = @import("tools.zig");
 
 const all_tool_names = [_][]const u8{ "read", "bash", "edit", "write", "grep", "find", "ls" };
 
@@ -836,10 +837,14 @@ fn writeToolUpdatePayloadJson(w: *std.Io.Writer, update: agent.ToolUpdate) !void
     try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
     try writeJsonString(w, update.content);
     try w.writeAll("}]");
-    if (update.truncated or update.full_output_path != null) {
+    if (update.truncated or update.full_output_path != null or update.truncation != null) {
         try w.writeAll(",\"details\":{");
         var needs_comma = false;
-        if (update.truncated) {
+        if (update.truncation) |truncation| {
+            try w.writeAll("\"truncation\":");
+            try writeToolUpdateTruncationJson(w, update.content, truncation);
+            needs_comma = true;
+        } else if (update.truncated) {
             try w.writeAll("\"truncated\":true");
             needs_comma = true;
         }
@@ -854,6 +859,37 @@ fn writeToolUpdatePayloadJson(w: *std.Io.Writer, update: agent.ToolUpdate) !void
     try w.writeAll(if (update.is_error) "true" else "false");
     try w.writeAll(",\"terminate\":");
     try w.writeAll(if (update.terminate) "true" else "false");
+    try w.writeByte('}');
+}
+
+fn writeToolUpdateTruncationJson(w: *std.Io.Writer, content: []const u8, truncation: tools.ShellTruncationDetails) !void {
+    try w.writeAll("{\"content\":");
+    try writeJsonString(w, content);
+    try w.writeAll(",\"truncated\":true,\"truncatedBy\":");
+    if (truncation.truncated_by) |truncated_by| {
+        try writeJsonString(w, switch (truncated_by) {
+            .lines => "lines",
+            .bytes => "bytes",
+        });
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"totalLines\":");
+    try w.print("{d}", .{truncation.total_lines});
+    try w.writeAll(",\"totalBytes\":");
+    try w.print("{d}", .{truncation.total_bytes});
+    try w.writeAll(",\"outputLines\":");
+    try w.print("{d}", .{truncation.output_lines});
+    try w.writeAll(",\"outputBytes\":");
+    try w.print("{d}", .{truncation.output_bytes});
+    try w.writeAll(",\"lastLinePartial\":");
+    try w.writeAll(if (truncation.last_line_partial) "true" else "false");
+    try w.writeAll(",\"firstLineExceedsLimit\":");
+    try w.writeAll(if (truncation.first_line_exceeds_limit) "true" else "false");
+    try w.writeAll(",\"maxLines\":");
+    try w.print("{d}", .{truncation.max_lines});
+    try w.writeAll(",\"maxBytes\":");
+    try w.print("{d}", .{truncation.max_bytes});
     try w.writeByte('}');
 }
 

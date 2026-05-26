@@ -151,6 +151,7 @@ pub const ToolUpdate = struct {
     terminate: bool = false,
     truncated: bool = false,
     full_output_path: ?[]const u8 = null,
+    truncation: ?tools.ShellTruncationDetails = null,
 };
 
 const ToolExecutionResult = struct {
@@ -556,7 +557,7 @@ fn emitToolUpdate(
     is_error: bool,
     terminate: bool,
 ) !void {
-    try emitToolUpdateWithDetails(options, call, content, is_error, terminate, false, null);
+    try emitToolUpdateWithDetails(options, call, content, is_error, terminate, false, null, null);
 }
 
 fn emitToolUpdateWithDetails(
@@ -567,6 +568,7 @@ fn emitToolUpdateWithDetails(
     terminate: bool,
     truncated: bool,
     full_output_path: ?[]const u8,
+    truncation: ?tools.ShellTruncationDetails,
 ) !void {
     if (options) |run_options| {
         if (run_options.on_tool_update) |callback| {
@@ -580,6 +582,7 @@ fn emitToolUpdateWithDetails(
                     .terminate = terminate,
                     .truncated = truncated,
                     .full_output_path = full_output_path,
+                    .truncation = truncation,
                 });
             }
         }
@@ -593,7 +596,7 @@ const BashShellUpdateContext = struct {
 
 fn handleBashShellUpdate(ctx_ptr: *anyopaque, update: tools.ShellUpdate) anyerror!void {
     const ctx: *BashShellUpdateContext = @ptrCast(@alignCast(ctx_ptr));
-    try emitToolUpdateWithDetails(ctx.options, ctx.call, update.output, false, false, update.truncated, update.full_output_path);
+    try emitToolUpdateWithDetails(ctx.options, ctx.call, update.output, false, false, update.truncated, update.full_output_path, update.truncation);
 }
 
 fn createToolResultTrace(
