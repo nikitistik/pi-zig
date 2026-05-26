@@ -423,7 +423,8 @@ const hook_runner_script =
     \\}
     \\const payload = JSON.parse(process.argv[1] || "{}");
     \\const handlers = new Map();
-    \\const registeredTools = [];
+    \\const extensionToolMaps = [];
+    \\let activeToolMap = null;
     \\const diagnostics = [];
     \\const api = {
     \\  on(type, handler) {
@@ -431,7 +432,7 @@ const hook_runner_script =
     \\    handlers.get(type).push(handler);
     \\  },
     \\  registerTool(tool) {
-    \\    if (tool && typeof tool.name === "string") registeredTools.push(tool);
+    \\    if (tool && typeof tool.name === "string" && activeToolMap) activeToolMap.set(tool.name, tool);
     \\  },
     \\  registerCommand() {},
     \\  registerFlag() {},
@@ -450,7 +451,24 @@ const hook_runner_script =
     \\async function loadExtension(extensionPath) {
     \\  const mod = await importExtensionModule(path.resolve(extensionPath));
     \\  const factory = typeof mod.default === "function" ? mod.default : typeof mod === "function" ? mod : null;
-    \\  if (factory) await factory(api);
+    \\  const toolMap = new Map();
+    \\  const previousToolMap = activeToolMap;
+    \\  activeToolMap = toolMap;
+    \\  try {
+    \\    if (factory) await factory(api);
+    \\  } finally {
+    \\    activeToolMap = previousToolMap;
+    \\  }
+    \\  extensionToolMaps.push(toolMap);
+    \\}
+    \\function allRegisteredTools() {
+    \\  const toolsByName = new Map();
+    \\  for (const toolMap of extensionToolMaps) {
+    \\    for (const tool of toolMap.values()) {
+    \\      if (!toolsByName.has(tool.name)) toolsByName.set(tool.name, tool);
+    \\    }
+    \\  }
+    \\  return Array.from(toolsByName.values());
     \\}
     \\function contentText(content) {
     \\  if (!Array.isArray(content)) return undefined;
@@ -476,11 +494,11 @@ const hook_runner_script =
     \\  for (const extensionPath of payload.extensions || []) await loadExtension(extensionPath);
     \\  const event = payload.event;
     \\  if (event?.type === "discover_tools") {
-    \\    process.stdout.write(JSON.stringify({ tools: registeredTools.map(toolSummary) }) + "\n");
+    \\    process.stdout.write(JSON.stringify({ tools: allRegisteredTools().map(toolSummary) }) + "\n");
     \\    return;
     \\  }
     \\  if (event?.type === "execute_tool") {
-    \\    const tool = registeredTools.slice().reverse().find((candidate) => candidate.name === event.toolName);
+    \\    const tool = allRegisteredTools().find((candidate) => candidate.name === event.toolName);
     \\    if (!tool || typeof tool.execute !== "function") throw new Error(`Extension tool not found: ${event.toolName}`);
     \\    process.stdout.write(JSON.stringify(normalizeToolResult(await tool.execute(event.toolCallId, event.input ?? {}, undefined, undefined, ctx))) + "\n");
     \\    return;
@@ -626,6 +644,59 @@ test "extension runner discovers and executes registered tools" {
     defer allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("hello world", result.content);
+}
+
+test "extension runner keeps first extension tool when names collide" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-tool-conflict-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const first_path = fixture_dir ++ "/a-first.mjs";
+    const second_path = fixture_dir ++ "/b-second.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = first_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerTool({
+        \\    name: "shared_ext",
+        \\    description: "first initial",
+        \\    parameters: { type: "object", properties: {}, additionalProperties: false },
+        \\    execute: async () => ({ content: [{ type: "text", text: "first initial" }], isError: false })
+        \\  });
+        \\  pi.registerTool({
+        \\    name: "shared_ext",
+        \\    description: "first final",
+        \\    parameters: { type: "object", properties: {}, additionalProperties: false },
+        \\    execute: async () => ({ content: [{ type: "text", text: "first final" }], isError: false })
+        \\  });
+        \\}
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = second_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerTool({
+        \\    name: "shared_ext",
+        \\    description: "second",
+        \\    parameters: { type: "object", properties: {}, additionalProperties: false },
+        \\    execute: async () => ({ content: [{ type: "text", text: "second" }], isError: false })
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{ first_path, second_path } };
+    const definitions = try runner.discoverToolDefinitions();
+    defer runner.deinitToolDefinitions(definitions);
+    try std.testing.expectEqual(@as(usize, 1), definitions.len);
+    try std.testing.expectEqualStrings("shared_ext", definitions[0].name);
+    try std.testing.expectEqualStrings("first final", definitions[0].description);
+
+    var call = ai_client.ChatToolCall{
+        .id = try allocator.dupe(u8, "call_shared_ext_1"),
+        .name = try allocator.dupe(u8, "shared_ext"),
+        .arguments_json = try allocator.dupe(u8, "{}"),
+    };
+    defer call.deinit(allocator);
+    const result = try runner.runRegisteredTool(call);
+    defer allocator.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("first final", result.content);
 }
 
 test "extension runner loads TypeScript registered tools" {
