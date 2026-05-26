@@ -1,0 +1,13 @@
+{
+  "name": "pi-zig-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "zig build && npm --prefix frontend run build",
+    "dev": "npm --prefix frontend run dev",
+    "inventory": "node scripts/upstream-inventory.mjs",
+    "test": "zig build test && node scripts/upstream-inventory.mjs && node scripts/check-cli-parity.mjs && node scripts/generate-model-catalog.mjs --check && zig build && node scripts/verify-basic.mjs"
+  },
+  "devDependencies": {}
+}
