@@ -868,10 +868,13 @@ fn formatShellOutputWithStatus(
     status_message: ?[]const u8,
     empty_text: []const u8,
 ) !ShellOutput {
-    const truncation = try truncateTail(allocator, raw_output, default_bash_max_lines, default_bash_max_bytes);
+    const sanitized_output = try sanitizeShellOutput(allocator, raw_output);
+    defer allocator.free(sanitized_output);
+
+    const truncation = try truncateTail(allocator, sanitized_output, default_bash_max_lines, default_bash_max_bytes);
     defer allocator.free(truncation.content);
 
-    if (truncation.truncated) try writeFile(io, bash_full_output_path, raw_output);
+    if (truncation.truncated) try writeFile(io, bash_full_output_path, sanitized_output);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -885,7 +888,7 @@ fn formatShellOutputWithStatus(
     if (truncation.truncated) {
         if (out.written().len > 0) try out.writer.writeAll("\n\n");
         if (truncation.last_line_partial) {
-            const last_line_size = bytesForLastLine(raw_output);
+            const last_line_size = bytesForLastLine(sanitized_output);
             try out.writer.writeAll("[Showing last ");
             try writeSize(&out.writer, truncation.output_bytes);
             try out.writer.print(" of line {d} (line is ", .{truncation.total_lines});
@@ -991,10 +994,13 @@ fn timeoutStatusMessage(allocator: std.mem.Allocator, timeout_ms: i64) ![]u8 {
 }
 
 fn formatShellOutputSnapshot(allocator: std.mem.Allocator, io: std.Io, raw_output: []const u8) !ShellOutput {
-    const truncation = try truncateTail(allocator, raw_output, default_bash_max_lines, default_bash_max_bytes);
+    const sanitized_output = try sanitizeShellOutput(allocator, raw_output);
+    defer allocator.free(sanitized_output);
+
+    const truncation = try truncateTail(allocator, sanitized_output, default_bash_max_lines, default_bash_max_bytes);
     defer allocator.free(truncation.content);
 
-    if (truncation.truncated) try writeFile(io, bash_full_output_path, raw_output);
+    if (truncation.truncated) try writeFile(io, bash_full_output_path, sanitized_output);
 
     return .{
         .output = try allocator.dupe(u8, truncation.content),
@@ -1028,6 +1034,66 @@ fn combineShellOutput(allocator: std.mem.Allocator, stdout: []const u8, stderr: 
     @memcpy(raw_output[0..stdout.len], stdout);
     @memcpy(raw_output[stdout.len..], stderr);
     return raw_output;
+}
+
+fn sanitizeShellOutput(allocator: std.mem.Allocator, raw_output: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    var index: usize = 0;
+    while (index < raw_output.len) {
+        const byte = raw_output[index];
+        if (byte == 0x1b) {
+            index = skipAnsiEscape(raw_output, index + 1);
+            continue;
+        }
+        if (byte == 0x9b) {
+            index = skipAnsiCsi(raw_output, index + 1);
+            continue;
+        }
+        if (isUtf8InterlinearAnnotation(raw_output, index)) {
+            index += 3;
+            continue;
+        }
+
+        index += 1;
+        if (byte == '\r') continue;
+        if (byte < 0x20 and byte != '\n' and byte != '\t') continue;
+        if (byte >= 0x80 and byte <= 0x9f) continue;
+        try out.writer.writeByte(byte);
+    }
+    return out.toOwnedSlice();
+}
+
+fn skipAnsiEscape(bytes: []const u8, start: usize) usize {
+    if (start >= bytes.len) return start;
+    if (bytes[start] == ']') return skipAnsiOsc(bytes, start + 1);
+    if (bytes[start] == '[') return skipAnsiCsi(bytes, start + 1);
+    return skipAnsiCsi(bytes, start);
+}
+
+fn skipAnsiOsc(bytes: []const u8, start: usize) usize {
+    var index = start;
+    while (index < bytes.len) : (index += 1) {
+        if (bytes[index] == 0x07) return index + 1;
+        if (bytes[index] == 0x9c) return index + 1;
+        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '\\') return index + 2;
+    }
+    return index;
+}
+
+fn skipAnsiCsi(bytes: []const u8, start: usize) usize {
+    var index = start;
+    while (index < bytes.len) : (index += 1) {
+        const byte = bytes[index];
+        if (byte >= 0x40 and byte <= 0x7e) return index + 1;
+    }
+    return index;
+}
+
+fn isUtf8InterlinearAnnotation(bytes: []const u8, index: usize) bool {
+    if (index + 2 >= bytes.len) return false;
+    return bytes[index] == 0xef and bytes[index + 1] == 0xbf and bytes[index + 2] >= 0xb9 and bytes[index + 2] <= 0xbb;
 }
 
 const ResolvedShellCommand = struct {
@@ -1509,4 +1575,11 @@ test "wildcard matching is deterministic" {
     try std.testing.expect(wildcardMatch("src/**/*.zig", "src/pi/tools.zig"));
     try std.testing.expect(wildcardMatch("README.*", "README.md"));
     try std.testing.expect(!wildcardMatch("README.?", "README.md"));
+}
+
+test "bash output sanitizes ansi carriage returns and control bytes" {
+    const result = try runShellCapture(std.testing.io, std.testing.allocator, "printf '\\033[31mred\\033[0m\\r\\nbad\\001ok'");
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expectEqualStrings("red\nbadok", result.output);
 }

@@ -2536,6 +2536,10 @@ const bash = run(['tool-bash', 'printf pi-zig-tool-bash']);
 if (bash !== 'pi-zig-tool-bash') {
   throw new Error(`tool-bash smoke returned unexpected output: ${JSON.stringify(bash)}`);
 }
+const bashSanitized = run(['tool-bash', "printf '\\033[31mred\\033[0m\\r\\nbad\\001ok'"]);
+if (bashSanitized !== 'red\nbadok') {
+  throw new Error(`tool-bash sanitization smoke returned unexpected output: ${JSON.stringify(bashSanitized)}`);
+}
 const bashNoOutput = run(['tool-bash', 'true']);
 if (bashNoOutput !== '(no output)') {
   throw new Error(`tool-bash no-output smoke returned unexpected output: ${JSON.stringify(bashNoOutput)}`);
