@@ -159,16 +159,26 @@ const PendingMessageQueue = struct {
     count: usize = 0,
     lengths: [max_pending_messages]usize = undefined,
     messages: [max_pending_messages][max_message_bytes]u8 = undefined,
+    image_parts: [max_pending_messages][]ai_client.ChatContentPart = [_][]ai_client.ChatContentPart{&.{}} ** max_pending_messages,
 
-    fn enqueue(self: *PendingMessageQueue, message: []const u8) !void {
+    fn enqueue(
+        self: *PendingMessageQueue,
+        allocator: std.mem.Allocator,
+        message: []const u8,
+        image_parts: []const ai_client.ChatContentPart,
+    ) !void {
         if (message.len > max_message_bytes) return error.MessageTooLarge;
         if (self.count >= max_pending_messages) return error.PendingMessageLimitReached;
+        const owned_image_parts = try cloneImageParts(allocator, image_parts);
+        errdefer freeRpcContentParts(allocator, owned_image_parts);
         self.lengths[self.count] = message.len;
         @memcpy(self.messages[self.count][0..message.len], message);
+        self.image_parts[self.count] = owned_image_parts;
         self.count += 1;
     }
 
-    fn clear(self: *PendingMessageQueue) void {
+    fn clear(self: *PendingMessageQueue, allocator: std.mem.Allocator) void {
+        for (self.image_parts[0..self.count]) |parts| freeRpcContentParts(allocator, parts);
         self.count = 0;
     }
 
@@ -179,11 +189,15 @@ const PendingMessageQueue = struct {
         };
     }
 
-    fn at(self: *const PendingMessageQueue, index: usize) []const u8 {
-        return self.messages[index][0..self.lengths[index]];
+    fn at(self: *const PendingMessageQueue, index: usize) UserBatchMessage {
+        return .{
+            .text = self.messages[index][0..self.lengths[index]],
+            .image_parts = self.image_parts[index],
+        };
     }
 
-    fn dropPrefix(self: *PendingMessageQueue, prefix_count: usize) void {
+    fn dropPrefix(self: *PendingMessageQueue, allocator: std.mem.Allocator, prefix_count: usize) void {
+        for (self.image_parts[0..@min(prefix_count, self.count)]) |parts| freeRpcContentParts(allocator, parts);
         if (prefix_count >= self.count) {
             self.count = 0;
             return;
@@ -193,9 +207,16 @@ const PendingMessageQueue = struct {
             const source = index + prefix_count;
             self.lengths[index] = self.lengths[source];
             @memcpy(self.messages[index][0..self.lengths[source]], self.messages[source][0..self.lengths[source]]);
+            self.image_parts[index] = self.image_parts[source];
+            self.image_parts[source] = &.{};
         }
         self.count = remaining;
     }
+};
+
+const UserBatchMessage = struct {
+    text: []const u8,
+    image_parts: []const ai_client.ChatContentPart = &.{},
 };
 
 const Runtime = struct {
@@ -230,21 +251,26 @@ const Runtime = struct {
         session_file: []const u8,
         command_options: commands.Options,
     ) !void {
-        self.resetInMemory();
+        self.resetInMemory(allocator);
         self.env = env;
         self.command_options = command_options;
         self.store = try session.PersistentStore.init(io, allocator, session_file);
         try self.loadSessionEntries(io, allocator);
     }
 
-    fn resetInMemory(self: *Runtime) void {
+    fn deinit(self: *Runtime, allocator: std.mem.Allocator) void {
+        self.steering_queue.clear(allocator);
+        self.follow_up_queue.clear(allocator);
+    }
+
+    fn resetInMemory(self: *Runtime, allocator: std.mem.Allocator) void {
         self.message_count = 0;
         self.session_name_len = 0;
         self.has_session_name = false;
         self.selected_model = null;
         self.thinking_level = .medium;
-        self.steering_queue.clear();
-        self.follow_up_queue.clear();
+        self.steering_queue.clear(allocator);
+        self.follow_up_queue.clear(allocator);
         self.auto_compaction_enabled = false;
         self.auto_retry_enabled = false;
         self.auto_retry_max_attempts = max_auto_retry_attempts;
@@ -255,13 +281,13 @@ const Runtime = struct {
     }
 
     fn clearSession(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, parent_session: ?[]const u8) !void {
-        self.resetInMemory();
+        self.resetInMemory(allocator);
         self.session_generation += 1;
         try self.store.newSession(io, allocator, parent_session);
     }
 
     fn switchSession(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, session_file: []const u8) !void {
-        self.resetInMemory();
+        self.resetInMemory(allocator);
         self.session_generation += 1;
         self.store = try session.PersistentStore.open(io, allocator, session_file);
         try self.loadSessionEntries(io, allocator);
@@ -344,7 +370,7 @@ const Runtime = struct {
         try new_store.appendThinkingLevelChange(io, allocator, thinkingLevelLabel(previous_thinking));
         if (previous_name) |name| try new_store.appendSessionInfo(io, allocator, name);
 
-        self.resetInMemory();
+        self.resetInMemory(allocator);
         self.session_generation += 1;
         self.store = new_store;
         try self.loadSessionEntries(io, allocator);
@@ -633,6 +659,8 @@ const Runtime = struct {
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
+        history_limit: usize,
+        batch_history_messages: []const UserBatchMessage,
         prompt: []const u8,
         prompt_image_parts: []const ai_client.ChatContentPart,
     ) !?agent.RunResult {
@@ -644,8 +672,11 @@ const Runtime = struct {
         defer allocator.free(runtime_system_prompt);
         const shell_settings = try settings.loadShellSettings(io, allocator, env);
         defer shell_settings.deinit(allocator);
-        var history = try self.buildAgentHistory(allocator);
+        var history = try self.buildAgentHistory(allocator, history_limit);
         defer deinitAgentHistory(allocator, &history);
+        for (batch_history_messages) |message| {
+            try appendBatchHistoryMessage(allocator, &history, message);
+        }
         const prompt_content_parts = try buildPromptContentParts(allocator, prompt, prompt_image_parts);
         defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
 
@@ -668,6 +699,8 @@ const Runtime = struct {
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
+        history_limit: usize,
+        batch_history_messages: []const UserBatchMessage,
         prompt: []const u8,
         prompt_image_parts: []const ai_client.ChatContentPart,
     ) !?agent.RunResult {
@@ -675,7 +708,7 @@ const Runtime = struct {
         self.last_retry_attempts = 0;
         self.last_retry_delay_ms = 0;
         while (true) {
-            return self.runAgentIfAuthenticatedOnce(io, allocator, prompt, prompt_image_parts) catch |err| {
+            return self.runAgentIfAuthenticatedOnce(io, allocator, history_limit, batch_history_messages, prompt, prompt_image_parts) catch |err| {
                 if (!self.auto_retry_enabled or !isRetryableAgentError(err) or retry_attempts >= self.auto_retry_max_attempts) return err;
                 retry_attempts += 1;
                 self.last_retry_attempts = retry_attempts;
@@ -695,12 +728,11 @@ const Runtime = struct {
         return @min(delay, self.auto_retry_max_delay_ms);
     }
 
-    fn buildAgentHistory(self: *Runtime, allocator: std.mem.Allocator) !std.ArrayList(ai_client.ChatMessage) {
+    fn buildAgentHistory(self: *Runtime, allocator: std.mem.Allocator, history_limit: usize) !std.ArrayList(ai_client.ChatMessage) {
         var history: std.ArrayList(ai_client.ChatMessage) = .empty;
         errdefer deinitAgentHistory(allocator, &history);
 
-        var limit = self.message_count;
-        if (limit > 0) limit -= 1;
+        const limit = @min(history_limit, self.message_count);
         if (self.latestCompactionIndex(limit)) |compaction_index| {
             try appendCompactionHistoryMessage(allocator, &history, &self.messages[compaction_index]);
             const first_kept_index = self.firstKeptMessageIndex(compaction_index) orelse compaction_index + 1;
@@ -751,6 +783,21 @@ const Runtime = struct {
     fn appendHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), role: ai_client.ChatRole, content: []const u8) !void {
         const owned = try allocator.dupe(u8, content);
         try appendOwnedHistoryMessage(allocator, history, role, owned);
+    }
+
+    fn appendBatchHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), message: UserBatchMessage) !void {
+        const chat_message: ai_client.ChatMessage = blk: {
+            const owned_text = try allocator.dupe(u8, message.text);
+            errdefer allocator.free(owned_text);
+            const owned_content_parts = try buildOwnedPromptContentParts(allocator, message.text, message.image_parts);
+            break :blk .{
+                .role = .user,
+                .content = owned_text,
+                .content_parts = owned_content_parts,
+            };
+        };
+        errdefer deinitHistoryMessage(allocator, chat_message);
+        try history.append(allocator, chat_message);
     }
 
     fn appendOwnedHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), role: ai_client.ChatRole, content: []u8) !void {
@@ -810,6 +857,7 @@ const Runtime = struct {
 
     fn deinitHistoryMessage(allocator: std.mem.Allocator, message: ai_client.ChatMessage) void {
         allocator.free(message.content);
+        freeRpcContentParts(allocator, message.content_parts);
         if (message.tool_call_id) |tool_call_id| allocator.free(tool_call_id);
         for (message.tool_calls) |call| call.deinit(allocator);
         if (message.tool_calls.len > 0) allocator.free(message.tool_calls);
@@ -919,17 +967,24 @@ const Runtime = struct {
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
-        messages: []const []const u8,
-        prompt_image_parts: []const ai_client.ChatContentPart,
+        messages: []const UserBatchMessage,
         last_result: *?agent.RunResult,
     ) !void {
         if (messages.len == 0) return;
+        const history_limit = self.message_count;
         for (messages) |message| {
-            try self.addMessage(io, allocator, .user, message);
+            try self.addMessage(io, allocator, .user, message.text);
         }
 
-        const prompt = self.messages[self.message_count - 1].text();
-        const maybe_run_result = try self.runAgentIfAuthenticated(io, allocator, prompt, prompt_image_parts);
+        const prompt_message = messages[messages.len - 1];
+        const maybe_run_result = try self.runAgentIfAuthenticated(
+            io,
+            allocator,
+            history_limit,
+            messages[0 .. messages.len - 1],
+            prompt_message.text,
+            prompt_message.image_parts,
+        );
         var run_result = maybe_run_result orelse return;
         errdefer run_result.deinit(allocator);
 
@@ -938,7 +993,7 @@ const Runtime = struct {
         last_result.* = run_result;
     }
 
-    fn drainQueueBatch(self: *Runtime, queue: *PendingMessageQueue, mode: QueueMode, batch: [][]const u8) usize {
+    fn drainQueueBatch(self: *Runtime, queue: *PendingMessageQueue, mode: QueueMode, batch: []UserBatchMessage) usize {
         _ = self;
         const count = queue.drainCount(mode);
         for (0..count) |index| {
@@ -953,17 +1008,17 @@ const Runtime = struct {
         allocator: std.mem.Allocator,
         last_result: *?agent.RunResult,
     ) !void {
-        var batch: [max_pending_messages][]const u8 = undefined;
+        var batch: [max_pending_messages]UserBatchMessage = undefined;
         while (self.steering_queue.count > 0 or self.follow_up_queue.count > 0) {
             if (self.steering_queue.count > 0) {
                 const count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, &batch);
-                try self.runUserBatch(io, allocator, batch[0..count], &.{}, last_result);
-                self.steering_queue.dropPrefix(count);
+                try self.runUserBatch(io, allocator, batch[0..count], last_result);
+                self.steering_queue.dropPrefix(allocator, count);
                 continue;
             }
             const count = self.drainQueueBatch(&self.follow_up_queue, self.follow_up_mode, &batch);
-            try self.runUserBatch(io, allocator, batch[0..count], &.{}, last_result);
-            self.follow_up_queue.dropPrefix(count);
+            try self.runUserBatch(io, allocator, batch[0..count], last_result);
+            self.follow_up_queue.dropPrefix(allocator, count);
         }
     }
 
@@ -974,13 +1029,15 @@ const Runtime = struct {
 
     fn enqueuePendingMessage(
         self: *Runtime,
+        allocator: std.mem.Allocator,
         w: *std.Io.Writer,
         id: ?[]const u8,
         command: []const u8,
         queue: *PendingMessageQueue,
         message: []const u8,
+        image_parts: []const ai_client.ChatContentPart,
     ) !void {
-        queue.enqueue(message) catch |err| {
+        queue.enqueue(allocator, message, image_parts) catch |err| {
             return writeError(w, id, command, @errorName(err));
         };
         try writeResponseHead(w, id, command, true);
@@ -1006,13 +1063,13 @@ const Runtime = struct {
         var last_result: ?agent.RunResult = null;
         defer if (last_result) |result| result.deinit(allocator);
 
-        var initial_batch: [1 + max_pending_messages][]const u8 = undefined;
-        initial_batch[0] = message;
+        var initial_batch: [1 + max_pending_messages]UserBatchMessage = undefined;
+        initial_batch[0] = .{ .text = message, .image_parts = image_parts };
         const steering_count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, initial_batch[1..]);
-        self.runUserBatch(io, allocator, initial_batch[0 .. 1 + steering_count], image_parts, &last_result) catch |err| {
+        self.runUserBatch(io, allocator, initial_batch[0 .. 1 + steering_count], &last_result) catch |err| {
             return writeError(w, id, command, @errorName(err));
         };
-        self.steering_queue.dropPrefix(steering_count);
+        self.steering_queue.dropPrefix(allocator, steering_count);
 
         self.drainQueuedMessages(io, allocator, &last_result) catch |err| {
             return writeError(w, id, command, @errorName(err));
@@ -1043,19 +1100,27 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "steer requires a string message");
             };
-            return self.enqueuePendingMessage(w, id, command, &self.steering_queue, message);
+            const image_parts = parseRpcImages(allocator, value) catch {
+                return writeError(w, id, command, "steer images must be ImageContent objects with type=image, data, and mimeType");
+            };
+            defer freeRpcImages(allocator, image_parts);
+            return self.enqueuePendingMessage(allocator, w, id, command, &self.steering_queue, message, image_parts);
         }
 
         if (std.mem.eql(u8, command, "follow_up")) {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "follow_up requires a string message");
             };
-            return self.enqueuePendingMessage(w, id, command, &self.follow_up_queue, message);
+            const image_parts = parseRpcImages(allocator, value) catch {
+                return writeError(w, id, command, "follow_up images must be ImageContent objects with type=image, data, and mimeType");
+            };
+            defer freeRpcImages(allocator, image_parts);
+            return self.enqueuePendingMessage(allocator, w, id, command, &self.follow_up_queue, message, image_parts);
         }
 
         if (std.mem.eql(u8, command, "abort")) {
-            self.steering_queue.clear();
-            self.follow_up_queue.clear();
+            self.steering_queue.clear(allocator);
+            self.follow_up_queue.clear(allocator);
             return writeSuccess(w, id, command);
         }
 
@@ -1523,6 +1588,7 @@ pub fn run(
 ) !void {
     var runtime: Runtime = .{};
     try runtime.init(io, allocator, env, session_file, command_options);
+    defer runtime.deinit(allocator);
 
     var in_buf: [16 * 1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &in_buf);
@@ -1649,6 +1715,57 @@ fn freeRpcImages(allocator: std.mem.Allocator, parts: []ai_client.ChatContentPar
     allocator.free(parts);
 }
 
+fn cloneImageParts(allocator: std.mem.Allocator, parts: []const ai_client.ChatContentPart) ![]ai_client.ChatContentPart {
+    if (parts.len == 0) return &.{};
+    const cloned = try allocator.alloc(ai_client.ChatContentPart, parts.len);
+    var len: usize = 0;
+    errdefer {
+        for (cloned[0..len]) |part| {
+            switch (part) {
+                .text => |text| allocator.free(text),
+                .image => |image| {
+                    allocator.free(image.data);
+                    allocator.free(image.mime_type);
+                },
+            }
+        }
+        allocator.free(cloned);
+    }
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                cloned[len] = .{ .text = try allocator.dupe(u8, text) };
+            },
+            .image => |image| {
+                const owned_data = try allocator.dupe(u8, image.data);
+                errdefer allocator.free(owned_data);
+                const owned_mime_type = try allocator.dupe(u8, image.mime_type);
+                errdefer allocator.free(owned_mime_type);
+                cloned[len] = .{ .image = .{
+                    .data = owned_data,
+                    .mime_type = owned_mime_type,
+                } };
+            },
+        }
+        len += 1;
+    }
+    return cloned;
+}
+
+fn freeRpcContentParts(allocator: std.mem.Allocator, parts: []const ai_client.ChatContentPart) void {
+    if (parts.len == 0) return;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| allocator.free(text),
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        }
+    }
+    allocator.free(parts);
+}
+
 fn buildPromptContentParts(
     allocator: std.mem.Allocator,
     prompt: []const u8,
@@ -1664,6 +1781,52 @@ fn buildPromptContentParts(
     }
     for (image_parts) |part| {
         parts[index] = part;
+        index += 1;
+    }
+    return parts;
+}
+
+fn buildOwnedPromptContentParts(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    image_parts: []const ai_client.ChatContentPart,
+) ![]ai_client.ChatContentPart {
+    if (image_parts.len == 0) return &.{};
+    const text_parts: usize = if (prompt.len > 0) 1 else 0;
+    const parts = try allocator.alloc(ai_client.ChatContentPart, text_parts + image_parts.len);
+    var index: usize = 0;
+    errdefer {
+        for (parts[0..index]) |part| {
+            switch (part) {
+                .text => |text| allocator.free(text),
+                .image => |image| {
+                    allocator.free(image.data);
+                    allocator.free(image.mime_type);
+                },
+            }
+        }
+        allocator.free(parts);
+    }
+    if (prompt.len > 0) {
+        parts[index] = .{ .text = try allocator.dupe(u8, prompt) };
+        index += 1;
+    }
+    for (image_parts) |part| {
+        switch (part) {
+            .text => |text| {
+                parts[index] = .{ .text = try allocator.dupe(u8, text) };
+            },
+            .image => |image| {
+                const owned_data = try allocator.dupe(u8, image.data);
+                errdefer allocator.free(owned_data);
+                const owned_mime_type = try allocator.dupe(u8, image.mime_type);
+                errdefer allocator.free(owned_mime_type);
+                parts[index] = .{ .image = .{
+                    .data = owned_data,
+                    .mime_type = owned_mime_type,
+                } };
+            },
+        }
         index += 1;
     }
     return parts;

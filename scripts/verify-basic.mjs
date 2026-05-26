@@ -60,6 +60,10 @@ const server = http.createServer((req, res) => {
     const lastUserMessage = [...body.messages].reverse().find((message) => message.role === 'user');
     const user = contentText(lastUserMessage?.content);
     const userMessages = body.messages.filter((message) => message.role === 'user').map((message) => contentText(message.content));
+    const userMessageIncluding = (text) => body.messages.find((message) => message.role === 'user' && contentText(message.content).includes(text));
+    const hasSmokeImage = (content) =>
+      Array.isArray(content) &&
+      content.some((part) => part?.type === 'image_url' && part.image_url?.url === 'data:image/png;base64,aW1hZ2Utc21va2U=');
     const system = body.messages.find((message) => message.role === 'system')?.content ?? '';
     const toolMessages = body.messages.filter((message) => message.role === 'tool');
     const hasTool = (name) => body.tools?.some((tool) => tool?.function?.name === name) ?? false;
@@ -683,6 +687,30 @@ const server = http.createServer((req, res) => {
           }
         }]
       }));
+      return;
+    }
+    if (user.includes('rpc steer image one')) {
+      const promptContent = userMessageIncluding('rpc prompt image before steer')?.content;
+      const steerContent = lastUserMessage?.content;
+      if (!hasSmokeImage(promptContent) || !hasSmokeImage(steerContent) || (body.tools?.length ?? 0) === 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing queued steer image content parts', promptContent, steerContent, tools: body.tools }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc queued steer image observed' } }] }));
+      return;
+    }
+    if (user.includes('rpc follow image two')) {
+      const followOneContent = userMessageIncluding('rpc follow image one')?.content;
+      const followTwoContent = lastUserMessage?.content;
+      if (!hasSmokeImage(followOneContent) || !hasSmokeImage(followTwoContent) || (body.tools?.length ?? 0) === 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing queued follow-up image content parts', followOneContent, followTwoContent, tools: body.tools }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc queued follow image observed' } }] }));
       return;
     }
     if (userMessages.includes('rpc steer start')) {
@@ -3201,6 +3229,65 @@ try {
   const rpcProviderImagePrompt = rpcProviderImageResponses.find((response) => response.id === 'rpc-provider-image-prompt');
   if (!rpcProviderImagePrompt?.success || rpcProviderImagePrompt?.data?.text !== 'image rpc observed') {
     throw new Error('rpc provider prompt smoke did not send image content parts');
+  }
+
+  const rpcProviderQueuedImageSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-queued-image-smoke.jsonl');
+  fs.rmSync(rpcProviderQueuedImageSessionFile, { force: true });
+  const rpcProviderQueuedImageOutput = run(
+    ['rpc', rpcProviderQueuedImageSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-provider-queued-image-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-provider-queued-image-steer-mode', type: 'set_steering_mode', mode: 'one-at-a-time' }),
+      JSON.stringify({
+        id: 'rpc-provider-queued-image-steer',
+        type: 'steer',
+        message: 'rpc steer image one',
+        images: [{ type: 'image', data: 'aW1hZ2Utc21va2U=', mimeType: 'image/png' }]
+      }),
+      JSON.stringify({
+        id: 'rpc-provider-queued-image-prompt',
+        type: 'prompt',
+        message: 'rpc prompt image before steer',
+        images: [{ type: 'image', data: 'aW1hZ2Utc21va2U=', mimeType: 'image/png' }]
+      }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderQueuedImageResponses = rpcProviderQueuedImageOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderQueuedImagePrompt = rpcProviderQueuedImageResponses.find((response) => response.id === 'rpc-provider-queued-image-prompt');
+  if (!rpcProviderQueuedImagePrompt?.success || rpcProviderQueuedImagePrompt?.data?.text !== 'rpc queued steer image observed') {
+    throw new Error('rpc provider prompt smoke did not send queued steer image content parts');
+  }
+
+  const rpcProviderFollowImageSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-follow-image-smoke.jsonl');
+  fs.rmSync(rpcProviderFollowImageSessionFile, { force: true });
+  const rpcProviderFollowImageOutput = run(
+    ['rpc', rpcProviderFollowImageSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-provider-follow-image-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-provider-follow-image-mode', type: 'set_follow_up_mode', mode: 'all' }),
+      JSON.stringify({
+        id: 'rpc-provider-follow-image-one',
+        type: 'follow_up',
+        message: 'rpc follow image one',
+        images: [{ type: 'image', data: 'aW1hZ2Utc21va2U=', mimeType: 'image/png' }]
+      }),
+      JSON.stringify({
+        id: 'rpc-provider-follow-image-two',
+        type: 'follow_up',
+        message: 'rpc follow image two',
+        images: [{ type: 'image', data: 'aW1hZ2Utc21va2U=', mimeType: 'image/png' }]
+      }),
+      JSON.stringify({ id: 'rpc-provider-follow-image-prompt', type: 'prompt', message: 'rpc follow image start' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderFollowImageResponses = rpcProviderFollowImageOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderFollowImagePrompt = rpcProviderFollowImageResponses.find((response) => response.id === 'rpc-provider-follow-image-prompt');
+  if (!rpcProviderFollowImagePrompt?.success || rpcProviderFollowImagePrompt?.data?.text !== 'rpc queued follow image observed') {
+    throw new Error('rpc provider prompt smoke did not send queued follow_up image content parts');
   }
 
   const rpcProviderHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-history-smoke.jsonl');
