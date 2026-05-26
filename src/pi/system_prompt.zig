@@ -379,7 +379,7 @@ fn builtinToolGuidelines(name: []const u8) ?[]const []const u8 {
     return null;
 }
 
-fn combineAppendPrompt(allocator: std.mem.Allocator, discovered: ?context_files.TextFile, additional: []const []const u8) !?[]u8 {
+pub fn combineAppendPrompt(allocator: std.mem.Allocator, discovered: ?context_files.TextFile, additional: []const []const u8) !?[]u8 {
     if (discovered == null and additional.len == 0) return null;
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -474,7 +474,7 @@ fn takeValue(argv: []const []const u8, index: *usize) ?[]const u8 {
     return argv[index.*];
 }
 
-fn resolvePackageDir(
+pub fn resolvePackageDir(
     io: std.Io,
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
@@ -510,7 +510,7 @@ fn findPackageDirFromAncestor(io: std.Io, allocator: std.mem.Allocator, cwd: []c
     return null;
 }
 
-fn currentUtcDate(io: std.Io, buf: []u8) ![]const u8 {
+pub fn currentUtcDate(io: std.Io, buf: []u8) ![]const u8 {
     const timestamp = std.Io.Clock.real.now(io).toSeconds();
     const secs: u64 = if (timestamp < 0) 0 else @intCast(timestamp);
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };

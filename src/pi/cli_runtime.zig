@@ -4,9 +4,13 @@ const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const commands = @import("commands.zig");
 const config = @import("config.zig");
+const context_files = @import("context_files.zig");
 const models = @import("models.zig");
 const rpc = @import("rpc.zig");
 const session = @import("session.zig");
+const system_prompt = @import("system_prompt.zig");
+
+const all_tool_names = [_][]const u8{ "read", "bash", "edit", "write", "grep", "find", "ls" };
 
 const PromptResult = struct {
     text: []const u8,
@@ -23,6 +27,15 @@ const PathResult = struct {
 
     fn deinit(self: PathResult, allocator: std.mem.Allocator) void {
         if (self.owned) allocator.free(self.path);
+    }
+};
+
+const SelectedToolNames = struct {
+    names: []const []const u8,
+    owned: bool = false,
+
+    fn deinit(self: SelectedToolNames, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.names);
     }
 };
 
@@ -120,8 +133,8 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
         \\  context-files --no-context-files Skip AGENTS/CLAUDE discovery
         \\  system-prompt                   Build the effective system prompt text
         \\
-        \\Current top-level scope: print/json/rpc entry-point foundation. Provider execution,
-        \\interactive TUI, extension execution, provider execution, and full agent loop remain incomplete.
+        \\Current top-level scope: print/json/rpc entry-point foundation. Interactive TUI,
+        \\extension execution, live streaming, and full upstream agent parity remain incomplete.
         \\
     );
 }
@@ -448,15 +461,15 @@ fn buildPrintResponse(
         };
     defer allocator.free(api_key);
 
-    const system_override = try buildSystemOverride(allocator, parsed);
-    defer if (system_override) |value| allocator.free(value);
+    const runtime_system_prompt = try buildRuntimeSystemPrompt(io, allocator, env, parsed);
+    defer allocator.free(runtime_system_prompt);
 
     return agent.runPrompt(io, allocator, env, .{
         .provider = provider,
         .model = model,
         .api_key = api_key,
         .prompt = prompt,
-        .system_prompt = system_override,
+        .system_prompt = runtime_system_prompt,
         .tool_set = toolSetFromParsed(parsed),
     }) catch |err| {
         try writeStderr(io, "Provider request failed: ");
@@ -492,19 +505,55 @@ fn toolListContains(value: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn buildSystemOverride(allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !?[]u8 {
-    if (parsed.system_prompt == null and parsed.append_system_prompts_len == 0) return null;
+fn buildRuntimeSystemPrompt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+) ![]u8 {
+    const cwd = try currentPathOwned(io, allocator);
+    defer allocator.free(cwd);
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    if (parsed.system_prompt) |system_prompt| {
-        try out.writer.writeAll(system_prompt);
+    const package_dir = try system_prompt.resolvePackageDir(io, allocator, env, cwd, null);
+    defer allocator.free(package_dir);
+
+    var discovery = try context_files.discover(io, allocator, env, .{ .no_context_files = parsed.no_context_files });
+    defer discovery.deinit();
+
+    const append_prompt = try system_prompt.combineAppendPrompt(allocator, discovery.append_system_prompt, parsed.append_system_prompts[0..parsed.append_system_prompts_len]);
+    defer if (append_prompt) |value| allocator.free(value);
+
+    var date_buf: [10]u8 = undefined;
+    const current_date = try system_prompt.currentUtcDate(io, &date_buf);
+
+    const selected_tools = try selectedToolNamesFromParsed(allocator, parsed);
+    defer selected_tools.deinit(allocator);
+
+    return system_prompt.build(allocator, .{
+        .custom_prompt = parsed.system_prompt orelse if (discovery.system_prompt) |file| file.content else null,
+        .append_system_prompt = append_prompt,
+        .selected_tools = selected_tools.names,
+        .cwd = cwd,
+        .package_dir = package_dir,
+        .date = current_date,
+        .context_files = discovery.context_files.items,
+        .include_builtin_tool_metadata = true,
+    });
+}
+
+fn selectedToolNamesFromParsed(allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !SelectedToolNames {
+    if (parsed.no_tools or parsed.no_builtin_tools) return .{ .names = &.{} };
+    const raw = parsed.tools orelse return .{ .names = all_tool_names[0..] };
+    if (toolListContains(raw, "*") or toolListContains(raw, "all")) return .{ .names = all_tool_names[0..] };
+
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(allocator);
+    var parts = std.mem.splitScalar(u8, raw, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len > 0) try names.append(allocator, trimmed);
     }
-    for (parsed.append_system_prompts[0..parsed.append_system_prompts_len]) |append_prompt| {
-        if (out.written().len != 0) try out.writer.writeAll("\n\n");
-        try out.writer.writeAll(append_prompt);
-    }
-    return try out.toOwnedSlice();
+    return .{ .names = try names.toOwnedSlice(allocator), .owned = true };
 }
 
 fn writeAssistantMessageJson(w: *std.Io.Writer, text: []const u8) !void {

@@ -1852,6 +1852,56 @@ try {
     throw new Error('top-level print mode smoke did not execute the OpenAI-compatible provider path');
   }
 
+  const providerContextFixture = path.resolve('zig-out/pi-zig-provider-context-fixture');
+  const providerContextCwd = path.join(providerContextFixture, 'project');
+  const providerContextAgentDir = path.join(providerContextFixture, 'agent-home');
+  fs.rmSync(providerContextFixture, { recursive: true, force: true });
+  fs.mkdirSync(path.join(providerContextCwd, '.pi'), { recursive: true });
+  fs.mkdirSync(providerContextAgentDir, { recursive: true });
+  fs.writeFileSync(path.join(providerContextCwd, 'AGENTS.md'), 'provider project context sentinel');
+  fs.writeFileSync(path.join(providerContextCwd, '.pi', 'SYSTEM.md'), 'provider system sentinel');
+  fs.writeFileSync(path.join(providerContextCwd, '.pi', 'APPEND_SYSTEM.md'), 'provider append sentinel');
+  const providerContextPrint = run(
+    ['--provider', 'openai', '--model', 'mock-context-model', '-p', 'hello provider context'],
+    undefined,
+    {
+      cwd: providerContextCwd,
+      env: {
+        ...providerEnv,
+        PI_CODING_AGENT_DIR: providerContextAgentDir
+      }
+    }
+  );
+  if (
+    !providerContextPrint.includes('mock provider response for mock-context-model: hello provider context') ||
+    !providerContextPrint.includes('provider system sentinel') ||
+    !providerContextPrint.includes('provider append sentinel') ||
+    !providerContextPrint.includes('provider project context sentinel')
+  ) {
+    throw new Error('provider-backed print mode did not build a system prompt with custom system, append, and project context');
+  }
+  fs.rmSync(path.join(providerContextCwd, '.pi', 'SYSTEM.md'));
+  const providerDefaultContextPrint = run(
+    ['--provider', 'openai', '--model', 'mock-context-tools-model', '-p', 'hello provider context tools'],
+    undefined,
+    {
+      cwd: providerContextCwd,
+      env: {
+        ...providerEnv,
+        PI_CODING_AGENT_DIR: providerContextAgentDir
+      }
+    }
+  );
+  if (
+    !providerDefaultContextPrint.includes('mock provider response for mock-context-tools-model: hello provider context tools') ||
+    !providerDefaultContextPrint.includes('Available tools:') ||
+    !providerDefaultContextPrint.includes('read: Read file contents') ||
+    !providerDefaultContextPrint.includes('provider append sentinel') ||
+    !providerDefaultContextPrint.includes('provider project context sentinel')
+  ) {
+    throw new Error('provider-backed print mode did not build a default system prompt with context and tool metadata');
+  }
+
   const providerJsonLines = run(
     ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-model', '-p', 'hello provider json'],
     undefined,
