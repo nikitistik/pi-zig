@@ -564,7 +564,8 @@ pub fn runShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !
 }
 
 pub fn runShellCapture(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ShellResult {
-    const argv = [_][]const u8{ "sh", "-lc", command };
+    const shell_path = try resolveShellPath(io, null);
+    const argv = [_][]const u8{ shell_path, "-c", command };
     const result = try std.process.run(allocator, io, .{
         .argv = &argv,
         .stdout_limit = .limited(max_bash_capture_bytes),
@@ -599,7 +600,8 @@ pub fn runShellCaptureWithUpdates(
 ) !ShellResult {
     const resolved_command = try prefixedShellCommand(allocator, command, options.command_prefix);
     defer resolved_command.deinit(allocator);
-    const argv = [_][]const u8{ options.shell_path orelse "sh", "-lc", resolved_command.command };
+    const shell_path = try resolveShellPath(io, options.shell_path);
+    const argv = [_][]const u8{ shell_path, "-c", resolved_command.command };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
         .stdin = .ignore,
@@ -1114,6 +1116,36 @@ fn prefixedShellCommand(allocator: std.mem.Allocator, command: []const u8, maybe
     };
 }
 
+fn resolveShellPath(io: std.Io, custom_shell_path: ?[]const u8) ![]const u8 {
+    if (custom_shell_path) |path| {
+        try validateShellPath(io, path);
+        return path;
+    }
+
+    if (comptime builtin.os.tag == .windows) return "bash.exe";
+    if (absolutePathExists(io, "/bin/bash")) return "/bin/bash";
+    return "sh";
+}
+
+fn validateShellPath(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        if (absolutePathExists(io, path)) return;
+    } else if (relativePathExists(io, path)) {
+        return;
+    }
+    return error.ShellPathNotFound;
+}
+
+fn absolutePathExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
+}
+
+fn relativePathExists(io: std.Io, path: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return true;
+}
+
 fn emitShellUpdateSnapshot(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1582,4 +1614,14 @@ test "bash output sanitizes ansi carriage returns and control bytes" {
     defer std.testing.allocator.free(result.output);
 
     try std.testing.expectEqualStrings("red\nbadok", result.output);
+}
+
+test "shell path resolution validates custom paths and prefers bash on unix" {
+    try std.testing.expectError(error.ShellPathNotFound, validateShellPath(std.testing.io, "zig-out/pi-zig-missing-shell"));
+
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (absolutePathExists(std.testing.io, "/bin/bash")) {
+            try std.testing.expectEqualStrings("/bin/bash", try resolveShellPath(std.testing.io, null));
+        }
+    }
 }
