@@ -734,6 +734,11 @@ const Runtime = struct {
         allocator.destroy(job);
     }
 
+    fn isBashRunning(self: *Runtime) bool {
+        const job = self.active_bash orelse return false;
+        return !job.isDone();
+    }
+
     fn setSessionNameMemory(self: *Runtime, name: []const u8) !void {
         const trimmed = std.mem.trim(u8, name, " \t\r\n");
         if (trimmed.len > max_session_name_bytes) return error.SessionNameTooLarge;
@@ -1576,7 +1581,9 @@ const Runtime = struct {
         }
         try w.writeAll(",\"thinkingLevel\":");
         try writeJsonString(w, thinkingLevelLabel(self.thinking_level));
-        try w.writeAll(",\"isStreaming\":false,\"isCompacting\":false,\"steeringMode\":");
+        try w.writeAll(",\"isStreaming\":false,\"isBashRunning\":");
+        try w.writeAll(if (self.isBashRunning()) "true" else "false");
+        try w.writeAll(",\"isCompacting\":false,\"steeringMode\":");
         try writeJsonString(w, self.steering_mode.label());
         try w.writeAll(",\"followUpMode\":");
         try writeJsonString(w, self.follow_up_mode.label());
@@ -1871,7 +1878,7 @@ pub fn run(
         };
         defer parsed.deinit();
 
-        if (!isAbortBashCommand(parsed.value)) runtime.collectActiveBash(allocator, true);
+        if (!isActiveBashNonBlockingCommand(parsed.value)) runtime.collectActiveBash(allocator, true);
 
         {
             runtime.mutex.lock();
@@ -1887,9 +1894,9 @@ pub fn run(
     runtime.collectActiveBash(allocator, true);
 }
 
-fn isAbortBashCommand(value: std.json.Value) bool {
+fn isActiveBashNonBlockingCommand(value: std.json.Value) bool {
     const command = getStringField(value, "type") orelse return false;
-    return std.mem.eql(u8, command, "abort_bash");
+    return std.mem.eql(u8, command, "abort_bash") or std.mem.eql(u8, command, "get_state");
 }
 
 fn getStringField(value: std.json.Value, name: []const u8) ?[]const u8 {

@@ -4254,6 +4254,73 @@ const abortBashResponse = rpcResponses.find((response) => response.id === 'abort
 if (!abortBashResponse?.success || abortBashResponse?.command !== 'abort_bash') {
   throw new Error('rpc abort_bash smoke did not return upstream-shaped success response');
 }
+const initialState = rpcResponses.find((response) => response.id === 'state-1');
+if (initialState?.data?.isBashRunning !== false) {
+  throw new Error('rpc get_state smoke did not expose idle bash running state');
+}
+
+const rpcActiveBashStateSessionFile = 'zig-out/pi-zig-rpc-active-bash-state-smoke.jsonl';
+fs.rmSync(rpcActiveBashStateSessionFile, { force: true });
+const rpcActiveBashStateChild = spawn(bin, ['rpc', rpcActiveBashStateSessionFile], {
+  env: envWithoutAnthropicAuth(),
+  stdio: ['pipe', 'pipe', 'pipe']
+});
+let rpcActiveBashStateStdout = '';
+let rpcActiveBashStateStderr = '';
+rpcActiveBashStateChild.stdout.setEncoding('utf8');
+rpcActiveBashStateChild.stderr.setEncoding('utf8');
+rpcActiveBashStateChild.stdout.on('data', (chunk) => {
+  rpcActiveBashStateStdout += chunk;
+});
+rpcActiveBashStateChild.stderr.on('data', (chunk) => {
+  rpcActiveBashStateStderr += chunk;
+});
+const rpcActiveBashStateExit = new Promise((resolve, reject) => {
+  const timeout = setTimeout(() => {
+    rpcActiveBashStateChild.kill('SIGKILL');
+    reject(new Error('rpc active bash state smoke timed out'));
+  }, 5000);
+  rpcActiveBashStateChild.once('error', (error) => {
+    clearTimeout(timeout);
+    reject(error);
+  });
+  rpcActiveBashStateChild.once('exit', (code, signal) => {
+    clearTimeout(timeout);
+    resolve({ code, signal });
+  });
+});
+function writeRpcActiveBashStateCommand(command) {
+  rpcActiveBashStateChild.stdin.write(`${JSON.stringify(command)}\n`);
+}
+writeRpcActiveBashStateCommand({
+  id: 'rpc-active-bash-running',
+  type: 'bash',
+  command: 'printf rpc-active-before; sleep 2; printf rpc-active-after'
+});
+await new Promise((resolve) => setTimeout(resolve, 150));
+writeRpcActiveBashStateCommand({ id: 'rpc-active-bash-state', type: 'get_state' });
+await new Promise((resolve) => setTimeout(resolve, 50));
+writeRpcActiveBashStateCommand({ id: 'rpc-active-bash-abort', type: 'abort_bash' });
+rpcActiveBashStateChild.stdin.end();
+const rpcActiveBashStateResult = await rpcActiveBashStateExit;
+if (rpcActiveBashStateResult.code !== 0) {
+  throw new Error(`rpc active bash state smoke failed: ${rpcActiveBashStateStderr}`);
+}
+const rpcActiveBashStateResponses = rpcActiveBashStateStdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcActiveBashState = rpcActiveBashStateResponses.find((response) => response.id === 'rpc-active-bash-state');
+const rpcActiveBashAbort = rpcActiveBashStateResponses.find((response) => response.id === 'rpc-active-bash-abort');
+const rpcActiveBashRun = rpcActiveBashStateResponses.find((response) => response.id === 'rpc-active-bash-running');
+if (!rpcActiveBashState?.success || rpcActiveBashState?.data?.isBashRunning !== true) {
+  throw new Error('rpc get_state smoke did not observe a running bash command');
+}
+if (
+  !rpcActiveBashAbort?.success ||
+  !rpcActiveBashRun?.success ||
+  rpcActiveBashRun?.data?.cancelled !== true ||
+  rpcActiveBashRun?.data?.output?.includes('rpc-active-after')
+) {
+  throw new Error('rpc active bash state smoke did not abort the observed running bash command');
+}
 const rpcAbortBashSessionFile = 'zig-out/pi-zig-rpc-bash-abort-smoke.jsonl';
 fs.rmSync(rpcAbortBashSessionFile, { force: true });
 const rpcAbortBashOutput = run(
