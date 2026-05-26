@@ -630,6 +630,28 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc tool history observed' } }] }));
       return;
     }
+    if (user.includes('rpc compaction history check')) {
+      const compactionHistory = body.messages.find(
+        (message) =>
+          message.role === 'user' &&
+          String(message.content ?? '').includes('The conversation history before this point was compacted') &&
+          String(message.content ?? '').includes('summary of compacted provider history')
+      );
+      const keptHistory = body.messages.find(
+        (message) => message.role === 'user' && String(message.content ?? '').includes('kept provider message')
+      );
+      const rawCompactedHistory = body.messages.find(
+        (message) => String(message.content ?? '') === 'raw compacted provider message'
+      );
+      if (!compactionHistory || !keptHistory || rawCompactedHistory) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing compacted context history', messages: body.messages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc compaction history observed' } }] }));
+      return;
+    }
     const defaultContent = 'mock provider response for ' + body.model + ': ' + user + (system ? ' [system=' + system + ']' : '');
     if (body.stream === true) {
       writeStreamEvents([{ choices: [{ delta: { content: defaultContent } }] }]);
@@ -3155,6 +3177,41 @@ try {
   if (!rpcProviderToolHistoryCheck?.success || rpcProviderToolHistoryCheck?.data?.text !== 'rpc tool history observed') {
     throw new Error('rpc provider prompt smoke did not send prior assistant tool-call and tool result history to the provider');
   }
+
+  const rpcProviderCompactionHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-compaction-history-smoke.jsonl');
+  fs.writeFileSync(
+    rpcProviderCompactionHistorySessionFile,
+    [
+      JSON.stringify({ type: 'session', version: 3, id: 'pi-zig-compaction-history-smoke', timestamp: 'local-foundation', cwd: '.' }),
+      JSON.stringify({ type: 'model_change', id: 'm-1', parentId: null, timestamp: 'local-foundation', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ type: 'message', id: 'm-2', parentId: 'm-1', timestamp: 'local-foundation', message: { role: 'user', content: 'raw compacted provider message' } }),
+      JSON.stringify({ type: 'message', id: 'm-3', parentId: 'm-2', timestamp: 'local-foundation', message: { role: 'assistant', content: [{ type: 'text', text: 'raw compacted assistant response' }], provider: 'openai', model: 'gpt-4o' } }),
+      JSON.stringify({ type: 'message', id: 'm-4', parentId: 'm-3', timestamp: 'local-foundation', message: { role: 'user', content: 'kept provider message' } }),
+      JSON.stringify({ type: 'compaction', id: 'm-5', parentId: 'm-4', timestamp: 'local-foundation', summary: 'summary of compacted provider history', firstKeptEntryId: 'm-4', tokensBefore: 123, details: { local: true } }),
+      ''
+    ].join('\n')
+  );
+  const rpcProviderCompactionHistoryOutput = run(
+    ['rpc', rpcProviderCompactionHistorySessionFile],
+    [
+      JSON.stringify({ id: 'rpc-compaction-history-check', type: 'prompt', message: 'rpc compaction history check' }),
+      JSON.stringify({ id: 'rpc-compaction-history-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderCompactionHistoryResponses = rpcProviderCompactionHistoryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderCompactionHistoryCheck = rpcProviderCompactionHistoryResponses.find((response) => response.id === 'rpc-compaction-history-check');
+  const rpcProviderCompactionHistoryMessages = rpcProviderCompactionHistoryResponses.find((response) => response.id === 'rpc-compaction-history-messages');
+  if (
+    !rpcProviderCompactionHistoryCheck?.success ||
+    rpcProviderCompactionHistoryCheck?.data?.text !== 'rpc compaction history observed' ||
+    rpcProviderCompactionHistoryMessages?.data?.messages?.[0]?.role !== 'compactionSummary' ||
+    rpcProviderCompactionHistoryMessages?.data?.messages?.[1]?.content !== 'kept provider message' ||
+    rpcProviderCompactionHistoryMessages?.data?.messages?.some((message) => message.content === 'raw compacted provider message')
+  ) {
+    throw new Error('rpc provider prompt smoke did not replay compacted context as summary plus kept messages');
+  }
 } finally {
   rpcFakeProvider.stop();
 }
@@ -3215,8 +3272,12 @@ if (
   throw new Error('rpc set_model smoke did not return selected model');
 }
 const messagesResponse = rpcResponses.find((response) => response.id === 'messages-1');
-if (messagesResponse?.data?.messages?.[0]?.content !== 'hello rpc') {
-  throw new Error('rpc get_messages smoke did not return accepted prompt');
+if (
+  messagesResponse?.data?.messages?.[0]?.role !== 'compactionSummary' ||
+  !messagesResponse?.data?.messages?.[0]?.summary?.includes('hello rpc') ||
+  messagesResponse?.data?.messages?.[1]?.content !== 'hello rpc'
+) {
+  throw new Error('rpc get_messages smoke did not return compacted session context');
 }
 const bashResponse = rpcResponses.find((response) => response.id === 'bash-1');
 if (
@@ -3333,9 +3394,9 @@ if (
   throw new Error('rpc auto compaction/retry controls did not return success');
 }
 if (
-  messagesResponse?.data?.messages?.[1]?.role !== 'bashExecution' ||
-  messagesResponse?.data?.messages?.[1]?.command !== 'printf rpc-bash' ||
-  messagesResponse?.data?.messages?.[1]?.output !== 'rpc-bash'
+  messagesResponse?.data?.messages?.[2]?.role !== 'bashExecution' ||
+  messagesResponse?.data?.messages?.[2]?.command !== 'printf rpc-bash' ||
+  messagesResponse?.data?.messages?.[2]?.output !== 'rpc-bash'
 ) {
   throw new Error('rpc get_messages smoke did not include bashExecution message');
 }
@@ -3357,7 +3418,7 @@ if (exportResponse?.data?.path !== rpcExportFile) {
 }
 const secondState = rpcResponses.find((response) => response.id === 'state-2');
 if (
-  secondState?.data?.messageCount !== 2 ||
+  secondState?.data?.messageCount !== 3 ||
   secondState?.data?.sessionName !== 'smoke session' ||
   secondState?.data?.sessionFile !== rpcSessionFile ||
   secondState?.data?.autoCompactionEnabled !== true ||
@@ -3396,7 +3457,7 @@ const resumeOutput = run(
 );
 const resumeResponses = resumeOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 const resumeState = resumeResponses.find((response) => response.id === 'resume-state');
-if (resumeState?.data?.messageCount !== 3 || resumeState?.data?.sessionName !== 'smoke session') {
+if (resumeState?.data?.messageCount !== 4 || resumeState?.data?.sessionName !== 'smoke session') {
   throw new Error('rpc resume smoke did not load message count and session name from JSONL');
 }
 if (resumeState?.data?.model?.provider !== 'anthropic' || resumeState?.data?.model?.id !== 'claude-haiku-4-5') {
@@ -3404,12 +3465,13 @@ if (resumeState?.data?.model?.provider !== 'anthropic' || resumeState?.data?.mod
 }
 const resumeMessages = resumeResponses.find((response) => response.id === 'resume-messages');
 if (
-  resumeMessages?.data?.messages?.[0]?.content !== 'hello rpc' ||
-  resumeMessages?.data?.messages?.[1]?.role !== 'bashExecution' ||
-  resumeMessages?.data?.messages?.[1]?.output !== 'rpc-bash' ||
+  resumeMessages?.data?.messages?.[0]?.role !== 'compactionSummary' ||
+  resumeMessages?.data?.messages?.[1]?.content !== 'hello rpc' ||
   resumeMessages?.data?.messages?.[2]?.role !== 'bashExecution' ||
-  resumeMessages?.data?.messages?.[2]?.output?.includes('rpc-bash-line-0000') ||
-  !resumeMessages?.data?.messages?.[2]?.output?.includes('rpc-bash-line-2104')
+  resumeMessages?.data?.messages?.[2]?.output !== 'rpc-bash' ||
+  resumeMessages?.data?.messages?.[3]?.role !== 'bashExecution' ||
+  resumeMessages?.data?.messages?.[3]?.output?.includes('rpc-bash-line-0000') ||
+  !resumeMessages?.data?.messages?.[3]?.output?.includes('rpc-bash-line-2104')
 ) {
   throw new Error('rpc resume smoke did not reconstruct messages from JSONL');
 }

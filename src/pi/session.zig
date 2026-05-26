@@ -384,7 +384,7 @@ pub const PersistentStore = struct {
         tokens_before: usize,
         custom_instructions: ?[]const u8,
         message_count: usize,
-    ) !void {
+    ) ![]const u8 {
         var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
         const id = try self.nextEntryId(&entry_id_buf);
         var out: std.Io.Writer.Allocating = .init(allocator);
@@ -411,6 +411,7 @@ pub const PersistentStore = struct {
         try w.writeAll("}}\n");
         try appendBytes(io, self.path(), out.written());
         try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
+        return self.leaf_id_buf[0..self.leaf_id_len];
     }
 
     pub fn appendBashExecution(

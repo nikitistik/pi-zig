@@ -22,10 +22,13 @@ const max_tool_calls_per_message = 16;
 const max_tool_call_id_bytes = 128;
 const max_tool_name_bytes = 64;
 const max_tool_arguments_bytes = 4 * 1024;
+const max_compaction_kept_id_bytes = 32;
 const max_pending_messages = 32;
 const max_auto_retry_attempts = 3;
 const default_auto_retry_base_delay_ms = 0;
 const default_auto_retry_max_delay_ms = 60_000;
+const compaction_summary_prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+const compaction_summary_suffix = "\n</summary>";
 
 const StoredRole = enum {
     system,
@@ -33,6 +36,7 @@ const StoredRole = enum {
     assistant,
     tool,
     bash_execution,
+    compaction_summary,
 
     fn label(self: StoredRole) []const u8 {
         return switch (self) {
@@ -41,6 +45,7 @@ const StoredRole = enum {
             .assistant => "assistant",
             .tool => "tool",
             .bash_execution => "bashExecution",
+            .compaction_summary => "compactionSummary",
         };
     }
 
@@ -114,6 +119,9 @@ const StoredMessage = struct {
     tool_terminate: bool = false,
     tool_calls_count: usize = 0,
     tool_calls: [max_tool_calls_per_message]StoredToolCall = undefined,
+    first_kept_entry_id_len: usize = 0,
+    first_kept_entry_id: [max_compaction_kept_id_bytes]u8 = undefined,
+    tokens_before: usize = 0,
 
     fn entryId(self: *const StoredMessage) []const u8 {
         return self.id[0..self.id_len];
@@ -140,6 +148,10 @@ const StoredMessage = struct {
     fn toolName(self: *const StoredMessage) ?[]const u8 {
         if (self.tool_name_len == 0) return null;
         return self.tool_name[0..self.tool_name_len];
+    }
+
+    fn firstKeptEntryId(self: *const StoredMessage) []const u8 {
+        return self.first_kept_entry_id[0..self.first_kept_entry_id_len];
     }
 };
 
@@ -323,6 +335,9 @@ const Runtime = struct {
                     };
                     _ = try new_store.appendBashExecution(io, allocator, message.commandText(), result);
                 },
+                .compaction_summary => {
+                    _ = try new_store.appendCompaction(io, allocator, message.text(), message.firstKeptEntryId(), message.tokens_before, null, copy_count);
+                },
             }
         }
         if (previous_model) |model| try new_store.appendModelChange(io, allocator, model.provider, model.id);
@@ -370,8 +385,23 @@ const Runtime = struct {
                 const provider = getStringFieldObject(parsed.value.object, "provider") orelse continue;
                 const model_id = getStringFieldObject(parsed.value.object, "modelId") orelse continue;
                 if (models.find(provider, model_id)) |model| self.selected_model = model;
+            } else if (std.mem.eql(u8, entry_type, "compaction")) {
+                try self.loadCompactionEntry(parsed.value.object);
             }
         }
+    }
+
+    fn loadCompactionEntry(self: *Runtime, object: std.json.ObjectMap) !void {
+        const id = getStringFieldObject(object, "id") orelse return error.InvalidSessionEntry;
+        const summary = getStringFieldObject(object, "summary") orelse return error.InvalidSessionEntry;
+        const first_kept_entry_id = getStringFieldObject(object, "firstKeptEntryId") orelse "";
+        const tokens_before_value = object.get("tokensBefore") orelse return error.InvalidSessionEntry;
+        const tokens_before: usize = switch (tokens_before_value) {
+            .integer => |value| if (value < 0) 0 else @intCast(value),
+            .float => |value| if (value < 0) 0 else @intFromFloat(value),
+            else => return error.InvalidSessionEntry,
+        };
+        try self.addLoadedCompaction(id, summary, first_kept_entry_id, tokens_before);
     }
 
     fn loadMessageEntry(self: *Runtime, object: std.json.ObjectMap) !void {
@@ -430,7 +460,22 @@ const Runtime = struct {
         slot.tool_is_error = false;
         slot.tool_terminate = false;
         slot.tool_calls_count = 0;
+        slot.first_kept_entry_id_len = 0;
+        slot.tokens_before = 0;
         self.message_count += 1;
+    }
+
+    fn addLoadedCompaction(self: *Runtime, entry_id: []const u8, summary: []const u8, first_kept_entry_id: []const u8, tokens_before: usize) !void {
+        if (summary.len > max_message_bytes) return error.MessageTooLarge;
+        if (entry_id.len > 32) return error.ValueTooLong;
+        if (first_kept_entry_id.len > max_compaction_kept_id_bytes) return error.ValueTooLong;
+        if (self.message_count >= max_messages) return error.MessageLimitReached;
+
+        try self.addLoadedMessage(.compaction_summary, entry_id, summary);
+        var slot = &self.messages[self.message_count - 1];
+        slot.first_kept_entry_id_len = first_kept_entry_id.len;
+        @memcpy(slot.first_kept_entry_id[0..first_kept_entry_id.len], first_kept_entry_id);
+        slot.tokens_before = tokens_before;
     }
 
     fn addMessage(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, role: types.Role, content: []const u8) !void {
@@ -467,6 +512,8 @@ const Runtime = struct {
         slot.tool_is_error = false;
         slot.tool_terminate = false;
         slot.tool_calls_count = 0;
+        slot.first_kept_entry_id_len = 0;
+        slot.tokens_before = 0;
         self.message_count += 1;
     }
 
@@ -543,7 +590,8 @@ const Runtime = struct {
         const summary = summary_writer.written();
         const first_kept_entry_id = if (self.message_count > 0) self.messages[0].entryId() else "";
         const tokens_before = self.estimateTokensBeforeCompaction();
-        try self.store.appendCompaction(io, allocator, summary, first_kept_entry_id, tokens_before, custom_instructions, self.message_count);
+        const entry_id = try self.store.appendCompaction(io, allocator, summary, first_kept_entry_id, tokens_before, custom_instructions, self.message_count);
+        try self.addLoadedCompaction(entry_id, summary, first_kept_entry_id, tokens_before);
 
         try writeResponseHead(w, id, command, true);
         try w.writeAll(",\"data\":{\"summary\":");
@@ -636,16 +684,51 @@ const Runtime = struct {
 
         var limit = self.message_count;
         if (limit > 0) limit -= 1;
-        for (self.messages[0..limit]) |*message| {
-            switch (message.role) {
-                .user => try appendHistoryMessage(allocator, &history, .user, message.text()),
-                .assistant => try appendAssistantHistoryMessage(allocator, &history, message),
-                .tool => try appendToolHistoryMessage(allocator, &history, message),
-                .bash_execution => try appendOwnedHistoryMessage(allocator, &history, .user, try self.bashExecutionHistoryText(allocator, message)),
-                else => {},
-            }
+        if (self.latestCompactionIndex(limit)) |compaction_index| {
+            try appendCompactionHistoryMessage(allocator, &history, &self.messages[compaction_index]);
+            const first_kept_index = self.firstKeptMessageIndex(compaction_index) orelse compaction_index + 1;
+            try self.appendHistoryRange(allocator, &history, first_kept_index, compaction_index);
+            try self.appendHistoryRange(allocator, &history, compaction_index + 1, limit);
+        } else {
+            try self.appendHistoryRange(allocator, &history, 0, limit);
         }
         return history;
+    }
+
+    fn appendHistoryRange(self: *Runtime, allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), start: usize, end: usize) !void {
+        if (start >= end) return;
+        for (self.messages[start..end]) |*message| {
+            try self.appendStoredHistoryMessage(allocator, history, message);
+        }
+    }
+
+    fn appendStoredHistoryMessage(self: *Runtime, allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), message: *StoredMessage) !void {
+        switch (message.role) {
+            .user => try appendHistoryMessage(allocator, history, .user, message.text()),
+            .assistant => try appendAssistantHistoryMessage(allocator, history, message),
+            .tool => try appendToolHistoryMessage(allocator, history, message),
+            .bash_execution => try appendOwnedHistoryMessage(allocator, history, .user, try self.bashExecutionHistoryText(allocator, message)),
+            .compaction_summary => {},
+            else => {},
+        }
+    }
+
+    fn latestCompactionIndex(self: *Runtime, limit: usize) ?usize {
+        var index = @min(limit, self.message_count);
+        while (index > 0) {
+            index -= 1;
+            if (self.messages[index].role == .compaction_summary) return index;
+        }
+        return null;
+    }
+
+    fn firstKeptMessageIndex(self: *Runtime, compaction_index: usize) ?usize {
+        const first_kept_entry_id = self.messages[compaction_index].firstKeptEntryId();
+        if (first_kept_entry_id.len == 0) return null;
+        for (self.messages[0..compaction_index], 0..) |*message, index| {
+            if (std.mem.eql(u8, message.entryId(), first_kept_entry_id)) return index;
+        }
+        return null;
     }
 
     fn appendHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), role: ai_client.ChatRole, content: []const u8) !void {
@@ -696,6 +779,11 @@ const Runtime = struct {
             chat_message.tool_call_id = try allocator.dupe(u8, id);
         }
         try history.append(allocator, chat_message);
+    }
+
+    fn appendCompactionHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), message: *const StoredMessage) !void {
+        const content = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ compaction_summary_prefix, message.text(), compaction_summary_suffix });
+        try appendOwnedHistoryMessage(allocator, history, .user, content);
     }
 
     fn deinitAgentHistory(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage)) void {
@@ -1253,11 +1341,30 @@ const Runtime = struct {
     fn writeMessages(self: *Runtime, w: *std.Io.Writer, id: ?[]const u8, command: []const u8) !void {
         try writeResponseHead(w, id, command, true);
         try w.writeAll(",\"data\":{\"messages\":[");
-        for (self.messages[0..self.message_count], 0..) |*message, i| {
-            if (i != 0) try w.writeByte(',');
-            try self.writeStoredMessage(w, message);
+        var emitted: usize = 0;
+        if (self.latestCompactionIndex(self.message_count)) |compaction_index| {
+            try self.writeStoredMessageWithComma(w, &self.messages[compaction_index], &emitted);
+            const first_kept_index = self.firstKeptMessageIndex(compaction_index) orelse compaction_index + 1;
+            try self.writeMessageRange(w, first_kept_index, compaction_index, &emitted);
+            try self.writeMessageRange(w, compaction_index + 1, self.message_count, &emitted);
+        } else {
+            try self.writeMessageRange(w, 0, self.message_count, &emitted);
         }
         try w.writeAll("]}}\n");
+    }
+
+    fn writeMessageRange(self: *Runtime, w: *std.Io.Writer, start: usize, end: usize, emitted: *usize) !void {
+        if (start >= end) return;
+        for (self.messages[start..end]) |*message| {
+            if (message.role == .compaction_summary) continue;
+            try self.writeStoredMessageWithComma(w, message, emitted);
+        }
+    }
+
+    fn writeStoredMessageWithComma(self: *Runtime, w: *std.Io.Writer, message: *const StoredMessage, emitted: *usize) !void {
+        if (emitted.* != 0) try w.writeByte(',');
+        try self.writeStoredMessage(w, message);
+        emitted.* += 1;
     }
 
     fn writeStoredMessage(self: *Runtime, w: *std.Io.Writer, message: *const StoredMessage) !void {
@@ -1283,6 +1390,13 @@ const Runtime = struct {
                 try w.writeAll(",\"fullOutputPath\":");
                 try writeJsonString(w, path);
             }
+        } else if (message.role == .compaction_summary) {
+            try w.writeAll(",\"summary\":");
+            try writeJsonString(w, message.text());
+            try w.writeAll(",\"tokensBefore\":");
+            try w.print("{d}", .{message.tokens_before});
+            try w.writeAll(",\"firstKeptEntryId\":");
+            try writeJsonString(w, message.firstKeptEntryId());
         } else {
             try w.writeAll(",\"content\":");
             try writeJsonString(w, message.text());
@@ -1643,6 +1757,7 @@ fn parseStoredRole(role: []const u8) ?StoredRole {
     if (std.mem.eql(u8, role, "assistant")) return .assistant;
     if (std.mem.eql(u8, role, "tool") or std.mem.eql(u8, role, "toolResult")) return .tool;
     if (std.mem.eql(u8, role, "bashExecution")) return .bash_execution;
+    if (std.mem.eql(u8, role, "compactionSummary")) return .compaction_summary;
     return null;
 }
 
