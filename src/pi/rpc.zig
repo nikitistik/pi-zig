@@ -29,6 +29,7 @@ const max_pending_messages = 32;
 const max_auto_retry_attempts = 3;
 const default_auto_retry_base_delay_ms = 0;
 const default_auto_retry_max_delay_ms = 60_000;
+const retry_sleep_poll_ms = 25;
 const compaction_summary_prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const compaction_summary_suffix = "\n</summary>";
 
@@ -94,6 +95,78 @@ const ActiveBashJob = struct {
     }
 
     fn isDone(self: *ActiveBashJob) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.done;
+    }
+};
+
+const ActivePromptJob = struct {
+    runtime: *Runtime,
+    output: *RpcOutput,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    id: ?[]u8 = null,
+    message: []u8,
+    image_parts: []ai_client.ChatContentPart = &.{},
+    thread: ?std.Thread = null,
+    mutex: Mutex = .{},
+    cancel_requested: bool = false,
+    retry_cancel_requested: bool = false,
+    retry_sleeping: bool = false,
+    done: bool = false,
+
+    fn deinit(self: *ActivePromptJob) void {
+        if (self.id) |id| self.allocator.free(id);
+        self.allocator.free(self.message);
+        freeRpcContentParts(self.allocator, self.image_parts);
+    }
+
+    fn requestCancel(self: *ActivePromptJob) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cancel_requested = true;
+        self.retry_cancel_requested = true;
+    }
+
+    fn requestRetryCancel(self: *ActivePromptJob) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.retry_cancel_requested = true;
+    }
+
+    fn shouldCancel(self: *ActivePromptJob) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.cancel_requested;
+    }
+
+    fn shouldCancelRetrySleep(self: *ActivePromptJob) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.retry_cancel_requested or self.cancel_requested;
+    }
+
+    fn setRetrySleeping(self: *ActivePromptJob, value: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.retry_sleeping = value;
+    }
+
+    fn isRetrying(self: *ActivePromptJob) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.retry_sleeping;
+    }
+
+    fn markDone(self: *ActivePromptJob) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.retry_sleeping = false;
+        self.done = true;
+    }
+
+    fn isDone(self: *ActivePromptJob) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.done;
@@ -322,6 +395,7 @@ const Runtime = struct {
     run_options: RunOptions = .{},
     env: ?*const std.process.Environ.Map = null,
     active_bash: ?*ActiveBashJob = null,
+    active_prompt: ?*ActivePromptJob = null,
 
     fn init(
         self: *Runtime,
@@ -360,6 +434,69 @@ const Runtime = struct {
         self.auto_retry_max_delay_ms = default_auto_retry_max_delay_ms;
         self.last_retry_attempts = 0;
         self.last_retry_delay_ms = 0;
+    }
+
+    fn startPromptAsync(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        output: *RpcOutput,
+        id: ?[]const u8,
+        message: []const u8,
+        image_parts: []const ai_client.ChatContentPart,
+    ) !void {
+        if (self.active_prompt != null) return error.PromptAlreadyRunning;
+        const owned_id = if (id) |request_id| try allocator.dupe(u8, request_id) else null;
+        errdefer if (owned_id) |request_id| allocator.free(request_id);
+        const owned_message = try allocator.dupe(u8, message);
+        errdefer allocator.free(owned_message);
+        const owned_image_parts = try cloneImageParts(allocator, image_parts);
+        errdefer freeRpcContentParts(allocator, owned_image_parts);
+
+        var job = try allocator.create(ActivePromptJob);
+        errdefer allocator.destroy(job);
+        job.* = .{
+            .runtime = self,
+            .output = output,
+            .io = io,
+            .allocator = allocator,
+            .id = owned_id,
+            .message = owned_message,
+            .image_parts = owned_image_parts,
+        };
+        job.thread = try std.Thread.spawn(.{}, promptThreadMain, .{job});
+        self.active_prompt = job;
+    }
+
+    fn cancelActivePrompt(self: *Runtime) bool {
+        const job = self.active_prompt orelse return false;
+        job.requestCancel();
+        return true;
+    }
+
+    fn cancelActivePromptRetry(self: *Runtime) bool {
+        const job = self.active_prompt orelse return false;
+        job.requestRetryCancel();
+        return true;
+    }
+
+    fn collectActivePrompt(self: *Runtime, allocator: std.mem.Allocator, wait: bool) void {
+        const job = self.active_prompt orelse return;
+        if (!wait and !job.isDone()) return;
+        if (job.thread) |thread| thread.join();
+        self.active_prompt = null;
+        job.deinit();
+        allocator.destroy(job);
+    }
+
+    fn isPromptRunning(self: *Runtime) bool {
+        const job = self.active_prompt orelse return false;
+        return !job.isDone();
+    }
+
+    fn isPromptRetrying(self: *Runtime) bool {
+        const job = self.active_prompt orelse return false;
+        return job.isRetrying();
     }
 
     fn clearLoadedImages(self: *Runtime, allocator: std.mem.Allocator) void {
@@ -848,6 +985,7 @@ const Runtime = struct {
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
+        prompt_job: ?*ActivePromptJob,
         history_limit: usize,
         batch_history_messages: []const UserBatchMessage,
         prompt: []const u8,
@@ -899,6 +1037,8 @@ const Runtime = struct {
             .tool_hook_context = if (has_extension_hooks) &extension_runner_instance else null,
             .before_tool_call = if (has_extension_hooks) extension_runner.Runner.beforeToolCall else null,
             .after_tool_call = if (has_extension_hooks) extension_runner.Runner.afterToolCall else null,
+            .cancellation_context = if (prompt_job) |job| job else null,
+            .should_cancel = if (prompt_job != null) shouldCancelActivePrompt else null,
         });
     }
 
@@ -943,6 +1083,8 @@ const Runtime = struct {
         io: std.Io,
         allocator: std.mem.Allocator,
         w: *std.Io.Writer,
+        retry_event_output: ?*RpcOutput,
+        prompt_job: ?*ActivePromptJob,
         history_limit: usize,
         batch_history_messages: []const UserBatchMessage,
         prompt: []const u8,
@@ -952,12 +1094,12 @@ const Runtime = struct {
         self.last_retry_attempts = 0;
         self.last_retry_delay_ms = 0;
         while (true) {
-            const result = self.runAgentIfAuthenticatedOnce(io, allocator, history_limit, batch_history_messages, prompt, prompt_image_parts) catch |err| {
+            const result = self.runAgentIfAuthenticatedOnce(io, allocator, prompt_job, history_limit, batch_history_messages, prompt, prompt_image_parts) catch |err| {
                 if (!self.auto_retry_enabled or !isRetryableAgentError(err)) return err;
                 if (retry_attempts >= self.auto_retry_max_attempts) {
                     if (retry_attempts > 0) {
-                        try writeRpcAgentEndEvent(w, false);
-                        try writeRpcAutoRetryEndEvent(w, false, retry_attempts, @errorName(err));
+                        try writeRpcAgentEndEventMaybeLocked(retry_event_output, w, false);
+                        try writeRpcAutoRetryEndEventMaybeLocked(retry_event_output, w, false, retry_attempts, @errorName(err));
                     }
                     return err;
                 }
@@ -965,14 +1107,26 @@ const Runtime = struct {
                 self.last_retry_attempts = retry_attempts;
                 const delay_ms = self.retryDelayMs(retry_attempts);
                 self.last_retry_delay_ms += delay_ms;
-                try writeRpcAgentEndEvent(w, true);
-                try writeRpcAutoRetryStartEvent(w, retry_attempts, self.auto_retry_max_attempts, delay_ms, @errorName(err));
-                if (delay_ms > 0) try sleepMilliseconds(io, delay_ms);
+                if (prompt_job) |job| job.setRetrySleeping(true);
+                try writeRpcAgentEndEventMaybeLocked(retry_event_output, w, true);
+                try writeRpcAutoRetryStartEventMaybeLocked(retry_event_output, w, retry_attempts, self.auto_retry_max_attempts, delay_ms, @errorName(err));
+                if (prompt_job) |job| {
+                    sleepMillisecondsCancellable(io, delay_ms, job) catch |sleep_err| {
+                        job.setRetrySleeping(false);
+                        if (sleep_err == error.RetryCancelled) {
+                            try writeRpcAutoRetryEndEventMaybeLocked(retry_event_output, w, false, retry_attempts, "Retry cancelled");
+                        }
+                        return sleep_err;
+                    };
+                    job.setRetrySleeping(false);
+                } else if (delay_ms > 0) {
+                    try sleepMilliseconds(io, delay_ms);
+                }
                 continue;
             };
             if (retry_attempts > 0) {
-                try writeRpcAutoRetryEndEvent(w, true, retry_attempts, null);
-                try writeRpcAgentEndEvent(w, false);
+                try writeRpcAutoRetryEndEventMaybeLocked(retry_event_output, w, true, retry_attempts, null);
+                try writeRpcAgentEndEventMaybeLocked(retry_event_output, w, false);
             }
             return result;
         }
@@ -1242,6 +1396,8 @@ const Runtime = struct {
         io: std.Io,
         allocator: std.mem.Allocator,
         w: *std.Io.Writer,
+        retry_event_output: ?*RpcOutput,
+        prompt_job: ?*ActivePromptJob,
         messages: []const UserBatchMessage,
         last_result: *?agent.RunResult,
     ) !void {
@@ -1256,6 +1412,8 @@ const Runtime = struct {
             io,
             allocator,
             w,
+            retry_event_output,
+            prompt_job,
             history_limit,
             messages[0 .. messages.len - 1],
             prompt_message.text,
@@ -1283,18 +1441,20 @@ const Runtime = struct {
         io: std.Io,
         allocator: std.mem.Allocator,
         w: *std.Io.Writer,
+        retry_event_output: ?*RpcOutput,
+        prompt_job: ?*ActivePromptJob,
         last_result: *?agent.RunResult,
     ) !void {
         var batch: [max_pending_messages]UserBatchMessage = undefined;
         while (self.steering_queue.count > 0 or self.follow_up_queue.count > 0) {
             if (self.steering_queue.count > 0) {
                 const count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, &batch);
-                try self.runUserBatch(io, allocator, w, batch[0..count], last_result);
+                try self.runUserBatch(io, allocator, w, retry_event_output, prompt_job, batch[0..count], last_result);
                 self.steering_queue.dropPrefix(allocator, count);
                 continue;
             }
             const count = self.drainQueueBatch(&self.follow_up_queue, self.follow_up_mode, &batch);
-            try self.runUserBatch(io, allocator, w, batch[0..count], last_result);
+            try self.runUserBatch(io, allocator, w, retry_event_output, prompt_job, batch[0..count], last_result);
             self.follow_up_queue.dropPrefix(allocator, count);
         }
     }
@@ -1337,23 +1497,39 @@ const Runtime = struct {
         message: []const u8,
         image_parts: []const ai_client.ChatContentPart,
     ) !void {
+        const maybe_result = self.runPromptCommand(io, allocator, w, null, null, message, image_parts) catch |err| {
+            return writeError(w, id, command, @errorName(err));
+        };
+        defer if (maybe_result) |result| result.deinit(allocator);
+
+        const result = maybe_result orelse return writeSuccess(w, id, command);
+        return self.writePromptAgentResult(w, id, command, result);
+    }
+
+    fn runPromptCommand(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
+        retry_event_output: ?*RpcOutput,
+        prompt_job: ?*ActivePromptJob,
+        message: []const u8,
+        image_parts: []const ai_client.ChatContentPart,
+    ) !?agent.RunResult {
         var last_result: ?agent.RunResult = null;
-        defer if (last_result) |result| result.deinit(allocator);
+        errdefer if (last_result) |result| result.deinit(allocator);
 
         var initial_batch: [1 + max_pending_messages]UserBatchMessage = undefined;
         initial_batch[0] = .{ .text = message, .image_parts = image_parts };
         const steering_count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, initial_batch[1..]);
-        self.runUserBatch(io, allocator, w, initial_batch[0 .. 1 + steering_count], &last_result) catch |err| {
-            return writeError(w, id, command, @errorName(err));
-        };
+        try self.runUserBatch(io, allocator, w, retry_event_output, prompt_job, initial_batch[0 .. 1 + steering_count], &last_result);
         self.steering_queue.dropPrefix(allocator, steering_count);
 
-        self.drainQueuedMessages(io, allocator, w, &last_result) catch |err| {
-            return writeError(w, id, command, @errorName(err));
-        };
+        try self.drainQueuedMessages(io, allocator, w, retry_event_output, prompt_job, &last_result);
 
-        const result = last_result orelse return writeSuccess(w, id, command);
-        return self.writePromptAgentResult(w, id, command, result);
+        const result = last_result orelse return null;
+        last_result = null;
+        return result;
     }
 
     fn handleValue(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, output: *RpcOutput, value: std.json.Value) !void {
@@ -1371,7 +1547,10 @@ const Runtime = struct {
                 return writeError(w, id, command, "prompt images must be ImageContent objects with type=image, data, and mimeType");
             };
             defer freeRpcImages(allocator, image_parts);
-            return self.handlePromptCommand(io, allocator, w, id, command, message, image_parts);
+            self.startPromptAsync(io, allocator, output, id, message, image_parts) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            };
+            return;
         }
 
         if (std.mem.eql(u8, command, "steer")) {
@@ -1399,6 +1578,7 @@ const Runtime = struct {
         if (std.mem.eql(u8, command, "abort")) {
             self.steering_queue.clear(allocator);
             self.follow_up_queue.clear(allocator);
+            _ = self.cancelActivePrompt();
             return writeSuccess(w, id, command);
         }
 
@@ -1602,6 +1782,7 @@ const Runtime = struct {
         }
 
         if (std.mem.eql(u8, command, "abort_retry")) {
+            _ = self.cancelActivePromptRetry();
             return writeSuccess(w, id, command);
         }
 
@@ -1664,7 +1845,11 @@ const Runtime = struct {
         }
         try w.writeAll(",\"thinkingLevel\":");
         try writeJsonString(w, thinkingLevelLabel(self.thinking_level));
-        try w.writeAll(",\"isStreaming\":false,\"isBashRunning\":");
+        try w.writeAll(",\"isStreaming\":");
+        try w.writeAll(if (self.isPromptRunning()) "true" else "false");
+        try w.writeAll(",\"isRetrying\":");
+        try w.writeAll(if (self.isPromptRetrying()) "true" else "false");
+        try w.writeAll(",\"isBashRunning\":");
         try w.writeAll(if (self.isBashRunning()) "true" else "false");
         try w.writeAll(",\"isCompacting\":false,\"steeringMode\":");
         try writeJsonString(w, self.steering_mode.label());
@@ -1862,6 +2047,47 @@ const Runtime = struct {
     }
 };
 
+fn promptThreadMain(job: *ActivePromptJob) void {
+    const maybe_result = job.runtime.runPromptCommand(
+        job.io,
+        job.allocator,
+        job.output.writer,
+        job.output,
+        job,
+        job.message,
+        job.image_parts,
+    ) catch |err| {
+        job.output.mutex.lock();
+        defer job.output.mutex.unlock();
+        writeError(job.output.writer, job.id, "prompt", @errorName(err)) catch {};
+        job.output.writer.flush() catch {};
+        job.markDone();
+        return;
+    };
+    defer if (maybe_result) |result| result.deinit(job.allocator);
+
+    job.output.mutex.lock();
+    defer job.output.mutex.unlock();
+    if (maybe_result) |result| {
+        job.runtime.writePromptAgentResult(job.output.writer, job.id, "prompt", result) catch {
+            job.markDone();
+            return;
+        };
+    } else {
+        writeSuccess(job.output.writer, job.id, "prompt") catch {
+            job.markDone();
+            return;
+        };
+    }
+    job.output.writer.flush() catch {};
+    job.markDone();
+}
+
+fn shouldCancelActivePrompt(ctx: *anyopaque) bool {
+    const job: *ActivePromptJob = @ptrCast(@alignCast(ctx));
+    return job.shouldCancel();
+}
+
 fn bashThreadMain(job: *ActiveBashJob) void {
     const result = job.runtime.captureBash(
         job.io,
@@ -1928,6 +2154,7 @@ pub fn run(
     var runtime: Runtime = .{};
     try runtime.init(io, allocator, env, session_file, run_options);
     defer runtime.deinit(allocator);
+    defer runtime.collectActivePrompt(allocator, true);
     defer runtime.collectActiveBash(allocator, true);
 
     var in_buf: [16 * 1024]u8 = undefined;
@@ -1961,6 +2188,7 @@ pub fn run(
         };
         defer parsed.deinit();
 
+        if (!isActivePromptNonBlockingCommand(parsed.value)) runtime.collectActivePrompt(allocator, true);
         if (!isActiveBashNonBlockingCommand(parsed.value)) runtime.collectActiveBash(allocator, true);
 
         {
@@ -1971,10 +2199,17 @@ pub fn run(
             try runtime.handleValue(io, allocator, &output, parsed.value);
             try w.flush();
         }
+        runtime.collectActivePrompt(allocator, false);
         runtime.collectActiveBash(allocator, false);
     }
 
+    runtime.collectActivePrompt(allocator, true);
     runtime.collectActiveBash(allocator, true);
+}
+
+fn isActivePromptNonBlockingCommand(value: std.json.Value) bool {
+    const command = getStringField(value, "type") orelse return false;
+    return std.mem.eql(u8, command, "abort_retry");
 }
 
 fn isActiveBashNonBlockingCommand(value: std.json.Value) bool {
@@ -2226,6 +2461,17 @@ fn sleepMilliseconds(io: std.Io, milliseconds: usize) !void {
     try std.Io.sleep(io, .fromMilliseconds(@intCast(bounded)), .awake);
 }
 
+fn sleepMillisecondsCancellable(io: std.Io, milliseconds: usize, job: *ActivePromptJob) !void {
+    var remaining = milliseconds;
+    while (remaining > 0) {
+        if (job.shouldCancelRetrySleep()) return error.RetryCancelled;
+        const step = @min(remaining, retry_sleep_poll_ms);
+        try sleepMilliseconds(io, step);
+        remaining -= step;
+    }
+    if (job.shouldCancelRetrySleep()) return error.RetryCancelled;
+}
+
 fn getOptionalExitCode(object: std.json.ObjectMap) ?u8 {
     const field = object.get("exitCode") orelse return null;
     return switch (field) {
@@ -2270,6 +2516,16 @@ fn writeRpcAgentEndEvent(w: *std.Io.Writer, will_retry: bool) !void {
     try w.writeAll("}\n");
 }
 
+fn writeRpcAgentEndEventMaybeLocked(output: ?*RpcOutput, w: *std.Io.Writer, will_retry: bool) !void {
+    if (output) |rpc_output| {
+        rpc_output.mutex.lock();
+        defer rpc_output.mutex.unlock();
+        try writeRpcAgentEndEvent(rpc_output.writer, will_retry);
+        return rpc_output.writer.flush();
+    }
+    return writeRpcAgentEndEvent(w, will_retry);
+}
+
 fn writeRpcAutoRetryStartEvent(
     w: *std.Io.Writer,
     attempt: usize,
@@ -2288,6 +2544,23 @@ fn writeRpcAutoRetryStartEvent(
     try w.writeAll("}\n");
 }
 
+fn writeRpcAutoRetryStartEventMaybeLocked(
+    output: ?*RpcOutput,
+    w: *std.Io.Writer,
+    attempt: usize,
+    max_attempts: usize,
+    delay_ms: usize,
+    error_message: []const u8,
+) !void {
+    if (output) |rpc_output| {
+        rpc_output.mutex.lock();
+        defer rpc_output.mutex.unlock();
+        try writeRpcAutoRetryStartEvent(rpc_output.writer, attempt, max_attempts, delay_ms, error_message);
+        return rpc_output.writer.flush();
+    }
+    return writeRpcAutoRetryStartEvent(w, attempt, max_attempts, delay_ms, error_message);
+}
+
 fn writeRpcAutoRetryEndEvent(w: *std.Io.Writer, success: bool, attempt: usize, final_error: ?[]const u8) !void {
     try w.writeAll("{\"type\":\"auto_retry_end\",\"success\":");
     try w.writeAll(if (success) "true" else "false");
@@ -2298,6 +2571,22 @@ fn writeRpcAutoRetryEndEvent(w: *std.Io.Writer, success: bool, attempt: usize, f
         try writeJsonString(w, message);
     }
     try w.writeAll("}\n");
+}
+
+fn writeRpcAutoRetryEndEventMaybeLocked(
+    output: ?*RpcOutput,
+    w: *std.Io.Writer,
+    success: bool,
+    attempt: usize,
+    final_error: ?[]const u8,
+) !void {
+    if (output) |rpc_output| {
+        rpc_output.mutex.lock();
+        defer rpc_output.mutex.unlock();
+        try writeRpcAutoRetryEndEvent(rpc_output.writer, success, attempt, final_error);
+        return rpc_output.writer.flush();
+    }
+    return writeRpcAutoRetryEndEvent(w, success, attempt, final_error);
 }
 
 fn writeBashResultJson(w: *std.Io.Writer, result: tools.ShellResult) !void {

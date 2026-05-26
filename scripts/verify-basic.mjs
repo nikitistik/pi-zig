@@ -1659,6 +1659,23 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
       return;
     }
+    if (user.includes('rpc retry abort delay')) {
+      const count = (requestCounts.get(user) ?? 0) + 1;
+      requestCounts.set(user, count);
+      if (count === 1) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'temporary provider failure before abortable retry delay' }));
+        return;
+      }
+      const content = 'rpc retry abort delay unexpectedly recovered';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
     if (user.includes('rpc retry exhausted')) {
       res.writeHead(503, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'temporary provider failure' }));
@@ -4655,6 +4672,140 @@ try {
     PI_ZIG_PROVIDER_BASE_URL: rpcFakeProvider.baseUrl,
     PI_CODING_AGENT_DIR: rpcProviderAuthDir
   };
+  async function runRpcRetryAbortDelaySmoke() {
+    const sessionFile = path.resolve('zig-out/pi-zig-rpc-provider-retry-abort-delay-smoke.jsonl');
+    fs.rmSync(sessionFile, { force: true });
+    const child = spawn(bin, ['rpc', sessionFile], {
+      env: rpcProviderEnv,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    let pending = '';
+    const lines = [];
+    const waiters = [];
+    function failWaiters(error) {
+      while (waiters.length > 0) {
+        const waiter = waiters.pop();
+        clearTimeout(waiter.timeout);
+        waiter.reject(error);
+      }
+    }
+    function resolveWaiters(line) {
+      for (let index = 0; index < waiters.length;) {
+        const waiter = waiters[index];
+        if (waiter.predicate(line)) {
+          waiters.splice(index, 1);
+          clearTimeout(waiter.timeout);
+          waiter.resolve(line);
+        } else {
+          index += 1;
+        }
+      }
+    }
+    function waitForLine(predicate, timeoutMs = 2500) {
+      const existing = lines.find(predicate);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          const error = new Error(`timed out waiting for RPC line\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+          const index = waiters.findIndex((waiter) => waiter.reject === reject);
+          if (index !== -1) waiters.splice(index, 1);
+          reject(error);
+        }, timeoutMs);
+        waiters.push({ predicate, resolve, reject, timeout });
+      });
+    }
+    function writeCommand(command) {
+      child.stdin.write(`${JSON.stringify(command)}\n`);
+    }
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      pending += chunk;
+      while (pending.includes('\n')) {
+        const newline = pending.indexOf('\n');
+        const rawLine = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (rawLine.trim().length === 0) continue;
+        try {
+          const line = JSON.parse(rawLine);
+          lines.push(line);
+          resolveWaiters(line);
+        } catch (error) {
+          failWaiters(new Error(`failed to parse RPC JSON line: ${rawLine}\n${error.message}`));
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const exitPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`rpc retry abort delay smoke timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      }, 7000);
+      child.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once('exit', (code, signal) => {
+        clearTimeout(timeout);
+        if (code !== 0) {
+          reject(new Error(`rpc retry abort delay smoke exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          return;
+        }
+        resolve();
+      });
+    });
+
+    writeCommand({ id: 'rpc-retry-abort-delay-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' });
+    await waitForLine((line) => line.id === 'rpc-retry-abort-delay-model' && line.success === true);
+    writeCommand({ id: 'rpc-retry-abort-delay-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 1000, maxDelayMs: 1000 });
+    await waitForLine((line) => line.id === 'rpc-retry-abort-delay-enable' && line.success === true);
+    writeCommand({ id: 'rpc-retry-abort-delay-prompt', type: 'prompt', message: 'rpc retry abort delay' });
+    const retryStart = await waitForLine((line) => line.type === 'auto_retry_start' && line.attempt === 1);
+    writeCommand({ id: 'rpc-retry-abort-delay-abort', type: 'abort_retry' });
+    const abortResponse = await waitForLine((line) => line.id === 'rpc-retry-abort-delay-abort');
+    const retryEnd = await waitForLine((line) => line.type === 'auto_retry_end' && line.success === false);
+    writeCommand({ id: 'rpc-retry-abort-delay-state', type: 'get_state' });
+    const state = await waitForLine((line) => line.id === 'rpc-retry-abort-delay-state');
+    child.stdin.end();
+    await exitPromise;
+
+    const summary = lines
+      .filter((line) => ['agent_end', 'auto_retry_start', 'auto_retry_end'].includes(line.type))
+      .map((line) => {
+        if (line.type === 'agent_end') return `agent_end:${line.willRetry}`;
+        if (line.type === 'auto_retry_start') return `auto_retry_start:${line.attempt}:${line.maxAttempts}:${line.delayMs}:${line.errorMessage}`;
+        return `auto_retry_end:${line.success}:${line.attempt}:${line.finalError}`;
+      });
+    if (
+      retryStart.maxAttempts !== 2 ||
+      retryStart.delayMs !== 1000 ||
+      retryStart.errorMessage !== 'ProviderRequestFailed' ||
+      !abortResponse.success ||
+      retryEnd.finalError !== 'Retry cancelled' ||
+      state.data?.autoRetryEnabled !== true ||
+      state.data?.autoRetryMaxAttempts !== 2 ||
+      state.data?.autoRetryBaseDelayMs !== 1000 ||
+      state.data?.autoRetryMaxDelayMs !== 1000 ||
+      state.data?.lastRetryAttempts !== 1 ||
+      state.data?.lastRetryDelayMs !== 1000 ||
+      state.data?.isRetrying !== false ||
+      lines.some((line) => line.type === 'auto_retry_start' && line.attempt === 2) ||
+      lines.some((line) => line.type === 'auto_retry_end' && line.success === true) ||
+      stdout.includes('rpc retry abort delay unexpectedly recovered') ||
+      JSON.stringify(summary) !== JSON.stringify([
+        'agent_end:true',
+        'auto_retry_start:1:2:1000:ProviderRequestFailed',
+        'auto_retry_end:false:1:Retry cancelled'
+      ])
+    ) {
+      throw new Error(`rpc retry abort delay smoke did not cancel retry sleep\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+  }
   const rpcExtensionHookFixture = path.resolve('zig-out/pi-zig-rpc-extension-hook-fixture');
   fs.rmSync(rpcExtensionHookFixture, { recursive: true, force: true });
   fs.mkdirSync(rpcExtensionHookFixture, { recursive: true });
@@ -5156,6 +5307,8 @@ export default function(pi: any): void {
   ) {
     throw new Error('rpc provider retry classifier smoke retried a non-transient client error');
   }
+
+  await runRpcRetryAbortDelaySmoke();
 
   const rpcProviderOutput = run(
     ['rpc', rpcProviderSessionFile],
