@@ -5,6 +5,8 @@ const tools = @import("tools.zig");
 pub const ToolStartCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!void;
 pub const ToolEndCallback = *const fn (ctx: *anyopaque, result: ToolResult) anyerror!void;
 pub const TextDeltaCallback = ai_client.StreamTextCallback;
+pub const BeforeToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!BeforeToolCallResult;
+pub const AfterToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall, result: ToolResult) anyerror!AfterToolCallResult;
 
 pub const RunOptions = struct {
     provider: []const u8,
@@ -19,8 +21,32 @@ pub const RunOptions = struct {
     tool_event_context: ?*anyopaque = null,
     on_tool_start: ?ToolStartCallback = null,
     on_tool_end: ?ToolEndCallback = null,
+    tool_hook_context: ?*anyopaque = null,
+    before_tool_call: ?BeforeToolCallCallback = null,
+    after_tool_call: ?AfterToolCallCallback = null,
     text_event_context: ?*anyopaque = null,
     on_text_delta: ?TextDeltaCallback = null,
+};
+
+pub const BeforeToolCallResult = struct {
+    block: bool = false,
+    reason: ?[]u8 = null,
+    arguments_json: ?[]u8 = null,
+
+    pub fn deinit(self: BeforeToolCallResult, allocator: std.mem.Allocator) void {
+        if (self.reason) |reason| allocator.free(reason);
+        if (self.arguments_json) |arguments_json| allocator.free(arguments_json);
+    }
+};
+
+pub const AfterToolCallResult = struct {
+    content: ?[]u8 = null,
+    is_error: ?bool = null,
+    terminate: ?bool = null,
+
+    pub fn deinit(self: AfterToolCallResult, allocator: std.mem.Allocator) void {
+        if (self.content) |content| allocator.free(content);
+    }
 };
 
 pub const ToolSet = struct {
@@ -73,6 +99,7 @@ pub const ToolResult = struct {
     arguments_json: []u8,
     content: []u8,
     is_error: bool = false,
+    terminate: bool = false,
 
     pub fn deinit(self: ToolResult, allocator: std.mem.Allocator) void {
         if (self.tool_call_id.len > 0) allocator.free(self.tool_call_id);
@@ -85,6 +112,13 @@ pub const ToolResult = struct {
 const ToolExecutionResult = struct {
     content: []u8,
     is_error: bool = false,
+    terminate: bool = false,
+    arguments_json: ?[]u8 = null,
+
+    fn deinit(self: ToolExecutionResult, allocator: std.mem.Allocator) void {
+        if (self.content.len > 0) allocator.free(self.content);
+        if (self.arguments_json) |arguments_json| allocator.free(arguments_json);
+    }
 };
 
 pub const AgentError = anyerror;
@@ -242,15 +276,21 @@ pub fn runPrompt(
         const tool_calls = messages.items[messages.items.len - 1].tool_calls;
         response.tool_calls = &.{};
 
+        var terminating_results: usize = 0;
         for (tool_calls) |call| {
             if (options.on_tool_start) |callback| {
                 if (options.tool_event_context) |context| try callback(context, call);
             }
-            const tool_execution = try executeToolCall(io, allocator, call);
-            errdefer allocator.free(tool_execution.content);
+            var tool_execution = try executeToolCallWithHooks(io, allocator, call, options);
+            errdefer tool_execution.deinit(allocator);
             const tool_call_id = try allocator.dupe(u8, call.id);
             errdefer allocator.free(tool_call_id);
-            const traced_tool_result = try createToolResultTrace(allocator, call, tool_execution.content, tool_execution.is_error);
+            const trace_call: ai_client.ChatToolCall = .{
+                .id = call.id,
+                .name = call.name,
+                .arguments_json = tool_execution.arguments_json orelse call.arguments_json,
+            };
+            const traced_tool_result = try createToolResultTrace(allocator, trace_call, tool_execution.content, tool_execution.is_error, tool_execution.terminate);
             errdefer traced_tool_result.deinit(allocator);
             if (options.on_tool_end) |callback| {
                 if (options.tool_event_context) |context| try callback(context, traced_tool_result);
@@ -261,7 +301,19 @@ pub fn runPrompt(
                 .content = tool_execution.content,
                 .tool_call_id = tool_call_id,
             });
+            tool_execution.content = &.{};
+            if (tool_execution.arguments_json) |arguments_json| allocator.free(arguments_json);
+            tool_execution.arguments_json = null;
             tool_results_count += 1;
+            if (traced_tool_result.terminate) terminating_results += 1;
+        }
+
+        if (terminating_results == tool_calls.len) {
+            return .{
+                .final_text = try allocator.dupe(u8, ""),
+                .tool_results = try tool_results.toOwnedSlice(allocator),
+                .tool_results_count = tool_results_count,
+            };
         }
     }
 
@@ -344,6 +396,7 @@ fn createToolResultTrace(
     call: ai_client.ChatToolCall,
     content: []const u8,
     is_error: bool,
+    terminate: bool,
 ) !ToolResult {
     var result: ToolResult = .{
         .tool_call_id = try allocator.dupe(u8, call.id),
@@ -351,11 +404,83 @@ fn createToolResultTrace(
         .arguments_json = &.{},
         .content = &.{},
         .is_error = is_error,
+        .terminate = terminate,
     };
     errdefer result.deinit(allocator);
     result.tool_name = try allocator.dupe(u8, call.name);
     result.arguments_json = try allocator.dupe(u8, call.arguments_json);
     result.content = try allocator.dupe(u8, content);
+    return result;
+}
+
+fn executeToolCallWithHooks(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    call: ai_client.ChatToolCall,
+    options: RunOptions,
+) !ToolExecutionResult {
+    if (!isImplementedTool(call.name)) return executeToolCall(io, allocator, call);
+
+    var effective_call = call;
+    var overridden_arguments_json: ?[]u8 = null;
+    errdefer if (overridden_arguments_json) |arguments_json| allocator.free(arguments_json);
+
+    if (options.before_tool_call) |callback| {
+        if (options.tool_hook_context) |context| {
+            var before_result = callback(context, call) catch |err| {
+                return toolError(try std.fmt.allocPrint(allocator, "beforeToolCall failed: {s}", .{@errorName(err)}));
+            };
+            defer before_result.deinit(allocator);
+
+            if (before_result.block) {
+                const reason = before_result.reason orelse "Tool execution was blocked";
+                return toolError(try allocator.dupe(u8, reason));
+            }
+
+            if (before_result.arguments_json) |arguments_json| {
+                effective_call.arguments_json = arguments_json;
+                overridden_arguments_json = arguments_json;
+                before_result.arguments_json = null;
+            }
+        }
+    }
+
+    var result = try executeToolCall(io, allocator, effective_call);
+    errdefer result.deinit(allocator);
+
+    if (options.after_tool_call) |callback| {
+        if (options.tool_hook_context) |context| {
+            const provisional_result: ToolResult = .{
+                .tool_call_id = effective_call.id,
+                .tool_name = effective_call.name,
+                .arguments_json = effective_call.arguments_json,
+                .content = result.content,
+                .is_error = result.is_error,
+                .terminate = result.terminate,
+            };
+            var after_result = callback(context, effective_call, provisional_result) catch |err| {
+                allocator.free(result.content);
+                result.content = try std.fmt.allocPrint(allocator, "afterToolCall failed: {s}", .{@errorName(err)});
+                result.is_error = true;
+                result.terminate = false;
+                result.arguments_json = overridden_arguments_json;
+                overridden_arguments_json = null;
+                return result;
+            };
+            defer after_result.deinit(allocator);
+
+            if (after_result.content) |content| {
+                allocator.free(result.content);
+                result.content = content;
+                after_result.content = null;
+            }
+            if (after_result.is_error) |is_error| result.is_error = is_error;
+            if (after_result.terminate) |terminate| result.terminate = terminate;
+        }
+    }
+
+    result.arguments_json = overridden_arguments_json;
+    overridden_arguments_json = null;
     return result;
 }
 
@@ -372,6 +497,17 @@ fn executeToolCall(
     if (std.mem.eql(u8, call.name, "find")) return executeFindTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "ls")) return executeLsTool(io, allocator, call.arguments_json);
     return toolError(try std.fmt.allocPrint(allocator, "Tool {s} is not implemented in pi-zig yet.", .{call.name}));
+}
+
+fn isImplementedTool(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "read")) return true;
+    if (std.mem.eql(u8, name, "bash")) return true;
+    if (std.mem.eql(u8, name, "edit")) return true;
+    if (std.mem.eql(u8, name, "write")) return true;
+    if (std.mem.eql(u8, name, "grep")) return true;
+    if (std.mem.eql(u8, name, "find")) return true;
+    if (std.mem.eql(u8, name, "ls")) return true;
+    return false;
 }
 
 fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
@@ -541,7 +677,7 @@ test "unsupported tool call returns a tool result instead of aborting" {
     defer call.deinit(std.testing.allocator);
 
     const result = try executeToolCall(std.testing.io, std.testing.allocator, call);
-    defer std.testing.allocator.free(result.content);
+    defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqualStrings("Tool unknown_tool is not implemented in pi-zig yet.", result.content);
 }
@@ -555,7 +691,142 @@ test "failed tool calls are marked as errors" {
     defer call.deinit(std.testing.allocator);
 
     const result = try executeToolCall(std.testing.io, std.testing.allocator, call);
-    defer std.testing.allocator.free(result.content);
+    defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.startsWith(u8, result.content, "read tool failed:"));
+}
+
+test "before tool hook can block execution with an error result" {
+    const HookContext = struct {
+        allocator: std.mem.Allocator,
+        before_calls: usize = 0,
+        after_calls: usize = 0,
+    };
+    const Hooks = struct {
+        fn before(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall) anyerror!BeforeToolCallResult {
+            const ctx: *HookContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.before_calls += 1;
+            try std.testing.expectEqualStrings("bash", call.name);
+            return .{
+                .block = true,
+                .reason = try ctx.allocator.dupe(u8, "blocked by before hook"),
+            };
+        }
+
+        fn after(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall, result: ToolResult) anyerror!AfterToolCallResult {
+            _ = call;
+            _ = result;
+            const ctx: *HookContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.after_calls += 1;
+            return .{};
+        }
+    };
+
+    var ctx = HookContext{ .allocator = std.testing.allocator };
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_blocked"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"command\":\"printf should-not-run\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithHooks(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .tool_hook_context = &ctx,
+        .before_tool_call = Hooks.before,
+        .after_tool_call = Hooks.after,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings("blocked by before hook", result.content);
+    try std.testing.expectEqual(@as(usize, 1), ctx.before_calls);
+    try std.testing.expectEqual(@as(usize, 0), ctx.after_calls);
+}
+
+test "before tool hook can replace arguments before execution" {
+    const HookContext = struct {
+        allocator: std.mem.Allocator,
+        before_calls: usize = 0,
+    };
+    const Hooks = struct {
+        fn before(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall) anyerror!BeforeToolCallResult {
+            const ctx: *HookContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.before_calls += 1;
+            try std.testing.expectEqualStrings("read", call.name);
+            return .{
+                .arguments_json = try ctx.allocator.dupe(u8, "{\"path\":\"build.zig\",\"limit\":1}"),
+            };
+        }
+    };
+
+    var ctx = HookContext{ .allocator = std.testing.allocator };
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_rewrite_args"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"path\":\"zig-out/does-not-exist-for-agent-test.txt\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithHooks(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .tool_hook_context = &ctx,
+        .before_tool_call = Hooks.before,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "const std") != null);
+    try std.testing.expectEqualStrings("{\"path\":\"build.zig\",\"limit\":1}", result.arguments_json.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.before_calls);
+}
+
+test "after tool hook can override content error state and termination" {
+    const HookContext = struct {
+        allocator: std.mem.Allocator,
+        after_calls: usize = 0,
+    };
+    const Hooks = struct {
+        fn after(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall, result: ToolResult) anyerror!AfterToolCallResult {
+            const ctx: *HookContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.after_calls += 1;
+            try std.testing.expectEqualStrings("read", call.name);
+            try std.testing.expect(result.is_error);
+            try std.testing.expect(std.mem.startsWith(u8, result.content, "read tool failed:"));
+            return .{
+                .content = try ctx.allocator.dupe(u8, "patched by after hook"),
+                .is_error = false,
+                .terminate = true,
+            };
+        }
+    };
+
+    var ctx = HookContext{ .allocator = std.testing.allocator };
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_after_patch"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"path\":\"zig-out/does-not-exist-for-agent-test.txt\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithHooks(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .tool_hook_context = &ctx,
+        .after_tool_call = Hooks.after,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(result.terminate);
+    try std.testing.expectEqualStrings("patched by after hook", result.content);
+    try std.testing.expectEqual(@as(usize, 1), ctx.after_calls);
 }
