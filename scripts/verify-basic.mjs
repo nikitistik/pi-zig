@@ -2675,8 +2675,9 @@ try {
     ['rpc', rpcProviderRetrySessionFile],
     [
       JSON.stringify({ id: 'rpc-retry-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
-      JSON.stringify({ id: 'rpc-retry-enable', type: 'set_auto_retry', enabled: true }),
+      JSON.stringify({ id: 'rpc-retry-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
       JSON.stringify({ id: 'rpc-retry-prompt', type: 'prompt', message: 'rpc retry transient' }),
+      JSON.stringify({ id: 'rpc-retry-state', type: 'get_state' }),
       JSON.stringify({ id: 'rpc-retry-messages', type: 'get_messages' }),
       ''
     ].join('\n'),
@@ -2684,10 +2685,18 @@ try {
   );
   const rpcProviderRetryResponses = rpcProviderRetryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const rpcProviderRetryPrompt = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-prompt');
+  const rpcProviderRetryState = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-state');
   const rpcProviderRetryMessages = rpcProviderRetryResponses.find((response) => response.id === 'rpc-retry-messages');
   if (
     !rpcProviderRetryPrompt?.success ||
     rpcProviderRetryPrompt?.data?.text !== 'rpc retry recovered' ||
+    rpcProviderRetryPrompt?.data?.retry?.attempts !== 1 ||
+    rpcProviderRetryPrompt?.data?.retry?.maxAttempts !== 2 ||
+    rpcProviderRetryPrompt?.data?.retry?.totalDelayMs !== 0 ||
+    rpcProviderRetryState?.data?.lastRetryAttempts !== 1 ||
+    rpcProviderRetryState?.data?.autoRetryMaxAttempts !== 2 ||
+    rpcProviderRetryState?.data?.autoRetryBaseDelayMs !== 0 ||
+    rpcProviderRetryState?.data?.autoRetryMaxDelayMs !== 5 ||
     rpcProviderRetryMessages?.data?.messages?.filter((message) => message.role === 'user').length !== 1 ||
     rpcProviderRetryMessages?.data?.messages?.filter((message) => message.role === 'assistant').length !== 1
   ) {

@@ -19,6 +19,8 @@ const max_session_file_bytes = 16 * 1024 * 1024;
 const max_session_path_bytes = std.Io.Dir.max_path_bytes;
 const max_pending_messages = 32;
 const max_auto_retry_attempts = 3;
+const default_auto_retry_base_delay_ms = 0;
+const default_auto_retry_max_delay_ms = 60_000;
 
 const StoredRole = enum {
     system,
@@ -149,6 +151,11 @@ const Runtime = struct {
     follow_up_queue: PendingMessageQueue = .{},
     auto_compaction_enabled: bool = false,
     auto_retry_enabled: bool = false,
+    auto_retry_max_attempts: usize = max_auto_retry_attempts,
+    auto_retry_base_delay_ms: usize = default_auto_retry_base_delay_ms,
+    auto_retry_max_delay_ms: usize = default_auto_retry_max_delay_ms,
+    last_retry_attempts: usize = 0,
+    last_retry_delay_ms: usize = 0,
     command_options: commands.Options = .{},
     env: ?*const std.process.Environ.Map = null,
 
@@ -177,6 +184,11 @@ const Runtime = struct {
         self.follow_up_queue.clear();
         self.auto_compaction_enabled = false;
         self.auto_retry_enabled = false;
+        self.auto_retry_max_attempts = max_auto_retry_attempts;
+        self.auto_retry_base_delay_ms = default_auto_retry_base_delay_ms;
+        self.auto_retry_max_delay_ms = default_auto_retry_max_delay_ms;
+        self.last_retry_attempts = 0;
+        self.last_retry_delay_ms = 0;
     }
 
     fn clearSession(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, parent_session: ?[]const u8) !void {
@@ -484,13 +496,27 @@ const Runtime = struct {
 
     fn runAgentIfAuthenticated(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, prompt: []const u8) !?agent.RunResult {
         var retry_attempts: usize = 0;
+        self.last_retry_attempts = 0;
+        self.last_retry_delay_ms = 0;
         while (true) {
             return self.runAgentIfAuthenticatedOnce(io, allocator, prompt) catch |err| {
-                if (!self.auto_retry_enabled or !isRetryableAgentError(err) or retry_attempts >= max_auto_retry_attempts) return err;
+                if (!self.auto_retry_enabled or !isRetryableAgentError(err) or retry_attempts >= self.auto_retry_max_attempts) return err;
                 retry_attempts += 1;
+                self.last_retry_attempts = retry_attempts;
+                const delay_ms = self.retryDelayMs(retry_attempts);
+                self.last_retry_delay_ms += delay_ms;
+                if (delay_ms > 0) try sleepMilliseconds(io, delay_ms);
                 continue;
             };
         }
+    }
+
+    fn retryDelayMs(self: *const Runtime, attempt: usize) usize {
+        if (self.auto_retry_base_delay_ms == 0) return 0;
+        const shift: std.math.Log2Int(usize) = @intCast(@min(attempt - 1, @bitSizeOf(usize) - 2));
+        const multiplier = @as(usize, 1) << shift;
+        const delay = std.math.mul(usize, self.auto_retry_base_delay_ms, multiplier) catch self.auto_retry_max_delay_ms;
+        return @min(delay, self.auto_retry_max_delay_ms);
     }
 
     fn buildAgentHistory(self: *Runtime, allocator: std.mem.Allocator) !std.ArrayList(ai_client.ChatMessage) {
@@ -528,6 +554,13 @@ const Runtime = struct {
         try writeJsonString(w, result.final_text);
         try w.writeAll(",\"toolResults\":");
         try writeAgentToolResultsJson(w, result.tool_results[0..result.tool_results_count]);
+        try w.writeAll(",\"retry\":{\"attempts\":");
+        try w.print("{d}", .{self.last_retry_attempts});
+        try w.writeAll(",\"totalDelayMs\":");
+        try w.print("{d}", .{self.last_retry_delay_ms});
+        try w.writeAll(",\"maxAttempts\":");
+        try w.print("{d}", .{self.auto_retry_max_attempts});
+        try w.writeAll("}");
         if (self.selected_model) |model| {
             try w.writeAll(",\"model\":");
             try models.writeModelJson(w, model);
@@ -867,6 +900,9 @@ const Runtime = struct {
             self.auto_retry_enabled = getBoolField(value, "enabled") orelse {
                 return writeError(w, id, command, "set_auto_retry requires a boolean enabled");
             };
+            if (getOptionalUsizeField(value, "maxRetries")) |max_retries| self.auto_retry_max_attempts = max_retries;
+            if (getOptionalUsizeField(value, "baseDelayMs")) |base_delay_ms| self.auto_retry_base_delay_ms = base_delay_ms;
+            if (getOptionalUsizeField(value, "maxDelayMs")) |max_delay_ms| self.auto_retry_max_delay_ms = max_delay_ms;
             return writeSuccess(w, id, command);
         }
 
@@ -942,6 +978,18 @@ const Runtime = struct {
         try writeJsonString(w, self.store.path());
         try w.writeAll(",\"autoCompactionEnabled\":");
         try w.writeAll(if (self.auto_compaction_enabled) "true" else "false");
+        try w.writeAll(",\"autoRetryEnabled\":");
+        try w.writeAll(if (self.auto_retry_enabled) "true" else "false");
+        try w.writeAll(",\"autoRetryMaxAttempts\":");
+        try w.print("{d}", .{self.auto_retry_max_attempts});
+        try w.writeAll(",\"autoRetryBaseDelayMs\":");
+        try w.print("{d}", .{self.auto_retry_base_delay_ms});
+        try w.writeAll(",\"autoRetryMaxDelayMs\":");
+        try w.print("{d}", .{self.auto_retry_max_delay_ms});
+        try w.writeAll(",\"lastRetryAttempts\":");
+        try w.print("{d}", .{self.last_retry_attempts});
+        try w.writeAll(",\"lastRetryDelayMs\":");
+        try w.print("{d}", .{self.last_retry_delay_ms});
         try w.writeAll(",\"messageCount\":");
         try w.print("{d}", .{self.message_count});
         try w.writeAll(",\"pendingMessageCount\":");
@@ -1102,6 +1150,16 @@ fn getBoolField(value: std.json.Value, name: []const u8) ?bool {
     return getBoolFieldObject(value.object, name);
 }
 
+fn getOptionalUsizeField(value: std.json.Value, name: []const u8) ?usize {
+    if (value != .object) return null;
+    const field = value.object.get(name) orelse return null;
+    return switch (field) {
+        .integer => |int| if (int >= 0) @intCast(int) else null,
+        .float => |float| if (float >= 0 and @floor(float) == float) @intFromFloat(float) else null,
+        else => null,
+    };
+}
+
 fn getStringFieldObject(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const field = object.get(name) orelse return null;
     if (field != .string) return null;
@@ -1119,6 +1177,11 @@ fn isRetryableAgentError(err: anyerror) bool {
         error.ProviderRequestFailed => true,
         else => false,
     };
+}
+
+fn sleepMilliseconds(io: std.Io, milliseconds: usize) !void {
+    const bounded = @min(milliseconds, @as(usize, @intCast(std.math.maxInt(i64))));
+    try std.Io.sleep(io, .fromMilliseconds(@intCast(bounded)), .awake);
 }
 
 fn getOptionalExitCode(object: std.json.ObjectMap) ?u8 {
