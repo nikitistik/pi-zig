@@ -761,6 +761,8 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
         .update_context = &update_context,
         .on_update = handleBashShellUpdate,
         .timeout_ms = timeout_ms,
+        .cancellation_context = if (options) |run_options| run_options.cancellation_context else null,
+        .should_cancel = if (options) |run_options| run_options.should_cancel else null,
     }) catch |err| {
         return toolError(try std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)}));
     };
@@ -1199,6 +1201,43 @@ test "bash tool timeout returns partial output as an error result" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "before-timeout") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "after-timeout") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Command timed out after 0.100 seconds") != null);
+}
+
+test "bash tool cancellation stops a running shell command" {
+    const CancelContext = struct {
+        checks: usize = 0,
+    };
+    const Hooks = struct {
+        fn shouldCancel(ctx_ptr: *anyopaque) bool {
+            const ctx: *CancelContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.checks += 1;
+            return ctx.checks >= 2;
+        }
+    };
+
+    var ctx = CancelContext{};
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_bash_cancel"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"command\":\"printf before-cancel; sleep 1; printf after-cancel\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .cancellation_context = &ctx,
+        .should_cancel = Hooks.shouldCancel,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "before-cancel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "after-cancel") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Command cancelled") != null);
+    try std.testing.expect(ctx.checks >= 2);
 }
 
 test "prepare next turn can update request state before should-stop runs" {

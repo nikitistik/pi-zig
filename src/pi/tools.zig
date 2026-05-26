@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const default_find_limit = 1000;
 const default_ls_limit = 500;
@@ -31,6 +32,7 @@ pub const ShellUpdate = struct {
 };
 
 pub const ShellUpdateCallback = *const fn (ctx: *anyopaque, update: ShellUpdate) anyerror!void;
+pub const ShellCancellationCallback = *const fn (ctx: *anyopaque) bool;
 
 pub const ShellTruncatedBy = enum {
     lines,
@@ -55,6 +57,9 @@ pub const ShellCaptureOptions = struct {
     update_throttle_ms: i64 = default_bash_update_throttle_ms,
     update_min_bytes: usize = default_bash_update_min_bytes,
     timeout_ms: ?i64 = null,
+    cancellation_context: ?*anyopaque = null,
+    should_cancel: ?ShellCancellationCallback = null,
+    cancellation_poll_ms: i64 = 100,
 };
 
 pub const GrepOptions = struct {
@@ -596,6 +601,7 @@ pub fn runShellCaptureWithUpdates(
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .pgid = shellProcessGroupId(),
         .create_no_window = true,
     });
     defer child.kill(io);
@@ -611,9 +617,27 @@ pub fn runShellCaptureWithUpdates(
     var last_update_ms: ?i64 = null;
     var dirty = false;
     var timed_out = false;
-    const fill_timeout = shellReadTimeout(io, options.timeout_ms);
+    var cancelled_by_request = false;
+    const started_ms = nowMilliseconds(io);
 
-    while (multi_reader.fill(64, fill_timeout)) |_| {
+    while (true) {
+        if (shouldCancelShell(options)) {
+            cancelled_by_request = true;
+            killShellChildTree(io, &child);
+            break;
+        }
+        if (shellTimedOut(io, started_ms, options.timeout_ms)) {
+            timed_out = true;
+            killShellChildTree(io, &child);
+            break;
+        }
+
+        multi_reader.fill(64, shellReadTimeout(io, started_ms, options)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.Timeout => continue,
+            else => |e| return e,
+        };
+
         if (stdout_reader.buffered().len > max_bash_capture_bytes) return error.StreamTooLong;
         if (stderr_reader.buffered().len > max_bash_capture_bytes) return error.StreamTooLong;
 
@@ -626,17 +650,10 @@ pub fn runShellCaptureWithUpdates(
             last_update_ms = nowMilliseconds(io);
             dirty = false;
         }
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        error.Timeout => {
-            timed_out = true;
-            child.kill(io);
-        },
-        else => |e| return e,
     }
 
     try multi_reader.checkAnyError();
-    const term = if (timed_out) null else try child.wait(io);
+    const term = if (timed_out or cancelled_by_request) null else try child.wait(io);
 
     const stdout_slice = try multi_reader.toOwnedSlice(0);
     defer allocator.free(stdout_slice);
@@ -654,12 +671,14 @@ pub fn runShellCaptureWithUpdates(
         .exited => |code| code,
         else => null,
     } else null;
-    const timeout_message = if (timed_out)
+    const status_message = if (timed_out)
         try timeoutStatusMessage(allocator, options.timeout_ms.?)
+    else if (cancelled_by_request)
+        try allocator.dupe(u8, "Command cancelled")
     else
         null;
-    defer if (timeout_message) |message| allocator.free(message);
-    const formatted = if (timeout_message) |message|
+    defer if (status_message) |message| allocator.free(message);
+    const formatted = if (status_message) |message|
         try formatShellOutputWithStatus(allocator, io, raw_output, exit_code, message, "")
     else
         try formatShellOutput(allocator, io, raw_output, exit_code);
@@ -668,7 +687,7 @@ pub fn runShellCaptureWithUpdates(
     return .{
         .output = formatted.output,
         .exit_code = exit_code,
-        .cancelled = timed_out,
+        .cancelled = timed_out or cancelled_by_request,
         .truncated = formatted.truncated,
         .full_output_path = formatted.full_output_path,
     };
@@ -902,14 +921,52 @@ fn formatShellOutputWithStatus(
     };
 }
 
-fn shellReadTimeout(io: std.Io, maybe_timeout_ms: ?i64) std.Io.Timeout {
-    const timeout_ms = maybe_timeout_ms orelse return .none;
-    if (timeout_ms <= 0) return .none;
+fn shellReadTimeout(io: std.Io, started_ms: i64, options: ShellCaptureOptions) std.Io.Timeout {
+    const needs_cancel_poll = options.should_cancel != null and options.cancellation_context != null;
+    if (!needs_cancel_poll and (options.timeout_ms == null or options.timeout_ms.? <= 0)) return .none;
+
+    var wait_ms: i64 = if (needs_cancel_poll) if (options.cancellation_poll_ms <= 0) 100 else options.cancellation_poll_ms else std.math.maxInt(i64);
+    if (options.timeout_ms) |timeout_ms| {
+        if (timeout_ms > 0) {
+            const elapsed_ms = @max(@as(i64, 0), nowMilliseconds(io) - started_ms);
+            const remaining_ms = timeout_ms - elapsed_ms;
+            if (remaining_ms <= 0) wait_ms = 1 else wait_ms = @min(wait_ms, remaining_ms);
+        }
+    }
     const duration: std.Io.Clock.Duration = .{
-        .raw = .fromMilliseconds(timeout_ms),
+        .raw = .fromMilliseconds(wait_ms),
         .clock = .awake,
     };
-    return .{ .deadline = .fromNow(io, duration) };
+    return .{ .duration = duration };
+}
+
+fn shellTimedOut(io: std.Io, started_ms: i64, maybe_timeout_ms: ?i64) bool {
+    const timeout_ms = maybe_timeout_ms orelse return false;
+    if (timeout_ms <= 0) return false;
+    return nowMilliseconds(io) - started_ms >= timeout_ms;
+}
+
+fn shouldCancelShell(options: ShellCaptureOptions) bool {
+    const callback = options.should_cancel orelse return false;
+    const context = options.cancellation_context orelse return false;
+    return callback(context);
+}
+
+fn shellProcessGroupId() ?std.posix.pid_t {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+    return 0;
+}
+
+fn killShellChildTree(io: std.Io, child: *std.process.Child) void {
+    terminateShellProcessGroup(child);
+    child.kill(io);
+}
+
+fn terminateShellProcessGroup(child: *std.process.Child) void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const pid = child.id orelse return;
+    if (pid <= 0) return;
+    std.posix.kill(-pid, .TERM) catch {};
 }
 
 fn timeoutStatusMessage(allocator: std.mem.Allocator, timeout_ms: i64) ![]u8 {
