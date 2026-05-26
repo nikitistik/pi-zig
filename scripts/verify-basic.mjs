@@ -1479,6 +1479,26 @@ const bash = run(['tool-bash', 'printf pi-zig-tool-bash']);
 if (bash !== 'pi-zig-tool-bash') {
   throw new Error(`tool-bash smoke returned unexpected output: ${JSON.stringify(bash)}`);
 }
+const bashNoOutput = run(['tool-bash', 'true']);
+if (bashNoOutput !== '(no output)') {
+  throw new Error(`tool-bash no-output smoke returned unexpected output: ${JSON.stringify(bashNoOutput)}`);
+}
+const bashFailure = runFail(['tool-bash', 'printf before-failure; exit 7']);
+if (!bashFailure.stdout.includes('before-failure') || !bashFailure.stdout.includes('Command exited with code 7')) {
+  throw new Error('tool-bash failure smoke did not include output and exit status');
+}
+const bashLong = run(['tool-bash', "node -e \"for (let i = 0; i < 2105; i++) console.log('bash-line-' + String(i).padStart(4, '0'))\""]);
+if (
+  bashLong.includes('bash-line-0000') ||
+  !bashLong.includes('bash-line-2104') ||
+  !bashLong.includes('Full output: zig-out/pi-zig-bash-full-output.log')
+) {
+  throw new Error('tool-bash long-output smoke did not keep tail output and full-output path');
+}
+const bashFullOutput = fs.readFileSync('zig-out/pi-zig-bash-full-output.log', 'utf8');
+if (!bashFullOutput.includes('bash-line-0000') || !bashFullOutput.includes('bash-line-2104')) {
+  throw new Error('tool-bash full-output smoke did not persist the complete output');
+}
 
 const ls = run(['tool-ls', '.']);
 if (!ls.includes('README.md')) {

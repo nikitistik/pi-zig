@@ -5,6 +5,10 @@ const default_ls_limit = 500;
 const default_grep_limit = 100;
 const default_read_max_lines = 2000;
 const default_read_max_bytes = 50 * 1024;
+const default_bash_max_lines = 2000;
+const default_bash_max_bytes = 50 * 1024;
+const max_bash_capture_bytes = 8 * 1024 * 1024;
+const bash_full_output_path = "zig-out/pi-zig-bash-full-output.log";
 const grep_max_line_chars = 500;
 const max_read_file_bytes = 16 * 1024 * 1024;
 const max_edit_file_bytes = 4 * 1024 * 1024;
@@ -476,22 +480,29 @@ pub fn runShellCapture(io: std.Io, allocator: std.mem.Allocator, command: []cons
     const argv = [_][]const u8{ "sh", "-lc", command };
     const result = try std.process.run(allocator, io, .{
         .argv = &argv,
-        .stdout_limit = .limited(512 * 1024),
-        .stderr_limit = .limited(512 * 1024),
+        .stdout_limit = .limited(max_bash_capture_bytes),
+        .stderr_limit = .limited(max_bash_capture_bytes),
     });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    const output = try allocator.alloc(u8, result.stdout.len + result.stderr.len);
-    @memcpy(output[0..result.stdout.len], result.stdout);
-    @memcpy(output[result.stdout.len..], result.stderr);
+    const raw_output = try allocator.alloc(u8, result.stdout.len + result.stderr.len);
+    defer allocator.free(raw_output);
+    @memcpy(raw_output[0..result.stdout.len], result.stdout);
+    @memcpy(raw_output[result.stdout.len..], result.stderr);
+
+    const exit_code: ?u8 = switch (result.term) {
+        .exited => |code| code,
+        else => null,
+    };
+    const formatted = try formatShellOutput(allocator, io, raw_output, exit_code);
+    errdefer allocator.free(formatted.output);
 
     return .{
-        .output = output,
-        .exit_code = switch (result.term) {
-            .exited => |code| code,
-            else => null,
-        },
+        .output = formatted.output,
+        .exit_code = exit_code,
+        .truncated = formatted.truncated,
+        .full_output_path = formatted.full_output_path,
     };
 }
 
@@ -527,7 +538,16 @@ const Truncation = struct {
     truncated: bool,
     truncated_by: TruncatedBy,
     output_lines: usize,
+    total_lines: usize = 0,
+    output_bytes: usize = 0,
+    last_line_partial: bool = false,
     first_line_exceeds_limit: bool = false,
+};
+
+const ShellOutput = struct {
+    output: []u8,
+    truncated: bool,
+    full_output_path: ?[]const u8 = null,
 };
 
 const GrepLineInfo = struct {
@@ -643,6 +663,60 @@ fn writeRestoredLineEndings(w: *std.Io.Writer, content: []const u8, line_ending:
     }
 }
 
+fn formatShellOutput(allocator: std.mem.Allocator, io: std.Io, raw_output: []const u8, exit_code: ?u8) !ShellOutput {
+    const truncation = try truncateTail(allocator, raw_output, default_bash_max_lines, default_bash_max_bytes);
+    defer allocator.free(truncation.content);
+
+    if (truncation.truncated) try writeFile(io, bash_full_output_path, raw_output);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    if (truncation.content.len > 0) {
+        try out.writer.writeAll(truncation.content);
+    } else if (exit_code == null or exit_code.? == 0) {
+        try out.writer.writeAll("(no output)");
+    }
+
+    if (truncation.truncated) {
+        if (out.written().len > 0) try out.writer.writeAll("\n\n");
+        if (truncation.last_line_partial) {
+            const last_line_size = bytesForLastLine(raw_output);
+            try out.writer.writeAll("[Showing last ");
+            try writeSize(&out.writer, truncation.output_bytes);
+            try out.writer.print(" of line {d} (line is ", .{truncation.total_lines});
+            try writeSize(&out.writer, last_line_size);
+            try out.writer.print("). Full output: {s}]", .{bash_full_output_path});
+        } else {
+            const start_line = truncation.total_lines - truncation.output_lines + 1;
+            const end_line = truncation.total_lines;
+            if (truncation.truncated_by == .lines) {
+                try out.writer.print("[Showing lines {d}-{d} of {d}. Full output: {s}]", .{ start_line, end_line, truncation.total_lines, bash_full_output_path });
+            } else {
+                try out.writer.print("[Showing lines {d}-{d} of {d} (", .{ start_line, end_line, truncation.total_lines });
+                try writeSize(&out.writer, default_bash_max_bytes);
+                try out.writer.print(" limit). Full output: {s}]", .{bash_full_output_path});
+            }
+        }
+    }
+
+    if (exit_code) |code| {
+        if (code != 0) {
+            if (out.written().len > 0) try out.writer.writeAll("\n\n");
+            try out.writer.print("Command exited with code {d}", .{code});
+        }
+    } else {
+        if (out.written().len > 0) try out.writer.writeAll("\n\n");
+        try out.writer.writeAll("Command exited without status");
+    }
+
+    return .{
+        .output = try out.toOwnedSlice(),
+        .truncated = truncation.truncated,
+        .full_output_path = if (truncation.truncated) bash_full_output_path else null,
+    };
+}
+
 fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: usize, max_bytes: usize) !Truncation {
     const total_lines = countOutputLines(content);
     if (total_lines <= max_lines and content.len <= max_bytes) {
@@ -651,6 +725,8 @@ fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: us
             .truncated = false,
             .truncated_by = .none,
             .output_lines = total_lines,
+            .total_lines = total_lines,
+            .output_bytes = content.len,
         };
     }
 
@@ -673,6 +749,8 @@ fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: us
                     .truncated = true,
                     .truncated_by = .bytes,
                     .output_lines = 0,
+                    .total_lines = total_lines,
+                    .output_bytes = 0,
                     .first_line_exceeds_limit = true,
                 };
             }
@@ -689,6 +767,66 @@ fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: us
         .truncated = true,
         .truncated_by = truncated_by,
         .output_lines = output_lines,
+        .total_lines = total_lines,
+        .output_bytes = out.written().len,
+    };
+}
+
+fn truncateTail(allocator: std.mem.Allocator, content: []const u8, max_lines: usize, max_bytes: usize) !Truncation {
+    const total_lines = countLogicalLines(content);
+    const total_bytes = content.len;
+    if (total_lines <= max_lines and total_bytes <= max_bytes) {
+        return .{
+            .content = try allocator.dupe(u8, trimTrailingNewline(content)),
+            .truncated = false,
+            .truncated_by = .none,
+            .output_lines = total_lines,
+            .total_lines = total_lines,
+            .output_bytes = trimTrailingNewline(content).len,
+        };
+    }
+
+    const content_end = trimTrailingNewline(content).len;
+    var scan_end = content_end;
+    var start = content_end;
+    var output_lines: usize = 0;
+    var output_bytes: usize = 0;
+    var truncated_by: TruncatedBy = .lines;
+    var last_line_partial = false;
+
+    while (scan_end > 0 and output_lines < max_lines) {
+        var line_start = scan_end;
+        while (line_start > 0 and content[line_start - 1] != '\n') : (line_start -= 1) {}
+        const line_len = scan_end - line_start;
+        const separator_len: usize = if (output_lines == 0) 0 else 1;
+        if (output_bytes + line_len + separator_len > max_bytes) {
+            truncated_by = .bytes;
+            if (output_lines == 0) {
+                const slice_start = if (line_len > max_bytes) scan_end - max_bytes else line_start;
+                start = slice_start;
+                output_bytes = scan_end - slice_start;
+                output_lines = 1;
+                last_line_partial = line_len > max_bytes;
+            }
+            break;
+        }
+
+        start = line_start;
+        output_bytes += line_len + separator_len;
+        output_lines += 1;
+        if (line_start == 0) break;
+        scan_end = line_start - 1;
+    }
+    if (output_lines >= max_lines and total_lines > max_lines and truncated_by != .bytes) truncated_by = .lines;
+
+    return .{
+        .content = try allocator.dupe(u8, content[start..content_end]),
+        .truncated = true,
+        .truncated_by = truncated_by,
+        .output_lines = output_lines,
+        .total_lines = total_lines,
+        .output_bytes = output_bytes,
+        .last_line_partial = last_line_partial,
     };
 }
 
@@ -715,6 +853,17 @@ fn countOutputLines(content: []const u8) usize {
     return std.mem.count(u8, content, "\n") + 1;
 }
 
+fn countLogicalLines(content: []const u8) usize {
+    const trimmed = trimTrailingNewline(content);
+    if (trimmed.len == 0) return 0;
+    return std.mem.count(u8, trimmed, "\n") + 1;
+}
+
+fn trimTrailingNewline(content: []const u8) []const u8 {
+    if (content.len > 0 and content[content.len - 1] == '\n') return content[0 .. content.len - 1];
+    return content;
+}
+
 fn bytesForLine(content: []const u8, target_line: usize) usize {
     var iter = std.mem.splitScalar(u8, content, '\n');
     var line_index: usize = 0;
@@ -722,6 +871,12 @@ fn bytesForLine(content: []const u8, target_line: usize) usize {
         if (line_index == target_line) return line.len;
     }
     return 0;
+}
+
+fn bytesForLastLine(content: []const u8) usize {
+    const trimmed = trimTrailingNewline(content);
+    if (std.mem.lastIndexOfScalar(u8, trimmed, '\n')) |idx| return trimmed.len - idx - 1;
+    return trimmed.len;
 }
 
 fn writeSize(w: *std.Io.Writer, bytes: usize) !void {
