@@ -39,6 +39,12 @@ pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_
 }
 
 pub fn readFileForTool(io: std.Io, allocator: std.mem.Allocator, path: []const u8, offset: ?usize, limit: ?usize) !void {
+    const text = try readFileForToolText(io, allocator, path, offset, limit);
+    defer allocator.free(text);
+    try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+pub fn readFileForToolText(io: std.Io, allocator: std.mem.Allocator, path: []const u8, offset: ?usize, limit: ?usize) ![]u8 {
     const bytes = try readFile(io, allocator, path, max_read_file_bytes);
     defer allocator.free(bytes);
 
@@ -54,9 +60,9 @@ pub fn readFileForTool(io: std.Io, allocator: std.mem.Allocator, path: []const u
     const truncation = try truncateHead(allocator, selected, default_read_max_lines, default_read_max_bytes);
     defer allocator.free(truncation.content);
 
-    var buf: [4096]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io, &buf);
-    const w = &writer.interface;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
 
     if (truncation.first_line_exceeds_limit) {
         try w.print("[Line {d} is ", .{start_line + 1});
@@ -64,8 +70,7 @@ pub fn readFileForTool(io: std.Io, allocator: std.mem.Allocator, path: []const u
         try w.writeAll(", exceeds ");
         try writeSize(w, default_read_max_bytes);
         try w.print(" limit. Use bash: sed -n '{d}p' {s} | head -c {d}]\n", .{ start_line + 1, path, default_read_max_bytes });
-        try w.flush();
-        return;
+        return out.toOwnedSlice();
     }
 
     try w.writeAll(truncation.content);
@@ -86,7 +91,7 @@ pub fn readFileForTool(io: std.Io, allocator: std.mem.Allocator, path: []const u
             try w.print("\n\n[{d} more lines in file. Use offset={d} to continue.]", .{ remaining, next_offset });
         }
     }
-    try w.flush();
+    return out.toOwnedSlice();
 }
 
 pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
@@ -102,6 +107,11 @@ pub fn writeFileForTool(io: std.Io, path: []const u8, content: []const u8) !void
     const w = &writer.interface;
     try w.print("Successfully wrote {d} bytes to {s}\n", .{ content.len, path });
     try w.flush();
+}
+
+pub fn writeFileForToolText(io: std.Io, allocator: std.mem.Allocator, path: []const u8, content: []const u8) ![]u8 {
+    try writeFile(io, path, content);
+    return std.fmt.allocPrint(allocator, "Successfully wrote {d} bytes to {s}", .{ content.len, path });
 }
 
 const ListEntry = struct {
@@ -125,6 +135,12 @@ const FindIgnoreRule = struct {
 };
 
 pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit: usize) !void {
+    const text = try listDirText(io, allocator, path, limit);
+    defer allocator.free(text);
+    try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+pub fn listDirText(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
     const effective_limit = if (limit == 0) default_ls_limit else limit;
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer dir.close(io);
@@ -144,14 +160,13 @@ pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit
     }
     std.mem.sort(ListEntry, entries.items, {}, lessThanListEntry);
 
-    var buf: [4096]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io, &buf);
-    const w = &writer.interface;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
 
     if (entries.items.len == 0) {
-        try w.writeAll("(empty directory)\n");
-        try w.flush();
-        return;
+        try w.writeAll("(empty directory)");
+        return out.toOwnedSlice();
     }
 
     const shown = @min(effective_limit, entries.items.len);
@@ -163,10 +178,16 @@ pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit
     if (shown < entries.items.len) {
         try w.print("\n[{d} entries limit reached. Use limit={d} for more]\n", .{ effective_limit, effective_limit * 2 });
     }
-    try w.flush();
+    return out.toOwnedSlice();
 }
 
 pub fn findFiles(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path: []const u8, limit: usize) !void {
+    const text = try findFilesText(io, allocator, pattern, path, limit);
+    defer allocator.free(text);
+    try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+pub fn findFilesText(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path: []const u8, limit: usize) ![]u8 {
     const effective_limit = if (limit == 0) default_find_limit else limit;
 
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
@@ -210,8 +231,7 @@ pub fn findFiles(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, 
     if (entries.items.len >= effective_limit) limit_reached = true;
 
     if (entries.items.len == 0) {
-        try std.Io.File.stdout().writeStreamingAll(io, "No files found matching pattern\n");
-        return;
+        return allocator.dupe(u8, "No files found matching pattern");
     }
 
     std.mem.sort(FindEntry, entries.items, {}, lessThanFindEntry);
@@ -227,9 +247,9 @@ pub fn findFiles(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, 
     const truncation = try truncateHead(allocator, out.written(), std.math.maxInt(usize), default_read_max_bytes);
     defer allocator.free(truncation.content);
 
-    var buf: [4096]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io, &buf);
-    const w = &writer.interface;
+    var final_out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer final_out.deinit();
+    const w = &final_out.writer;
     try w.writeAll(truncation.content);
     if (limit_reached or truncation.truncated) {
         var notice_count: usize = 0;
@@ -245,7 +265,7 @@ pub fn findFiles(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, 
         }
         try w.writeByte(']');
     }
-    try w.flush();
+    return final_out.toOwnedSlice();
 }
 
 pub fn grepFile(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path: []const u8, max_bytes: usize) !void {
@@ -267,6 +287,12 @@ pub fn grepFile(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, p
 }
 
 pub fn grep(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path: []const u8, options: GrepOptions) !void {
+    const text = try grepText(io, allocator, pattern, path, options);
+    defer allocator.free(text);
+    try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+pub fn grepText(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path: []const u8, options: GrepOptions) ![]u8 {
     const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
     const is_dir = stat.kind == .directory;
     const run_cwd = if (is_dir) path else std.fs.path.dirname(path) orelse ".";
@@ -313,8 +339,7 @@ pub fn grep(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path:
         return error.CommandFailed;
     }
     if (result.stdout.len == 0) {
-        try std.Io.File.stdout().writeStreamingAll(io, "No matches found\n");
-        return;
+        return allocator.dupe(u8, "No matches found");
     }
 
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -359,16 +384,15 @@ pub fn grep(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path:
     }
 
     if (match_count == 0) {
-        try std.Io.File.stdout().writeStreamingAll(io, "No matches found\n");
-        return;
+        return allocator.dupe(u8, "No matches found");
     }
 
     const truncation = try truncateHead(allocator, out.written(), std.math.maxInt(usize), default_read_max_bytes);
     defer allocator.free(truncation.content);
 
-    var buf: [4096]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io, &buf);
-    const w = &writer.interface;
+    var final_out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer final_out.deinit();
+    const w = &final_out.writer;
     try w.writeAll(truncation.content);
 
     var notice_count: usize = 0;
@@ -390,7 +414,7 @@ pub fn grep(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path:
         }
         try w.writeAll("]");
     }
-    try w.flush();
+    return final_out.toOwnedSlice();
 }
 
 pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_text: []const u8, new_text: []const u8) !void {
@@ -402,6 +426,12 @@ pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_
 }
 
 pub fn editFileMany(io: std.Io, allocator: std.mem.Allocator, path: []const u8, edits: []const EditReplacement) !void {
+    const text = try editFileManyText(io, allocator, path, edits);
+    defer allocator.free(text);
+    try std.Io.File.stdout().writeStreamingAll(io, text);
+}
+
+pub fn editFileManyText(io: std.Io, allocator: std.mem.Allocator, path: []const u8, edits: []const EditReplacement) ![]u8 {
     if (edits.len == 0) return error.EmptyEditTarget;
 
     const bytes = try readFile(io, allocator, path, max_edit_file_bytes);
@@ -477,11 +507,7 @@ pub fn editFileMany(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
 
     try writeFile(io, path, final_content);
 
-    var buf: [512]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io, &buf);
-    const w = &writer.interface;
-    try w.print("Successfully replaced {d} block(s) in {s}.\n", .{ edits.len, path });
-    try w.flush();
+    return std.fmt.allocPrint(allocator, "Successfully replaced {d} block(s) in {s}.", .{ edits.len, path });
 }
 
 pub fn runShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !void {

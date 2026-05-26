@@ -440,7 +440,7 @@ fn buildPrintResponse(
         .api_key = api_key,
         .prompt = prompt,
         .system_prompt = system_override,
-        .enable_bash_tool = shouldEnableBashTool(parsed),
+        .tool_set = toolSetFromParsed(parsed),
     }) catch |err| {
         try writeStderr(io, "Provider request failed: ");
         try writeStderr(io, @errorName(err));
@@ -450,10 +450,21 @@ fn buildPrintResponse(
     return run_result.final_text;
 }
 
-fn shouldEnableBashTool(parsed: cli.ParsedArgs) bool {
-    if (parsed.no_tools or parsed.no_builtin_tools) return false;
-    if (parsed.tools) |value| return toolListContains(value, "bash");
-    return true;
+fn toolSetFromParsed(parsed: cli.ParsedArgs) agent.ToolSet {
+    if (parsed.no_tools or parsed.no_builtin_tools) return .none;
+    if (parsed.tools) |value| {
+        if (toolListContains(value, "*") or toolListContains(value, "all")) return .all;
+        return .{
+            .read = toolListContains(value, "read"),
+            .bash = toolListContains(value, "bash"),
+            .edit = toolListContains(value, "edit"),
+            .write = toolListContains(value, "write"),
+            .grep = toolListContains(value, "grep"),
+            .find = toolListContains(value, "find"),
+            .ls = toolListContains(value, "ls"),
+        };
+    }
+    return .all;
 }
 
 fn toolListContains(value: []const u8, needle: []const u8) bool {
@@ -461,7 +472,6 @@ fn toolListContains(value: []const u8, needle: []const u8) bool {
     while (parts.next()) |part| {
         const trimmed = std.mem.trim(u8, part, " \t\r\n");
         if (std.mem.eql(u8, trimmed, needle)) return true;
-        if (std.mem.eql(u8, trimmed, "*") or std.mem.eql(u8, trimmed, "all")) return true;
     }
     return false;
 }
@@ -548,11 +558,16 @@ test "top-level prompt builder combines messages" {
     try std.testing.expectEqualStrings("hello\n\nworld", prompt.text);
 }
 
-test "provider bash tool follows tool flags" {
-    try std.testing.expect(shouldEnableBashTool(cli.parse(&.{})));
-    try std.testing.expect(!shouldEnableBashTool(cli.parse(&.{"--no-tools"})));
-    try std.testing.expect(!shouldEnableBashTool(cli.parse(&.{"--no-builtin-tools"})));
-    try std.testing.expect(shouldEnableBashTool(cli.parse(&.{ "--tools", "read,bash" })));
-    try std.testing.expect(!shouldEnableBashTool(cli.parse(&.{ "--tools", "read,grep" })));
-    try std.testing.expect(shouldEnableBashTool(cli.parse(&.{ "--tools", "all" })));
+test "provider tools follow tool flags" {
+    try std.testing.expect(toolSetFromParsed(cli.parse(&.{})).bash);
+    try std.testing.expect(toolSetFromParsed(cli.parse(&.{})).read);
+    try std.testing.expect(!toolSetFromParsed(cli.parse(&.{"--no-tools"})).bash);
+    try std.testing.expect(!toolSetFromParsed(cli.parse(&.{"--no-builtin-tools"})).read);
+    const read_bash = toolSetFromParsed(cli.parse(&.{ "--tools", "read,bash" }));
+    try std.testing.expect(read_bash.read);
+    try std.testing.expect(read_bash.bash);
+    try std.testing.expect(!read_bash.grep);
+    const all_tools = toolSetFromParsed(cli.parse(&.{ "--tools", "all" }));
+    try std.testing.expect(all_tools.edit);
+    try std.testing.expect(all_tools.ls);
 }
