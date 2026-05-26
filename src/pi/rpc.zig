@@ -4,6 +4,7 @@ const ai_client = @import("ai_client.zig");
 const auth = @import("auth.zig");
 const commands = @import("commands.zig");
 const context_files = @import("context_files.zig");
+const extension_runner = @import("extension_runner.zig");
 const models = @import("models.zig");
 const session = @import("session.zig");
 const settings = @import("settings.zig");
@@ -30,6 +31,14 @@ const default_auto_retry_base_delay_ms = 0;
 const default_auto_retry_max_delay_ms = 60_000;
 const compaction_summary_prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const compaction_summary_suffix = "\n</summary>";
+
+pub const RunOptions = struct {
+    command_options: commands.Options = .{},
+    extension_paths: []const []const u8 = &.{},
+    tool_set: agent.ToolSet = .all,
+    custom_tools_enabled: bool = true,
+    tool_allowlist: ?[]const u8 = null,
+};
 
 const Mutex = struct {
     state: std.atomic.Mutex = .unlocked,
@@ -310,7 +319,7 @@ const Runtime = struct {
     auto_retry_max_delay_ms: usize = default_auto_retry_max_delay_ms,
     last_retry_attempts: usize = 0,
     last_retry_delay_ms: usize = 0,
-    command_options: commands.Options = .{},
+    run_options: RunOptions = .{},
     env: ?*const std.process.Environ.Map = null,
     active_bash: ?*ActiveBashJob = null,
 
@@ -320,11 +329,11 @@ const Runtime = struct {
         allocator: std.mem.Allocator,
         env: *const std.process.Environ.Map,
         session_file: []const u8,
-        command_options: commands.Options,
+        run_options: RunOptions,
     ) !void {
         self.resetInMemory(allocator);
         self.env = env;
-        self.command_options = command_options;
+        self.run_options = run_options;
         self.store = try session.PersistentStore.init(io, allocator, session_file);
         try self.loadSessionEntries(io, allocator);
     }
@@ -858,6 +867,18 @@ const Runtime = struct {
         }
         const prompt_content_parts = try buildPromptContentParts(allocator, prompt, prompt_image_parts);
         defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
+        var extension_runner_instance = extension_runner.Runner{
+            .io = io,
+            .allocator = allocator,
+            .extension_paths = self.run_options.extension_paths,
+        };
+        const has_extension_hooks = extension_runner_instance.hasExtensions();
+        var extension_tool_definitions: []ai_client.ChatToolDefinition = if (has_extension_hooks and self.run_options.custom_tools_enabled)
+            try extension_runner_instance.discoverToolDefinitions()
+        else
+            &.{};
+        extension_tool_definitions = try self.filterExtensionToolDefinitions(allocator, extension_tool_definitions);
+        defer if (extension_tool_definitions.len > 0) extension_runner_instance.deinitToolDefinitions(extension_tool_definitions);
 
         return try agent.runPrompt(io, allocator, env, .{
             .provider = model.provider,
@@ -870,8 +891,50 @@ const Runtime = struct {
             .shell_path = shell_settings.shell_path,
             .shell_command_prefix = shell_settings.shell_command_prefix,
             .history = history.items,
-            .tool_set = .all,
+            .tool_set = self.run_options.tool_set,
+            .custom_tools = extension_tool_definitions,
+            .custom_tool_context = if (extension_tool_definitions.len > 0) &extension_runner_instance else null,
+            .execute_custom_tool = if (extension_tool_definitions.len > 0) extension_runner.Runner.executeRegisteredTool else null,
+            .tool_hook_context = if (has_extension_hooks) &extension_runner_instance else null,
+            .before_tool_call = if (has_extension_hooks) extension_runner.Runner.beforeToolCall else null,
+            .after_tool_call = if (has_extension_hooks) extension_runner.Runner.afterToolCall else null,
         });
+    }
+
+    fn filterExtensionToolDefinitions(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        definitions: []ai_client.ChatToolDefinition,
+    ) ![]ai_client.ChatToolDefinition {
+        if (definitions.len == 0) return &.{};
+        var kept: std.ArrayList(ai_client.ChatToolDefinition) = .empty;
+        errdefer {
+            for (kept.items) |definition| {
+                allocator.free(definition.name);
+                allocator.free(definition.description);
+                allocator.free(definition.parameters_json);
+            }
+            kept.deinit(allocator);
+        }
+        for (definitions) |definition| {
+            if (self.extensionToolAllowed(definition.name)) {
+                try kept.append(allocator, definition);
+            } else {
+                allocator.free(definition.name);
+                allocator.free(definition.description);
+                allocator.free(definition.parameters_json);
+            }
+        }
+        allocator.free(definitions);
+        if (kept.items.len == 0) return &.{};
+        return kept.toOwnedSlice(allocator);
+    }
+
+    fn extensionToolAllowed(self: *Runtime, name: []const u8) bool {
+        if (!self.run_options.custom_tools_enabled) return false;
+        const raw = self.run_options.tool_allowlist orelse return true;
+        if (toolListContains(raw, "*") or toolListContains(raw, "all")) return true;
+        return toolListContains(raw, name);
     }
 
     fn runAgentIfAuthenticated(
@@ -1527,7 +1590,7 @@ const Runtime = struct {
         if (std.mem.eql(u8, command, "get_commands")) {
             try writeResponseHead(w, id, command, true);
             try w.writeAll(",\"data\":");
-            try commands.writeCommandsDataJsonWithOptions(io, allocator, w, self.command_options);
+            try commands.writeCommandsDataJsonWithOptions(io, allocator, w, self.run_options.command_options);
             try w.writeAll("}\n");
             return;
         }
@@ -1840,10 +1903,10 @@ pub fn run(
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
     session_file: []const u8,
-    command_options: commands.Options,
+    run_options: RunOptions,
 ) !void {
     var runtime: Runtime = .{};
-    try runtime.init(io, allocator, env, session_file, command_options);
+    try runtime.init(io, allocator, env, session_file, run_options);
     defer runtime.deinit(allocator);
     defer runtime.collectActiveBash(allocator, true);
 
@@ -1897,6 +1960,15 @@ pub fn run(
 fn isActiveBashNonBlockingCommand(value: std.json.Value) bool {
     const command = getStringField(value, "type") orelse return false;
     return std.mem.eql(u8, command, "abort_bash") or std.mem.eql(u8, command, "get_state");
+}
+
+fn toolListContains(value: []const u8, needle: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, needle)) return true;
+    }
+    return false;
 }
 
 fn getStringField(value: std.json.Value, name: []const u8) ?[]const u8 {

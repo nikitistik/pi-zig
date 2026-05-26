@@ -664,7 +664,7 @@ const server = http.createServer((req, res) => {
       ]);
       return;
     }
-    if (user.includes('extension hook events')) {
+    if (user.includes('extension hook events') && !user.includes('rpc extension hook events')) {
       if (body.stream !== true) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'expected extension hook stream request' }));
@@ -693,7 +693,77 @@ const server = http.createServer((req, res) => {
       ]);
       return;
     }
-    if (user.includes('extension registered tool')) {
+    if (user.includes('rpc extension hook events')) {
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_rpc_extension_hook_1',
+                type: 'function',
+                function: {
+                  name: 'bash',
+                  arguments: JSON.stringify({ command: 'printf extension-original' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_rpc_extension_hook_1' || toolOutput !== 'extension-result-patched') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc extension hook did not rewrite arguments and patch result', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension hook complete: ' + toolOutput } }] }));
+      return;
+    }
+    if (user.includes('rpc extension registered tool')) {
+      if (!hasTool('ext_echo')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing rpc extension tool definition', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_rpc_extension_tool_1',
+                type: 'function',
+                function: {
+                  name: 'ext_echo',
+                  arguments: JSON.stringify({ value: 'rpc-registered-ok' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_rpc_extension_tool_1' || toolOutput !== 'ext-echo: rpc-registered-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc extension registered tool did not execute', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension tool complete: ' + toolOutput } }] }));
+      return;
+    }
+    if (user.includes('extension registered tool') && !user.includes('rpc extension registered tool')) {
       if (body.stream !== true) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'expected extension registered tool stream request' }));
@@ -3783,6 +3853,47 @@ try {
     PI_ZIG_PROVIDER_BASE_URL: rpcFakeProvider.baseUrl,
     PI_CODING_AGENT_DIR: rpcProviderAuthDir
   };
+  const rpcExtensionHookFixture = path.resolve('zig-out/pi-zig-rpc-extension-hook-fixture');
+  fs.rmSync(rpcExtensionHookFixture, { recursive: true, force: true });
+  fs.mkdirSync(rpcExtensionHookFixture, { recursive: true });
+  const rpcExtensionHookPath = path.join(rpcExtensionHookFixture, 'hook.mjs');
+  fs.writeFileSync(rpcExtensionHookPath, `
+export default function(pi) {
+  pi.on("tool_call", (event) => {
+    if (event.toolName === "bash" && event.input.command === "printf extension-original") {
+      event.input.command = "printf extension-rewritten-ok";
+    }
+  });
+  pi.on("tool_result", (event) => {
+    const text = Array.isArray(event.content)
+      ? event.content.filter((part) => part?.type === "text").map((part) => part.text ?? "").join("\\n")
+      : "";
+    if (event.toolName === "bash" && text.trim() === "extension-rewritten-ok") {
+      return { content: [{ type: "text", text: "extension-result-patched" }], isError: false };
+    }
+  });
+}
+`);
+  const rpcExtensionToolPath = path.join(rpcExtensionHookFixture, 'tool.mjs');
+  fs.writeFileSync(rpcExtensionToolPath, `
+export default function(pi) {
+  pi.registerTool({
+    name: "ext_echo",
+    label: "Extension Echo",
+    description: "Echo a value through an explicit extension tool",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false
+    },
+    execute: async (_toolCallId, params) => ({
+      content: [{ type: "text", text: "ext-echo: " + params.value }],
+      isError: false
+    })
+  });
+}
+`);
   const rpcProviderContextFixture = path.resolve('zig-out/pi-zig-rpc-provider-context-fixture');
   const rpcProviderContextCwd = path.join(rpcProviderContextFixture, 'project');
   const rpcProviderContextSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-context-smoke.jsonl');
@@ -4181,6 +4292,57 @@ try {
   const rpcProviderToolHistoryCheck = rpcProviderToolHistoryResponses.find((response) => response.id === 'rpc-tool-history-check');
   if (!rpcProviderToolHistoryCheck?.success || rpcProviderToolHistoryCheck?.data?.text !== 'rpc tool history observed') {
     throw new Error('rpc provider prompt smoke did not send prior assistant tool-call and tool result history to the provider');
+  }
+
+  const rpcProviderExtensionHookSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-hook-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionHookSessionFile, { force: true });
+  const rpcProviderExtensionHookOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionHookSessionFile, '--extension', rpcExtensionHookPath],
+    [
+      JSON.stringify({ id: 'rpc-extension-hook-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-hook-prompt', type: 'prompt', message: 'rpc extension hook events' }),
+      JSON.stringify({ id: 'rpc-extension-hook-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionHookResponses = rpcProviderExtensionHookOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionHookPrompt = rpcProviderExtensionHookResponses.find((response) => response.id === 'rpc-extension-hook-prompt');
+  const rpcProviderExtensionHookMessages = rpcProviderExtensionHookResponses.find((response) => response.id === 'rpc-extension-hook-messages');
+  if (
+    !rpcProviderExtensionHookPrompt?.success ||
+    rpcProviderExtensionHookPrompt?.data?.text !== 'rpc extension hook complete: extension-result-patched' ||
+    rpcProviderExtensionHookPrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_rpc_extension_hook_1' ||
+    rpcProviderExtensionHookPrompt?.data?.toolResults?.[0]?.content !== 'extension-result-patched' ||
+    !rpcProviderExtensionHookMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_hook_1' && message.content === 'extension-result-patched')
+  ) {
+    throw new Error('rpc provider prompt smoke did not bind explicit extension tool_call/tool_result hooks');
+  }
+
+  const rpcProviderExtensionToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-tool-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionToolSessionFile, { force: true });
+  const rpcProviderExtensionToolOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionToolSessionFile, '--extension', rpcExtensionToolPath],
+    [
+      JSON.stringify({ id: 'rpc-extension-tool-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-tool-prompt', type: 'prompt', message: 'rpc extension registered tool' }),
+      JSON.stringify({ id: 'rpc-extension-tool-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionToolResponses = rpcProviderExtensionToolOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionToolPrompt = rpcProviderExtensionToolResponses.find((response) => response.id === 'rpc-extension-tool-prompt');
+  const rpcProviderExtensionToolMessages = rpcProviderExtensionToolResponses.find((response) => response.id === 'rpc-extension-tool-messages');
+  if (
+    !rpcProviderExtensionToolPrompt?.success ||
+    rpcProviderExtensionToolPrompt?.data?.text !== 'rpc extension tool complete: ext-echo: rpc-registered-ok' ||
+    rpcProviderExtensionToolPrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_rpc_extension_tool_1' ||
+    rpcProviderExtensionToolPrompt?.data?.toolResults?.[0]?.toolName !== 'ext_echo' ||
+    rpcProviderExtensionToolPrompt?.data?.toolResults?.[0]?.content !== 'ext-echo: rpc-registered-ok' ||
+    !rpcProviderExtensionToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-registered-ok')
+  ) {
+    throw new Error('rpc provider prompt smoke did not expose and execute an explicit registered extension tool');
   }
 
   const rpcProviderCompactionHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-compaction-history-smoke.jsonl');

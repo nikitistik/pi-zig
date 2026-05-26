@@ -102,7 +102,13 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         }
         const path = try resolveSessionPath(init.io, init.gpa, init.environ_map, parsed);
         defer path.deinit(init.gpa);
-        return rpc.run(init.io, init.gpa, init.environ_map, path.path, commandOptionsFromParsed(init, &parsed));
+        return rpc.run(init.io, init.gpa, init.environ_map, path.path, .{
+            .command_options = commandOptionsFromParsed(init, &parsed),
+            .extension_paths = if (parsed.no_extensions) &.{} else parsed.extensions[0..parsed.extensions_len],
+            .tool_set = toolSetFromParsed(parsed),
+            .custom_tools_enabled = !parsed.no_tools,
+            .tool_allowlist = parsed.tools,
+        });
     }
 
     const prompt = try buildPrompt(init.io, init.gpa, parsed);

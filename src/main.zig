@@ -94,7 +94,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "rpc")) {
         const session_file = if (args.len >= 3) args[2] else pi.session.default_session_file;
-        return pi.rpc.run(init.io, init.gpa, init.environ_map, session_file, commandOptionsFromInit(init));
+        return pi.rpc.run(init.io, init.gpa, init.environ_map, session_file, .{
+            .command_options = commandOptionsFromInit(init),
+        });
     }
 
     if (std.mem.eql(u8, command, "parity")) {
