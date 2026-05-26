@@ -534,6 +534,24 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc bash history observed' } }] }));
       return;
     }
+    if (user.includes('rpc truncated bash history check')) {
+      const bashHistory = body.messages.find((message) => {
+        const content = String(message.content ?? '');
+        return (
+          message.role === 'user' &&
+          content.includes('rpc-truncated-history-line-2104') &&
+          content.includes('[Output truncated. Full output: zig-out/pi-zig-bash-full-output.log]')
+        );
+      });
+      if (!bashHistory) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing truncated bashExecution full output path history', messages: body.messages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc truncated bash history observed' } }] }));
+      return;
+    }
     const defaultContent = 'mock provider response for ' + body.model + ': ' + user + (system ? ' [system=' + system + ']' : '');
     if (body.stream === true) {
       writeStreamEvents([{ choices: [{ delta: { content: defaultContent } }] }]);
@@ -2836,6 +2854,8 @@ try {
       JSON.stringify({ id: 'rpc-provider-bash-history-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
       JSON.stringify({ id: 'rpc-provider-bash-history-bash', type: 'bash', command: 'printf rpc-history-bash' }),
       JSON.stringify({ id: 'rpc-provider-bash-history-prompt', type: 'prompt', message: 'rpc bash history check' }),
+      JSON.stringify({ id: 'rpc-provider-truncated-bash-history-bash', type: 'bash', command: "node -e \"for (let i = 0; i < 2105; i++) console.log('rpc-truncated-history-line-' + String(i).padStart(4, '0'))\"" }),
+      JSON.stringify({ id: 'rpc-provider-truncated-bash-history-prompt', type: 'prompt', message: 'rpc truncated bash history check' }),
       ''
     ].join('\n'),
     { env: rpcProviderEnv }
@@ -2844,6 +2864,15 @@ try {
   const rpcProviderBashHistoryPrompt = rpcProviderBashHistoryResponses.find((response) => response.id === 'rpc-provider-bash-history-prompt');
   if (!rpcProviderBashHistoryPrompt?.success || rpcProviderBashHistoryPrompt?.data?.text !== 'rpc bash history observed') {
     throw new Error('rpc provider prompt smoke did not send prior bashExecution history to the provider');
+  }
+  const rpcProviderTruncatedBashHistoryPrompt = rpcProviderBashHistoryResponses.find(
+    (response) => response.id === 'rpc-provider-truncated-bash-history-prompt'
+  );
+  if (
+    !rpcProviderTruncatedBashHistoryPrompt?.success ||
+    rpcProviderTruncatedBashHistoryPrompt?.data?.text !== 'rpc truncated bash history observed'
+  ) {
+    throw new Error('rpc provider prompt smoke did not send truncated bashExecution full-output path history to the provider');
   }
 
   const rpcProviderQueueSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-queue-smoke.jsonl');
