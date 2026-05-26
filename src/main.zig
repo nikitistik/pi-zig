@@ -16,6 +16,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (try pi.package_manager.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
+    if (try pi.settings.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
     if (try pi.themes.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
     if (try pi.context_files.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
     if (try pi.system_prompt.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
@@ -157,6 +158,7 @@ fn usage(io: std.Io) !void {
         \\  uninstall <source> [-l]
         \\  list
         \\  update [source|self|pi] [--self] [--extensions] [--extension <source>] [--force]
+        \\  settings [--json]
         \\  themes [--theme <path>] [--export <name>] [--resolved <name>] [--detect]
         \\  context-files [--no-context-files]
         \\  system-prompt [--json] [--no-context-files]

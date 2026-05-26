@@ -8,6 +8,7 @@ pub const package_manager = @import("package_manager.zig");
 pub const providers = @import("providers.zig");
 pub const rpc = @import("rpc.zig");
 pub const session = @import("session.zig");
+pub const settings = @import("settings.zig");
 pub const system_prompt = @import("system_prompt.zig");
 pub const themes = @import("themes.zig");
 pub const tools = @import("tools.zig");
@@ -25,6 +26,7 @@ test {
     _ = providers;
     _ = rpc;
     _ = session;
+    _ = settings;
     _ = system_prompt;
     _ = themes;
     _ = tools;

@@ -638,6 +638,117 @@ if (packageNpmFailure.status === 0 || !packageNpmFailure.stderr.includes('local 
   throw new Error('package npm install smoke did not fail visibly for the unimplemented npm installer');
 }
 
+const settingsFixtureRoot = path.resolve('zig-out/pi-zig-settings-fixture');
+const settingsFixtureHome = path.join(settingsFixtureRoot, 'home');
+const settingsFixtureProject = path.join(settingsFixtureRoot, 'project');
+const settingsFixtureNoPiProject = path.join(settingsFixtureRoot, 'no-pi-project');
+const settingsFixtureEnv = { ...process.env, HOME: settingsFixtureHome };
+fs.rmSync(settingsFixtureRoot, { recursive: true, force: true });
+fs.mkdirSync(path.join(settingsFixtureHome, '.pi/agent'), { recursive: true });
+fs.mkdirSync(path.join(settingsFixtureProject, '.pi'), { recursive: true });
+fs.mkdirSync(settingsFixtureNoPiProject, { recursive: true });
+fs.writeFileSync(
+  path.join(settingsFixtureHome, '.pi/agent/settings.json'),
+  JSON.stringify({
+    queueMode: 'all',
+    websockets: false,
+    skills: {
+      enableSkillCommands: false,
+      customDirectories: ['legacy-skills']
+    },
+    retry: {
+      maxDelayMs: 1234,
+      maxRetries: 4
+    },
+    compaction: {
+      reserveTokens: 111
+    },
+    enabledModels: ['claude-opus-4-5', 'gpt-5.2-codex'],
+    httpIdleTimeoutMs: 'disabled',
+    sessionDir: '~/sessions'
+  }, null, 2)
+);
+fs.writeFileSync(
+  path.join(settingsFixtureProject, '.pi/settings.json'),
+  JSON.stringify({
+    websockets: true,
+    theme: 'dark',
+    compaction: {
+      keepRecentTokens: 222
+    },
+    branchSummary: {
+      skipPrompt: true
+    }
+  }, null, 2)
+);
+const settingsReport = JSON.parse(run(['settings', '--json'], undefined, { cwd: settingsFixtureProject, env: settingsFixtureEnv }));
+if (
+  settingsReport.globalSettings.queueMode !== undefined ||
+  settingsReport.globalSettings.websockets !== undefined ||
+  settingsReport.globalSettings.steeringMode !== 'all' ||
+  settingsReport.globalSettings.transport !== 'sse' ||
+  settingsReport.globalSettings.enableSkillCommands !== false ||
+  settingsReport.globalSettings.skills?.[0] !== 'legacy-skills' ||
+  settingsReport.globalSettings.retry?.maxDelayMs !== undefined ||
+  settingsReport.globalSettings.retry?.provider?.maxRetryDelayMs !== 1234 ||
+  settingsReport.settings.transport !== 'websocket' ||
+  settingsReport.settings.compaction?.reserveTokens !== 111 ||
+  settingsReport.settings.compaction?.keepRecentTokens !== 222 ||
+  settingsReport.resolved.followUpMode !== 'one-at-a-time' ||
+  settingsReport.resolved.compaction?.enabled !== true ||
+  settingsReport.resolved.retry?.maxRetries !== 4 ||
+  settingsReport.resolved.retry?.baseDelayMs !== 2000 ||
+  settingsReport.resolved.retry?.provider?.maxRetryDelayMs !== 1234 ||
+  settingsReport.resolved.branchSummary?.skipPrompt !== true ||
+  settingsReport.resolved.httpIdleTimeoutMs !== 0 ||
+  settingsReport.resolved.sessionDir !== path.join(settingsFixtureHome, 'sessions') ||
+  settingsReport.resolved.enableSkillCommands !== false
+) {
+  throw new Error('settings smoke did not migrate, merge, and resolve upstream settings defaults');
+}
+const settingsGet = JSON.parse(run(['settings', 'get', 'resolved.compaction.keepRecentTokens'], undefined, {
+  cwd: settingsFixtureProject,
+  env: settingsFixtureEnv
+}));
+if (settingsGet !== 222) {
+  throw new Error('settings get smoke did not read a resolved dotted value');
+}
+run(['settings', 'set-model', 'openai', 'gpt-4o'], undefined, { cwd: settingsFixtureProject, env: settingsFixtureEnv });
+const settingsGlobalAfterModel = JSON.parse(fs.readFileSync(path.join(settingsFixtureHome, '.pi/agent/settings.json'), 'utf8'));
+if (
+  settingsGlobalAfterModel.defaultProvider !== 'openai' ||
+  settingsGlobalAfterModel.defaultModel !== 'gpt-4o' ||
+  settingsGlobalAfterModel.enabledModels?.[1] !== 'gpt-5.2-codex'
+) {
+  throw new Error('settings set-model smoke did not preserve unrelated global settings');
+}
+run(['settings', 'set', 'theme', 'light', '--local'], undefined, { cwd: settingsFixtureProject, env: settingsFixtureEnv });
+const settingsProjectAfterTheme = JSON.parse(fs.readFileSync(path.join(settingsFixtureProject, '.pi/settings.json'), 'utf8'));
+if (settingsProjectAfterTheme.theme !== 'light' || settingsProjectAfterTheme.compaction?.keepRecentTokens !== 222) {
+  throw new Error('settings set --local smoke did not preserve unrelated project settings');
+}
+run(['settings', '--json'], undefined, { cwd: settingsFixtureNoPiProject, env: settingsFixtureEnv });
+if (fs.existsSync(path.join(settingsFixtureNoPiProject, '.pi'))) {
+  throw new Error('settings read smoke created a project .pi directory');
+}
+const invalidSettingsHome = path.join(settingsFixtureRoot, 'invalid-home');
+fs.mkdirSync(path.join(invalidSettingsHome, '.pi/agent'), { recursive: true });
+fs.writeFileSync(path.join(invalidSettingsHome, '.pi/agent/settings.json'), '{ invalid json');
+const invalidRead = JSON.parse(run(['settings', '--json'], undefined, {
+  cwd: settingsFixtureProject,
+  env: { ...process.env, HOME: invalidSettingsHome }
+}));
+if (!invalidRead.errors.some((error) => error.scope === 'global')) {
+  throw new Error('settings invalid-read smoke did not report a global load error');
+}
+const invalidWrite = runFail(['settings', 'set', 'theme', 'dark'], undefined, {
+  cwd: settingsFixtureProject,
+  env: { ...process.env, HOME: invalidSettingsHome }
+});
+if (invalidWrite.status === 0 || !invalidWrite.stderr.includes('Refusing to overwrite invalid settings file')) {
+  throw new Error('settings invalid-write smoke did not refuse to overwrite invalid JSON');
+}
+
 const themeFixtureRoot = path.resolve('zig-out/pi-zig-theme-fixture');
 const themeFixtureHome = path.join(themeFixtureRoot, 'home');
 const themeFixtureEnv = { ...process.env, HOME: themeFixtureHome };
