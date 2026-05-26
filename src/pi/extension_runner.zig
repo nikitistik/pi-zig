@@ -197,7 +197,12 @@ pub const Runner = struct {
             if (content_text != .string) return error.ExtensionHookInvalidResponse;
             patch.content = try self.allocator.dupe(u8, content_text.string);
         } else if (parsed.value.object.get("content")) |content| {
-            patch.content = try textContentToOwnedString(self.allocator, content);
+            if (content == .string) {
+                patch.content = try self.allocator.dupe(u8, content.string);
+            } else {
+                patch.content = try textContentToOwnedString(self.allocator, content);
+                patch.content_parts = try contentPartsToOwned(self.allocator, content);
+            }
         }
         if (parsed.value.object.get("isError")) |is_error| {
             if (is_error != .bool) return error.ExtensionHookInvalidResponse;
@@ -228,14 +233,18 @@ pub const Runner = struct {
 
         var content: ?[]u8 = null;
         errdefer if (content) |value| self.allocator.free(value);
+        var content_parts: []ai_client.ChatContentPart = &.{};
+        errdefer freeContentParts(self.allocator, content_parts);
         if (parsed.value.object.get("contentText")) |content_text| {
             if (content_text != .string) return error.ExtensionHookInvalidResponse;
             content = try self.allocator.dupe(u8, content_text.string);
         } else if (parsed.value.object.get("content")) |result_content| {
-            content = if (result_content == .string)
-                try self.allocator.dupe(u8, result_content.string)
-            else
-                try textContentToOwnedString(self.allocator, result_content);
+            if (result_content == .string) {
+                content = try self.allocator.dupe(u8, result_content.string);
+            } else {
+                content = try textContentToOwnedString(self.allocator, result_content);
+                content_parts = try contentPartsToOwned(self.allocator, result_content);
+            }
         } else {
             content = try self.allocator.dupe(u8, "");
         }
@@ -253,6 +262,7 @@ pub const Runner = struct {
 
         return .{
             .content = content.?,
+            .content_parts = content_parts,
             .is_error = is_error,
             .terminate = terminate,
         };
@@ -317,9 +327,9 @@ pub const Runner = struct {
         try writeJsonString(w, result.tool_name);
         try w.writeAll(",\"input\":");
         try writeJsonObjectOrEmpty(self.allocator, w, call.arguments_json);
-        try w.writeAll(",\"content\":[{\"type\":\"text\",\"text\":");
-        try writeJsonString(w, result.content);
-        try w.writeAll("}],\"details\":null,\"isError\":");
+        try w.writeAll(",\"content\":");
+        try writeToolResultContentJson(w, result);
+        try w.writeAll(",\"details\":null,\"isError\":");
         try w.writeAll(if (result.is_error) "true" else "false");
         try w.writeAll("}}");
         return out.toOwnedSlice();
@@ -394,6 +404,100 @@ fn textContentToOwnedString(allocator: std.mem.Allocator, content: std.json.Valu
         try out.writer.writeAll(text.string);
     }
     return out.toOwnedSlice();
+}
+
+fn contentPartsToOwned(allocator: std.mem.Allocator, content: std.json.Value) ![]ai_client.ChatContentPart {
+    if (content != .array) return error.ExtensionHookInvalidResponse;
+    if (content.array.items.len == 0) return &.{};
+
+    const parts = try allocator.alloc(ai_client.ChatContentPart, content.array.items.len);
+    var len: usize = 0;
+    errdefer {
+        for (parts[0..len]) |part| {
+            switch (part) {
+                .text => |text| allocator.free(text),
+                .image => |image| {
+                    allocator.free(image.data);
+                    allocator.free(image.mime_type);
+                },
+            }
+        }
+        allocator.free(parts);
+    }
+
+    for (content.array.items) |item| {
+        if (item != .object) return error.ExtensionHookInvalidResponse;
+        const kind = item.object.get("type") orelse continue;
+        if (kind != .string) return error.ExtensionHookInvalidResponse;
+        if (std.mem.eql(u8, kind.string, "text")) {
+            const text = item.object.get("text") orelse continue;
+            if (text != .string) return error.ExtensionHookInvalidResponse;
+            parts[len] = .{ .text = try allocator.dupe(u8, text.string) };
+            len += 1;
+        } else if (std.mem.eql(u8, kind.string, "image")) {
+            const data = item.object.get("data") orelse return error.ExtensionHookInvalidResponse;
+            const mime_type = item.object.get("mimeType") orelse return error.ExtensionHookInvalidResponse;
+            if (data != .string or mime_type != .string) return error.ExtensionHookInvalidResponse;
+            const owned_data = try allocator.dupe(u8, data.string);
+            errdefer allocator.free(owned_data);
+            const owned_mime_type = try allocator.dupe(u8, mime_type.string);
+            errdefer allocator.free(owned_mime_type);
+            parts[len] = .{ .image = .{
+                .data = owned_data,
+                .mime_type = owned_mime_type,
+            } };
+            len += 1;
+        }
+    }
+    if (len == 0) {
+        allocator.free(parts);
+        return &.{};
+    }
+    if (len == parts.len) return parts;
+    const trimmed = try allocator.realloc(parts, len);
+    return trimmed;
+}
+
+fn freeContentParts(allocator: std.mem.Allocator, parts: []ai_client.ChatContentPart) void {
+    if (parts.len == 0) return;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| allocator.free(text),
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        }
+    }
+    allocator.free(parts);
+}
+
+fn writeToolResultContentJson(w: *std.Io.Writer, result: agent.ToolResult) !void {
+    if (result.content_parts.len == 0) {
+        try w.writeAll("[{\"type\":\"text\",\"text\":");
+        try writeJsonString(w, result.content);
+        try w.writeAll("}]");
+        return;
+    }
+    try w.writeByte('[');
+    for (result.content_parts, 0..) |part, index| {
+        if (index != 0) try w.writeByte(',');
+        switch (part) {
+            .text => |text| {
+                try w.writeAll("{\"type\":\"text\",\"text\":");
+                try writeJsonString(w, text);
+                try w.writeByte('}');
+            },
+            .image => |image| {
+                try w.writeAll("{\"type\":\"image\",\"data\":");
+                try writeJsonString(w, image.data);
+                try w.writeAll(",\"mimeType\":");
+                try writeJsonString(w, image.mime_type);
+                try w.writeByte('}');
+            },
+        }
+    }
+    try w.writeByte(']');
 }
 
 fn jsonValueToOwnedString(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {

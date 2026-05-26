@@ -991,9 +991,9 @@ fn writeToolResultMessageJson(w: *std.Io.Writer, tool_result: agent.ToolResult) 
     try writeJsonString(w, tool_result.tool_call_id);
     try w.writeAll(",\"toolName\":");
     try writeJsonString(w, tool_result.tool_name);
-    try w.writeAll(",\"content\":[{\"type\":\"text\",\"text\":");
-    try writeJsonString(w, tool_result.content);
-    try w.writeAll("}],\"isError\":");
+    try w.writeAll(",\"content\":");
+    try writeToolResultContentJson(w, tool_result);
+    try w.writeAll(",\"isError\":");
     try w.writeAll(if (tool_result.is_error) "true" else "false");
     try w.writeAll(",\"terminate\":");
     try w.writeAll(if (tool_result.terminate) "true" else "false");
@@ -1001,11 +1001,43 @@ fn writeToolResultMessageJson(w: *std.Io.Writer, tool_result: agent.ToolResult) 
 }
 
 fn writeToolResultPayloadJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {
-    try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
-    try writeJsonString(w, tool_result.content);
-    try w.writeAll("}],\"terminate\":");
+    try w.writeAll("{\"content\":");
+    try writeToolResultContentJson(w, tool_result);
+    try w.writeAll(",\"terminate\":");
     try w.writeAll(if (tool_result.terminate) "true" else "false");
     try w.writeByte('}');
+}
+
+fn writeToolResultContentJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {
+    if (tool_result.content_parts.len == 0) {
+        try w.writeAll("[{\"type\":\"text\",\"text\":");
+        try writeJsonString(w, tool_result.content);
+        try w.writeAll("}]");
+        return;
+    }
+    try w.writeByte('[');
+    for (tool_result.content_parts, 0..) |part, index| {
+        if (index != 0) try w.writeByte(',');
+        try writeChatContentPartJson(w, part);
+    }
+    try w.writeByte(']');
+}
+
+fn writeChatContentPartJson(w: *std.Io.Writer, part: ai_client.ChatContentPart) !void {
+    switch (part) {
+        .text => |text| {
+            try w.writeAll("{\"type\":\"text\",\"text\":");
+            try writeJsonString(w, text);
+            try w.writeByte('}');
+        },
+        .image => |image| {
+            try w.writeAll("{\"type\":\"image\",\"data\":");
+            try writeJsonString(w, image.data);
+            try w.writeAll(",\"mimeType\":");
+            try writeJsonString(w, image.mime_type);
+            try w.writeByte('}');
+        },
+    }
 }
 
 fn writeToolUpdatePayloadJson(w: *std.Io.Writer, update: agent.ToolUpdate) !void {

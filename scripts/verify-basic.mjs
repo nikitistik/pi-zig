@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const bin = path.resolve('zig-out/bin/pi-zig');
+const tinyPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 
 function run(args, input, options = {}) {
   return execFileSync(bin, args, { encoding: 'utf8', input, ...options });
@@ -41,6 +42,7 @@ async function startFakeProviderServer() {
       `
 import http from 'node:http';
 const requestCounts = new Map();
+const tinyPngBase64 = ${JSON.stringify(tinyPngBase64)};
 function eventStreamU32(value) {
   const buffer = Buffer.alloc(4);
   buffer.writeUInt32BE(value);
@@ -361,6 +363,9 @@ const server = http.createServer((req, res) => {
     const hasSmokeImage = (content) =>
       Array.isArray(content) &&
       content.some((part) => part?.type === 'image_url' && part.image_url?.url === 'data:image/png;base64,aW1hZ2Utc21va2U=');
+    const hasReadToolImage = (content) =>
+      Array.isArray(content) &&
+      content.some((part) => part?.type === 'image_url' && part.image_url?.url === 'data:image/png;base64,' + tinyPngBase64);
     const system = body.messages.find((message) => message.role === 'system')?.content ?? '';
     const toolMessages = body.messages.filter((message) => message.role === 'tool');
     const hasTool = (name) => body.tools?.some((tool) => tool?.function?.name === name) ?? false;
@@ -1430,6 +1435,51 @@ const server = http.createServer((req, res) => {
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: 'invalid tool arguments loop complete' } }] }));
+      return;
+    }
+    if (userMessages.some((message) => message.includes('read image result'))) {
+      if (!hasTool('read')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing read tool definition for image result smoke', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_read_image_1',
+                type: 'function',
+                function: {
+                  name: 'read',
+                  arguments: JSON.stringify({ path: 'zig-out/pi-zig-agent-tool-image-fixture/input.png' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const assistantToolCall = body.messages.find((message) =>
+        message.role === 'assistant' &&
+        message.tool_calls?.some((call) => call.id === 'call_read_image_1' && call.function?.name === 'read')
+      );
+      const readToolMessage = toolMessages.find((message) => message.tool_call_id === 'call_read_image_1');
+      const syntheticImageMessage = body.messages.find((message) =>
+        message.role === 'user' &&
+        Array.isArray(message.content) &&
+        message.content.some((part) => part?.type === 'text' && part.text === 'Attached image(s) from tool result:') &&
+        hasReadToolImage(message.content)
+      );
+      if (!assistantToolCall || !readToolMessage?.content?.includes('Read image file [image/png]') || !syntheticImageMessage) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing image-capable read tool result replay', messages: body.messages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'read image result complete' } }] }));
       return;
     }
     if (user.includes('tool loop')) {
@@ -4202,6 +4252,20 @@ export default function(pi: any): void {
   if (!providerToolLoop.includes('tool loop complete: tool-loop-ok')) {
     throw new Error('provider-backed agent loop did not execute bash tool call and return the follow-up response');
   }
+
+  const providerToolImageFixture = path.resolve('zig-out/pi-zig-agent-tool-image-fixture');
+  fs.rmSync(providerToolImageFixture, { recursive: true, force: true });
+  fs.mkdirSync(providerToolImageFixture, { recursive: true });
+  fs.writeFileSync(path.join(providerToolImageFixture, 'input.png'), Buffer.from(tinyPngBase64, 'base64'));
+  const providerReadImageTool = run(
+    ['--no-session', '--provider', 'openai', '--model', 'mock-read-image-tool-model', '-p', 'please run read image result'],
+    undefined,
+    { env: providerEnv }
+  );
+  if (!providerReadImageTool.includes('read image result complete')) {
+    throw new Error('provider-backed read tool did not return image tool result content');
+  }
+
   const providerInvalidToolArgumentsLoop = run(
     ['--no-session', '--provider', 'openai', '--model', 'mock-invalid-tool-arguments-model', '-p', 'please run the invalid tool arguments loop'],
     undefined,

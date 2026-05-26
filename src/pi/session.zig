@@ -380,7 +380,11 @@ pub const PersistentStore = struct {
         try w.writeAll(",\"toolName\":");
         try writeJsonString(w, result.tool_name);
         try w.writeAll(",\"content\":");
-        try writeJsonString(w, result.content);
+        if (result.content_parts.len > 0) {
+            try writeContentParts(w, result.content_parts);
+        } else {
+            try writeJsonString(w, result.content);
+        }
         try w.writeAll(",\"isError\":");
         try w.writeAll(if (result.is_error) "true" else "false");
         try w.writeAll(",\"terminate\":");
@@ -390,6 +394,28 @@ pub const PersistentStore = struct {
         try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
         self.tool_results += 1;
         return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+
+    fn writeContentParts(w: *std.Io.Writer, content_parts: []const ai_client.ChatContentPart) !void {
+        try w.writeByte('[');
+        for (content_parts, 0..) |part, index| {
+            if (index != 0) try w.writeByte(',');
+            switch (part) {
+                .text => |text| {
+                    try w.writeAll("{\"type\":\"text\",\"text\":");
+                    try writeJsonString(w, text);
+                    try w.writeByte('}');
+                },
+                .image => |image| {
+                    try w.writeAll("{\"type\":\"image\",\"data\":");
+                    try writeJsonString(w, image.data);
+                    try w.writeAll(",\"mimeType\":");
+                    try writeJsonString(w, image.mime_type);
+                    try w.writeByte('}');
+                },
+            }
+        }
+        try w.writeByte(']');
     }
 
     pub fn appendSessionInfo(self: *PersistentStore, io: std.Io, allocator: std.mem.Allocator, name: []const u8) !void {

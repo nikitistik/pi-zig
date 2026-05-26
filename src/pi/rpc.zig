@@ -434,6 +434,7 @@ const Runtime = struct {
                             .tool_call_id = message.toolCallId().?,
                             .tool_name = message.toolName() orelse "",
                             .content = message.text(),
+                            .content_parts = message.image_parts,
                             .is_error = message.tool_is_error,
                             .terminate = message.tool_terminate,
                         });
@@ -540,7 +541,7 @@ const Runtime = struct {
         } else {
             var text_buf: [max_message_bytes]u8 = undefined;
             const text_len = try extractMessageText(message.object, &text_buf);
-            var image_parts: []ai_client.ChatContentPart = if (role == .user) try extractMessageImages(allocator, message.object) else &.{};
+            var image_parts: []ai_client.ChatContentPart = if (role == .user or role == .tool) try extractMessageImages(allocator, message.object) else &.{};
             errdefer freeRpcContentParts(allocator, image_parts);
             try self.addLoadedMessage(role, id, text_buf[0..text_len]);
             const slot = &self.messages[self.message_count - 1];
@@ -1103,6 +1104,7 @@ const Runtime = struct {
         var chat_message = ai_client.ChatMessage{
             .role = .tool,
             .content = try allocator.dupe(u8, message.text()),
+            .content_parts = try buildOwnedPromptContentParts(allocator, message.text(), message.image_parts),
             .tool_call_id = null,
         };
         errdefer deinitHistoryMessage(allocator, chat_message);
@@ -1204,6 +1206,7 @@ const Runtime = struct {
         var slot = &self.messages[self.message_count - 1];
         try copyBounded(&slot.tool_call_id, &slot.tool_call_id_len, result.tool_call_id);
         try copyBounded(&slot.tool_name, &slot.tool_name_len, result.tool_name);
+        slot.image_parts = try cloneImageParts(allocator, result.content_parts);
         slot.tool_is_error = result.is_error;
         slot.tool_terminate = result.terminate;
     }
@@ -1762,7 +1765,7 @@ const Runtime = struct {
         } else {
             try w.writeAll(",\"content\":");
             try writeJsonString(w, message.text());
-            if (message.role == .user and message.image_parts.len > 0) {
+            if ((message.role == .user or message.role == .tool) and message.image_parts.len > 0) {
                 try w.writeAll(",\"images\":");
                 try writeImagePartsJson(w, message.image_parts);
             }
@@ -2337,6 +2340,28 @@ fn writeImagePartsJson(w: *std.Io.Writer, parts: []const ai_client.ChatContentPa
     try w.writeByte(']');
 }
 
+fn writeContentPartsJson(w: *std.Io.Writer, parts: []const ai_client.ChatContentPart) !void {
+    try w.writeByte('[');
+    for (parts, 0..) |part, index| {
+        if (index != 0) try w.writeByte(',');
+        switch (part) {
+            .text => |text| {
+                try w.writeAll("{\"type\":\"text\",\"text\":");
+                try writeJsonString(w, text);
+                try w.writeByte('}');
+            },
+            .image => |image| {
+                try w.writeAll("{\"type\":\"image\",\"data\":");
+                try writeJsonString(w, image.data);
+                try w.writeAll(",\"mimeType\":");
+                try writeJsonString(w, image.mime_type);
+                try w.writeByte('}');
+            },
+        }
+    }
+    try w.writeByte(']');
+}
+
 fn writeAgentToolResultsJson(w: *std.Io.Writer, results: []const agent.ToolResult) !void {
     try w.writeByte('[');
     for (results, 0..) |result, i| {
@@ -2349,6 +2374,10 @@ fn writeAgentToolResultsJson(w: *std.Io.Writer, results: []const agent.ToolResul
         try writeJsonString(w, result.arguments_json);
         try w.writeAll(",\"content\":");
         try writeJsonString(w, result.content);
+        if (result.content_parts.len > 0) {
+            try w.writeAll(",\"contentParts\":");
+            try writeContentPartsJson(w, result.content_parts);
+        }
         try w.writeAll(",\"isError\":");
         try w.writeAll(if (result.is_error) "true" else "false");
         try w.writeAll(",\"terminate\":");

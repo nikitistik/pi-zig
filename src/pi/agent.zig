@@ -59,11 +59,13 @@ pub const BeforeToolCallResult = struct {
 
 pub const AfterToolCallResult = struct {
     content: ?[]u8 = null,
+    content_parts: []ai_client.ChatContentPart = &.{},
     is_error: ?bool = null,
     terminate: ?bool = null,
 
     pub fn deinit(self: AfterToolCallResult, allocator: std.mem.Allocator) void {
         if (self.content) |content| allocator.free(content);
+        freeContentParts(allocator, self.content_parts);
     }
 };
 
@@ -155,6 +157,7 @@ pub const ToolResult = struct {
     tool_name: []u8,
     arguments_json: []u8,
     content: []u8,
+    content_parts: []ai_client.ChatContentPart = &.{},
     is_error: bool = false,
     terminate: bool = false,
 
@@ -163,6 +166,7 @@ pub const ToolResult = struct {
         if (self.tool_name.len > 0) allocator.free(self.tool_name);
         if (self.arguments_json.len > 0) allocator.free(self.arguments_json);
         if (self.content.len > 0) allocator.free(self.content);
+        freeContentParts(allocator, self.content_parts);
     }
 };
 
@@ -180,12 +184,14 @@ pub const ToolUpdate = struct {
 
 pub const ToolExecutionResult = struct {
     content: []u8,
+    content_parts: []ai_client.ChatContentPart = &.{},
     is_error: bool = false,
     terminate: bool = false,
     arguments_json: ?[]u8 = null,
 
     fn deinit(self: ToolExecutionResult, allocator: std.mem.Allocator) void {
         if (self.content.len > 0) allocator.free(self.content);
+        freeContentParts(allocator, self.content_parts);
         if (self.arguments_json) |arguments_json| allocator.free(arguments_json);
     }
 };
@@ -217,7 +223,7 @@ const ls_parameters_json =
 const all_tool_definitions = [_]ai_client.ChatToolDefinition{
     .{
         .name = "read",
-        .description = "Read the contents of a file. Supports text files with offset and limit. Output is truncated to pi-zig read-tool limits.",
+        .description = "Read the contents of a file. Supports text files with offset and limit, plus png, jpg, gif, and webp images as attachments. Text output is truncated to pi-zig read-tool limits.",
         .parameters_json = read_parameters_json,
     },
     .{
@@ -390,7 +396,14 @@ pub fn runPrompt(
                 .name = call.name,
                 .arguments_json = tool_execution.arguments_json orelse call.arguments_json,
             };
-            const traced_tool_result = try createToolResultTrace(allocator, trace_call, tool_execution.content, tool_execution.is_error, tool_execution.terminate);
+            const traced_tool_result = try createToolResultTrace(
+                allocator,
+                trace_call,
+                tool_execution.content,
+                tool_execution.content_parts,
+                tool_execution.is_error,
+                tool_execution.terminate,
+            );
             errdefer traced_tool_result.deinit(allocator);
             if (options.on_tool_end) |callback| {
                 if (options.tool_event_context) |context| try callback(context, traced_tool_result);
@@ -399,9 +412,11 @@ pub fn runPrompt(
             try messages.append(allocator, .{
                 .role = .tool,
                 .content = tool_execution.content,
+                .content_parts = tool_execution.content_parts,
                 .tool_call_id = tool_call_id,
             });
             tool_execution.content = &.{};
+            tool_execution.content_parts = &.{};
             if (tool_execution.arguments_json) |arguments_json| allocator.free(arguments_json);
             tool_execution.arguments_json = null;
             tool_results_count += 1;
@@ -696,6 +711,7 @@ fn createToolResultTrace(
     allocator: std.mem.Allocator,
     call: ai_client.ChatToolCall,
     content: []const u8,
+    content_parts: []const ai_client.ChatContentPart,
     is_error: bool,
     terminate: bool,
 ) !ToolResult {
@@ -704,6 +720,7 @@ fn createToolResultTrace(
         .tool_name = &.{},
         .arguments_json = &.{},
         .content = &.{},
+        .content_parts = &.{},
         .is_error = is_error,
         .terminate = terminate,
     };
@@ -711,6 +728,7 @@ fn createToolResultTrace(
     result.tool_name = try allocator.dupe(u8, call.name);
     result.arguments_json = try allocator.dupe(u8, call.arguments_json);
     result.content = try allocator.dupe(u8, content);
+    result.content_parts = try cloneContentParts(allocator, content_parts);
     return result;
 }
 
@@ -759,12 +777,15 @@ fn executeToolCallWithHooks(
                 .tool_name = effective_call.name,
                 .arguments_json = effective_call.arguments_json,
                 .content = result.content,
+                .content_parts = result.content_parts,
                 .is_error = result.is_error,
                 .terminate = result.terminate,
             };
             var after_result = callback(context, effective_call, provisional_result) catch |err| {
                 allocator.free(result.content);
+                freeContentParts(allocator, result.content_parts);
                 result.content = try std.fmt.allocPrint(allocator, "afterToolCall failed: {s}", .{@errorName(err)});
+                result.content_parts = &.{};
                 result.is_error = true;
                 result.terminate = false;
                 result.arguments_json = overridden_arguments_json;
@@ -775,8 +796,15 @@ fn executeToolCallWithHooks(
 
             if (after_result.content) |content| {
                 allocator.free(result.content);
+                freeContentParts(allocator, result.content_parts);
                 result.content = content;
+                result.content_parts = &.{};
                 after_result.content = null;
+            }
+            if (after_result.content_parts.len > 0) {
+                freeContentParts(allocator, result.content_parts);
+                result.content_parts = after_result.content_parts;
+                after_result.content_parts = &.{};
             }
             if (after_result.is_error) |is_error| result.is_error = is_error;
             if (after_result.terminate) |terminate| result.terminate = terminate;
@@ -832,12 +860,49 @@ fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []c
     var parsed = parseArguments(allocator, "read", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "read", err));
     defer parsed.deinit();
     const path = requiredString(parsed.value, "path") orelse return toolError(try allocator.dupe(u8, "read tool arguments are missing path."));
+    if (imageMimeTypeForPath(path)) |mime_type| {
+        return executeReadImageTool(io, allocator, path, mime_type) catch |err| {
+            return toolError(try std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)}));
+        };
+    }
     const offset = optionalUsize(parsed.value, "offset") catch return toolError(try allocator.dupe(u8, "read tool offset must be a non-negative number."));
     const limit = optionalUsize(parsed.value, "limit") catch return toolError(try allocator.dupe(u8, "read tool limit must be a non-negative number."));
     const content = tools.readFileForToolText(io, allocator, path, offset, limit) catch |err| {
         return toolError(try std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)}));
     };
     return toolOk(content);
+}
+
+fn executeReadImageTool(io: std.Io, allocator: std.mem.Allocator, path: []const u8, mime_type: []const u8) !ToolExecutionResult {
+    const bytes = try tools.readFile(io, allocator, path, 16 * 1024 * 1024);
+    defer allocator.free(bytes);
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    errdefer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+
+    const mime_owned = try allocator.dupe(u8, mime_type);
+    errdefer allocator.free(mime_owned);
+
+    const content = try std.fmt.allocPrint(allocator, "Read image file [{s}]", .{mime_type});
+    errdefer allocator.free(content);
+
+    const content_note = try allocator.dupe(u8, content);
+    errdefer allocator.free(content_note);
+
+    const parts = try allocator.alloc(ai_client.ChatContentPart, 2);
+    errdefer allocator.free(parts);
+    parts[0] = .{ .text = content_note };
+    parts[1] = .{ .image = .{
+        .data = encoded,
+        .mime_type = mime_owned,
+    } };
+
+    return .{
+        .content = content,
+        .content_parts = parts,
+    };
 }
 
 fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.ChatToolCall, options: ?RunOptions) !ToolExecutionResult {
@@ -976,6 +1041,24 @@ fn toolOk(content: []u8) ToolExecutionResult {
 
 fn toolError(content: []u8) ToolExecutionResult {
     return .{ .content = content, .is_error = true };
+}
+
+fn imageMimeTypeForPath(path: []const u8) ?[]const u8 {
+    const ext = std.fs.path.extension(path);
+    if (asciiEqlIgnoreCase(ext, ".png")) return "image/png";
+    if (asciiEqlIgnoreCase(ext, ".jpg")) return "image/jpeg";
+    if (asciiEqlIgnoreCase(ext, ".jpeg")) return "image/jpeg";
+    if (asciiEqlIgnoreCase(ext, ".webp")) return "image/webp";
+    if (asciiEqlIgnoreCase(ext, ".gif")) return "image/gif";
+    return null;
+}
+
+fn asciiEqlIgnoreCase(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |l, r| {
+        if (std.ascii.toLower(l) != std.ascii.toLower(r)) return false;
+    }
+    return true;
 }
 
 fn fieldValue(value: std.json.Value, name: []const u8) ?std.json.Value {

@@ -1128,16 +1128,37 @@ fn buildPayloadWithStream(allocator: std.mem.Allocator, request: ChatTurnRequest
     try w.writeAll("{\"model\":");
     try writeJsonString(w, request.model);
     try w.writeAll(",\"messages\":[");
-    for (request.messages, 0..) |message, index| {
-        if (index != 0) try w.writeByte(',');
-        try writeMessage(w, message);
+    var emitted: usize = 0;
+    var index: usize = 0;
+    while (index < request.messages.len) {
+        const message = request.messages[index];
+        if (message.role == .tool) {
+            const tool_start = index;
+            var has_images = false;
+            while (index < request.messages.len and request.messages[index].role == .tool) : (index += 1) {
+                if (emitted != 0) try w.writeByte(',');
+                try writeOpenAIToolTextMessage(w, request.messages[index]);
+                emitted += 1;
+                if (hasImageContentParts(request.messages[index].content_parts)) has_images = true;
+            }
+            if (has_images) {
+                if (emitted != 0) try w.writeByte(',');
+                try writeOpenAIToolResultImagesMessage(w, request.messages[tool_start..index]);
+                emitted += 1;
+            }
+        } else {
+            if (emitted != 0) try w.writeByte(',');
+            try writeMessage(w, message);
+            emitted += 1;
+            index += 1;
+        }
     }
     try w.writeAll("],\"stream\":");
     try w.writeAll(if (stream) "true" else "false");
     if (request.tools.len > 0) {
         try w.writeAll(",\"tools\":[");
-        for (request.tools, 0..) |tool, index| {
-            if (index != 0) try w.writeByte(',');
+        for (request.tools, 0..) |tool, tool_index| {
+            if (tool_index != 0) try w.writeByte(',');
             try writeToolDefinition(w, tool);
         }
         try w.writeAll("],\"tool_choice\":\"auto\"");
@@ -1340,7 +1361,11 @@ fn writeAnthropicToolResultMessage(w: *std.Io.Writer, messages: []const ChatMess
         try w.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
         try writeJsonString(w, message.tool_call_id orelse "");
         try w.writeAll(",\"content\":");
-        try writeJsonString(w, message.content);
+        if (message.content_parts.len > 0) {
+            try writeAnthropicContentParts(w, message.content_parts);
+        } else {
+            try writeJsonString(w, message.content);
+        }
         try w.writeByte('}');
         emitted += 1;
     }
@@ -1370,6 +1395,15 @@ fn writeAnthropicContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
             try w.writeAll("}}");
         },
     }
+}
+
+fn writeAnthropicContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
+    try w.writeByte('[');
+    for (parts, 0..) |part, index| {
+        if (index != 0) try w.writeByte(',');
+        try writeAnthropicContentPart(w, part);
+    }
+    try w.writeByte(']');
 }
 
 fn writeAnthropicToolUseBlock(w: *std.Io.Writer, call: ChatToolCall) !void {
@@ -1449,6 +1483,21 @@ fn writeGoogleToolResultContent(w: *std.Io.Writer, messages: []const ChatMessage
         try writeJsonString(w, message.content);
         try w.writeAll("}}}");
         emitted += 1;
+        if (hasImageContentParts(message.content_parts)) {
+            if (emitted != 0) try w.writeByte(',');
+            try w.writeAll("{\"text\":\"Tool result image:\"}");
+            emitted += 1;
+            for (message.content_parts) |part| {
+                switch (part) {
+                    .text => {},
+                    .image => {
+                        if (emitted != 0) try w.writeByte(',');
+                        try writeGoogleContentPart(w, part);
+                        emitted += 1;
+                    },
+                }
+            }
+        }
     }
     try w.writeAll("]}");
 }
@@ -1543,9 +1592,14 @@ fn writeMistralMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: 
             try w.writeAll(",\"name\":");
             try writeJsonString(w, tool_name);
         }
-        try w.writeAll(",\"content\":[{\"type\":\"text\",\"text\":");
-        try writeJsonString(w, if (message.content.len > 0) message.content else "(no tool output)");
-        try w.writeAll("}]");
+        try w.writeAll(",\"content\":");
+        if (message.content_parts.len > 0) {
+            try writeMistralContentParts(w, message.content_parts);
+        } else {
+            try w.writeAll("[{\"type\":\"text\",\"text\":");
+            try writeJsonString(w, if (message.content.len > 0) message.content else "(no tool output)");
+            try w.writeAll("}]");
+        }
     } else {
         try w.writeAll(",\"content\":");
         if (message.content_parts.len > 0) {
@@ -1646,9 +1700,15 @@ fn writeBedrockToolResultMessage(w: *std.Io.Writer, messages: []const ChatMessag
         const message = messages[index.*];
         try w.writeAll("{\"toolResult\":{\"toolUseId\":");
         try writeJsonString(w, message.tool_call_id orelse "");
-        try w.writeAll(",\"content\":[{\"text\":");
-        try writeJsonString(w, if (message.content.len > 0) message.content else "(no tool output)");
-        try w.writeAll("}],\"status\":\"success\"}}");
+        try w.writeAll(",\"content\":");
+        if (message.content_parts.len > 0) {
+            try writeBedrockContentParts(w, message.content_parts);
+        } else {
+            try w.writeAll("[{\"text\":");
+            try writeJsonString(w, if (message.content.len > 0) message.content else "(no tool output)");
+            try w.writeAll("}]");
+        }
+        try w.writeAll(",\"status\":\"success\"}}");
         emitted += 1;
     }
     try w.writeAll("]}");
@@ -1677,6 +1737,15 @@ fn writeBedrockContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
             try w.writeAll("}}}");
         },
     }
+}
+
+fn writeBedrockContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
+    try w.writeByte('[');
+    for (parts, 0..) |part, index| {
+        if (index != 0) try w.writeByte(',');
+        try writeBedrockContentPart(w, part);
+    }
+    try w.writeByte(']');
 }
 
 fn writeBedrockToolUseBlock(w: *std.Io.Writer, call: ChatToolCall) !void {
@@ -2864,26 +2933,73 @@ fn writeMessage(w: *std.Io.Writer, message: ChatMessage) !void {
     try w.writeByte('}');
 }
 
+fn writeOpenAIToolTextMessage(w: *std.Io.Writer, message: ChatMessage) !void {
+    try w.writeAll("{\"role\":\"tool\"");
+    if (message.tool_call_id) |tool_call_id| {
+        try w.writeAll(",\"tool_call_id\":");
+        try writeJsonString(w, tool_call_id);
+    }
+    try w.writeAll(",\"content\":");
+    if (message.content.len > 0) {
+        try writeJsonString(w, message.content);
+    } else if (hasImageContentParts(message.content_parts)) {
+        try writeJsonString(w, "(see attached image)");
+    } else {
+        try writeJsonString(w, "");
+    }
+    try w.writeByte('}');
+}
+
+fn writeOpenAIToolResultImagesMessage(w: *std.Io.Writer, messages: []const ChatMessage) !void {
+    try w.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Attached image(s) from tool result:\"}");
+    for (messages) |message| {
+        for (message.content_parts) |part| {
+            switch (part) {
+                .text => {},
+                .image => {
+                    try w.writeByte(',');
+                    try writeContentPart(w, part);
+                },
+            }
+        }
+    }
+    try w.writeAll("]}");
+}
+
 fn writeContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
     try w.writeByte('[');
     for (parts, 0..) |part, index| {
         if (index != 0) try w.writeByte(',');
-        switch (part) {
-            .text => |text| {
-                try w.writeAll("{\"type\":\"text\",\"text\":");
-                try writeJsonString(w, text);
-                try w.writeByte('}');
-            },
-            .image => |image| {
-                try w.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
-                try writeJsonStringFragment(w, image.mime_type);
-                try w.writeAll(";base64,");
-                try writeJsonStringFragment(w, image.data);
-                try w.writeAll("\"}}");
-            },
-        }
+        try writeContentPart(w, part);
     }
     try w.writeByte(']');
+}
+
+fn writeContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
+    switch (part) {
+        .text => |text| {
+            try w.writeAll("{\"type\":\"text\",\"text\":");
+            try writeJsonString(w, text);
+            try w.writeByte('}');
+        },
+        .image => |image| {
+            try w.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+            try writeJsonStringFragment(w, image.mime_type);
+            try w.writeAll(";base64,");
+            try writeJsonStringFragment(w, image.data);
+            try w.writeAll("\"}}");
+        },
+    }
+}
+
+fn hasImageContentParts(parts: []const ChatContentPart) bool {
+    for (parts) |part| {
+        switch (part) {
+            .image => return true,
+            .text => {},
+        }
+    }
+    return false;
 }
 
 fn writeToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void {
@@ -3108,9 +3224,38 @@ test "serializes OpenAI-compatible text and image content parts" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"content\":[{\"type\":\"text\",\"text\":\"inspect this\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGVsbG8=\"}}]") != null);
 }
 
+test "serializes OpenAI-compatible tool result images as a follow-up user message" {
+    const tool_result_parts = [_]ChatContentPart{
+        .{ .text = "ok" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const tool_calls = [_]ChatToolCall{
+        .{ .id = @constCast("call_1"), .name = @constCast("read"), .arguments_json = @constCast("{\"path\":\"image.png\"}") },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "inspect image" },
+        .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
+        .{ .role = .tool, .content = "ok", .content_parts = tool_result_parts[0..], .tool_call_id = "call_1" },
+    };
+    const payload = try buildPayload(std.testing.allocator, .{
+        .provider = "openai",
+        .model = "mock-image-tool-result-model",
+        .api_key = "unused",
+        .messages = messages[0..],
+    });
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Attached image(s) from tool result:\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGVsbG8=\"}}]") != null);
+}
+
 test "serializes Anthropic messages payload with images tools and tool results" {
     const parts = [_]ChatContentPart{
         .{ .text = "inspect this" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const tool_result_parts = [_]ChatContentPart{
+        .{ .text = "ok" },
         .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
     };
     const tool_calls = [_]ChatToolCall{
@@ -3120,7 +3265,7 @@ test "serializes Anthropic messages payload with images tools and tool results" 
         .{ .role = .system, .content = "be terse" },
         .{ .role = .user, .content_parts = parts[0..] },
         .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
-        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1" },
+        .{ .role = .tool, .content = "ok", .content_parts = tool_result_parts[0..], .tool_call_id = "call_1" },
     };
     const tools = [_]ChatToolDefinition{
         .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
@@ -3137,7 +3282,7 @@ test "serializes Anthropic messages payload with images tools and tool results" 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"system\":[{\"type\":\"text\",\"text\":\"be terse\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"aGVsbG8=\"}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"bash\",\"input\":{\"command\":\"printf ok\"}}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"ok\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"aGVsbG8=\"}}]}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"name\":\"bash\",\"description\":\"run shell\",\"input_schema\":{\"type\":\"object\"}}]") != null);
 }
 
@@ -3154,11 +3299,15 @@ test "serializes Google generate content payload with images tools and tool resu
             .thought_signature = @constCast("dGhvdWdodC1zaWduYXR1cmU="),
         },
     };
+    const tool_result_parts = [_]ChatContentPart{
+        .{ .text = "ok" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
     const messages = [_]ChatMessage{
         .{ .role = .system, .content = "be terse" },
         .{ .role = .user, .content_parts = parts[0..] },
         .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
-        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1" },
+        .{ .role = .tool, .content = "ok", .content_parts = tool_result_parts[0..], .tool_call_id = "call_1" },
     };
     const tools = [_]ChatToolDefinition{
         .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
@@ -3177,6 +3326,7 @@ test "serializes Google generate content payload with images tools and tool resu
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"functionCall\":{\"name\":\"bash\",\"args\":{\"command\":\"printf ok\"}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"thoughtSignature\":\"dGhvdWdodC1zaWduYXR1cmU=\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"functionResponse\":{\"name\":\"bash\",\"response\":{\"output\":\"ok\"}}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"functionResponse\":{\"name\":\"bash\",\"response\":{\"output\":\"ok\"}}},{\"text\":\"Tool result image:\"},{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"aGVsbG8=\"}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"functionDeclarations\":[{\"name\":\"bash\",\"description\":\"run shell\",\"parametersJsonSchema\":{\"type\":\"object\"}}]}]") != null);
 }
 
@@ -3188,11 +3338,15 @@ test "serializes Mistral chat payload with images tools and tool results" {
     const tool_calls = [_]ChatToolCall{
         .{ .id = @constCast("call_1"), .name = @constCast("bash"), .arguments_json = @constCast("{\"command\":\"printf ok\"}") },
     };
+    const tool_result_parts = [_]ChatContentPart{
+        .{ .text = "ok" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
     const messages = [_]ChatMessage{
         .{ .role = .system, .content = "be terse" },
         .{ .role = .user, .content_parts = parts[0..] },
         .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
-        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1" },
+        .{ .role = .tool, .content = "ok", .content_parts = tool_result_parts[0..], .tool_call_id = "call_1" },
     };
     const tools = [_]ChatToolDefinition{
         .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
@@ -3210,7 +3364,7 @@ test "serializes Mistral chat payload with images tools and tool results" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"role\":\"system\",\"content\":\"be terse\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,aGVsbG8=\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf ok\\\"}\"}}]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tool_call_id\":\"call_1\",\"name\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tool_call_id\":\"call_1\",\"name\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,aGVsbG8=\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"run shell\",\"parameters\":{\"type\":\"object\"},\"strict\":false}}]") != null);
 }
 
@@ -3222,11 +3376,15 @@ test "serializes Bedrock converse payload with images tools and tool results" {
     const tool_calls = [_]ChatToolCall{
         .{ .id = @constCast("call_1"), .name = @constCast("bash"), .arguments_json = @constCast("{\"command\":\"printf ok\"}") },
     };
+    const tool_result_parts = [_]ChatContentPart{
+        .{ .text = "ok" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
     const messages = [_]ChatMessage{
         .{ .role = .system, .content = "be terse" },
         .{ .role = .user, .content_parts = parts[0..] },
         .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
-        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1" },
+        .{ .role = .tool, .content = "ok", .content_parts = tool_result_parts[0..], .tool_call_id = "call_1" },
     };
     const tools = [_]ChatToolDefinition{
         .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
@@ -3243,7 +3401,7 @@ test "serializes Bedrock converse payload with images tools and tool results" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"system\":[{\"text\":\"be terse\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"image\":{\"format\":\"png\",\"source\":{\"bytes\":\"aGVsbG8=\"}}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "{\"toolUse\":{\"toolUseId\":\"call_1\",\"name\":\"bash\",\"input\":{\"command\":\"printf ok\"}}}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"toolResult\":{\"toolUseId\":\"call_1\",\"content\":[{\"text\":\"ok\"}],\"status\":\"success\"}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"toolResult\":{\"toolUseId\":\"call_1\",\"content\":[{\"text\":\"ok\"},{\"image\":{\"format\":\"png\",\"source\":{\"bytes\":\"aGVsbG8=\"}}}],\"status\":\"success\"}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"toolConfig\":{\"tools\":[{\"toolSpec\":{\"name\":\"bash\",\"description\":\"run shell\",\"inputSchema\":{\"json\":{\"type\":\"object\"}}}}],\"toolChoice\":{\"auto\":{}}}") != null);
 }
 
