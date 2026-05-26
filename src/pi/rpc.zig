@@ -104,6 +104,7 @@ const StoredMessage = struct {
     id: [32]u8 = undefined,
     len: usize = 0,
     content: [max_message_bytes]u8 = undefined,
+    image_parts: []ai_client.ChatContentPart = &.{},
     command_len: usize = 0,
     command: [max_command_bytes]u8 = undefined,
     exit_code: ?u8 = null,
@@ -259,11 +260,13 @@ const Runtime = struct {
     }
 
     fn deinit(self: *Runtime, allocator: std.mem.Allocator) void {
+        self.clearLoadedImages(allocator);
         self.steering_queue.clear(allocator);
         self.follow_up_queue.clear(allocator);
     }
 
     fn resetInMemory(self: *Runtime, allocator: std.mem.Allocator) void {
+        self.clearLoadedImages(allocator);
         self.message_count = 0;
         self.session_name_len = 0;
         self.has_session_name = false;
@@ -278,6 +281,13 @@ const Runtime = struct {
         self.auto_retry_max_delay_ms = default_auto_retry_max_delay_ms;
         self.last_retry_attempts = 0;
         self.last_retry_delay_ms = 0;
+    }
+
+    fn clearLoadedImages(self: *Runtime, allocator: std.mem.Allocator) void {
+        for (self.messages[0..self.message_count]) |*message| {
+            freeRpcContentParts(allocator, message.image_parts);
+            message.image_parts = &.{};
+        }
     }
 
     fn clearSession(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, parent_session: ?[]const u8) !void {
@@ -322,7 +332,7 @@ const Runtime = struct {
         for (self.messages[0..copy_count]) |*message| {
             switch (message.role) {
                 .system => _ = try new_store.appendMessage(io, allocator, .system, message.text()),
-                .user => _ = try new_store.appendMessage(io, allocator, .user, message.text()),
+                .user => _ = try new_store.appendMessageWithContentParts(io, allocator, .user, message.text(), message.image_parts),
                 .assistant => {
                     if (message.tool_calls_count > 0) {
                         var calls: [max_tool_calls_per_message]ai_client.ChatToolCall = undefined;
@@ -398,7 +408,7 @@ const Runtime = struct {
             const entry_type = getStringFieldObject(parsed.value.object, "type") orelse return error.InvalidSessionEntry;
 
             if (std.mem.eql(u8, entry_type, "message")) {
-                try self.loadMessageEntry(parsed.value.object);
+                try self.loadMessageEntry(allocator, parsed.value.object);
             } else if (std.mem.eql(u8, entry_type, "session_info")) {
                 if (getStringFieldObject(parsed.value.object, "name")) |name| {
                     try self.setSessionNameMemory(name);
@@ -430,7 +440,7 @@ const Runtime = struct {
         try self.addLoadedCompaction(id, summary, first_kept_entry_id, tokens_before);
     }
 
-    fn loadMessageEntry(self: *Runtime, object: std.json.ObjectMap) !void {
+    fn loadMessageEntry(self: *Runtime, allocator: std.mem.Allocator, object: std.json.ObjectMap) !void {
         const id = getStringFieldObject(object, "id") orelse return error.InvalidSessionEntry;
         const message = object.get("message") orelse return error.InvalidSessionEntry;
         if (message != .object) return error.InvalidSessionEntry;
@@ -450,8 +460,12 @@ const Runtime = struct {
         } else {
             var text_buf: [max_message_bytes]u8 = undefined;
             const text_len = try extractMessageText(message.object, &text_buf);
+            var image_parts: []ai_client.ChatContentPart = if (role == .user) try extractMessageImages(allocator, message.object) else &.{};
+            errdefer freeRpcContentParts(allocator, image_parts);
             try self.addLoadedMessage(role, id, text_buf[0..text_len]);
             const slot = &self.messages[self.message_count - 1];
+            slot.image_parts = image_parts;
+            image_parts = &.{};
             if (role == .assistant) {
                 try copyToolCallsFromMessage(message.object, slot);
             } else if (role == .tool) {
@@ -476,6 +490,7 @@ const Runtime = struct {
         @memcpy(slot.id[0..entry_id.len], entry_id);
         slot.len = content.len;
         @memcpy(slot.content[0..content.len], content);
+        slot.image_parts = &.{};
         slot.command_len = 0;
         slot.exit_code = null;
         slot.cancelled = false;
@@ -512,6 +527,23 @@ const Runtime = struct {
         try self.addLoadedMessage(StoredRole.fromBase(role), entry_id, content);
     }
 
+    fn addUserMessageWithImages(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        image_parts: []const ai_client.ChatContentPart,
+    ) !void {
+        if (content.len > max_message_bytes) return error.MessageTooLarge;
+        if (self.message_count >= max_messages) return error.MessageLimitReached;
+
+        const owned_image_parts = try cloneImageParts(allocator, image_parts);
+        errdefer freeRpcContentParts(allocator, owned_image_parts);
+        const entry_id = try self.store.appendMessageWithContentParts(io, allocator, .user, content, image_parts);
+        try self.addLoadedMessage(.user, entry_id, content);
+        self.messages[self.message_count - 1].image_parts = owned_image_parts;
+    }
+
     fn addLoadedBash(self: *Runtime, entry_id: []const u8, command: []const u8, result: tools.ShellResult) !void {
         if (command.len > max_command_bytes) return error.CommandTooLarge;
         if (entry_id.len > 32) return error.ValueTooLong;
@@ -528,6 +560,7 @@ const Runtime = struct {
         @memcpy(slot.command[0..command.len], command);
         slot.len = output.len;
         @memcpy(slot.content[0..output.len], output);
+        slot.image_parts = &.{};
         slot.exit_code = result.exit_code;
         slot.cancelled = result.cancelled;
         slot.truncated = result.truncated or output.len < result.output.len;
@@ -753,7 +786,16 @@ const Runtime = struct {
 
     fn appendStoredHistoryMessage(self: *Runtime, allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), message: *StoredMessage) !void {
         switch (message.role) {
-            .user => try appendHistoryMessage(allocator, history, .user, message.text()),
+            .user => {
+                if (message.image_parts.len > 0) {
+                    try appendBatchHistoryMessage(allocator, history, .{
+                        .text = message.text(),
+                        .image_parts = message.image_parts,
+                    });
+                } else {
+                    try appendHistoryMessage(allocator, history, .user, message.text());
+                }
+            },
             .assistant => try appendAssistantHistoryMessage(allocator, history, message),
             .tool => try appendToolHistoryMessage(allocator, history, message),
             .bash_execution => try appendOwnedHistoryMessage(allocator, history, .user, try self.bashExecutionHistoryText(allocator, message)),
@@ -973,7 +1015,7 @@ const Runtime = struct {
         if (messages.len == 0) return;
         const history_limit = self.message_count;
         for (messages) |message| {
-            try self.addMessage(io, allocator, .user, message.text);
+            try self.addUserMessageWithImages(io, allocator, message.text, message.image_parts);
         }
 
         const prompt_message = messages[messages.len - 1];
@@ -1490,6 +1532,10 @@ const Runtime = struct {
         } else {
             try w.writeAll(",\"content\":");
             try writeJsonString(w, message.text());
+            if (message.role == .user and message.image_parts.len > 0) {
+                try w.writeAll(",\"images\":");
+                try writeImagePartsJson(w, message.image_parts);
+            }
             if (message.role == .assistant and message.tool_calls_count > 0) {
                 try w.writeAll(",\"toolCalls\":[");
                 for (message.tool_calls[0..message.tool_calls_count], 0..) |*call, index| {
@@ -1914,6 +1960,26 @@ fn writeBashResultJson(w: *std.Io.Writer, result: tools.ShellResult) !void {
     try w.writeByte('}');
 }
 
+fn writeImagePartsJson(w: *std.Io.Writer, parts: []const ai_client.ChatContentPart) !void {
+    try w.writeByte('[');
+    var emitted = false;
+    for (parts) |part| {
+        switch (part) {
+            .text => {},
+            .image => |image| {
+                if (emitted) try w.writeByte(',');
+                try w.writeAll("{\"type\":\"image\",\"data\":");
+                try writeJsonString(w, image.data);
+                try w.writeAll(",\"mimeType\":");
+                try writeJsonString(w, image.mime_type);
+                try w.writeByte('}');
+                emitted = true;
+            },
+        }
+    }
+    try w.writeByte(']');
+}
+
 fn writeAgentToolResultsJson(w: *std.Io.Writer, results: []const agent.ToolResult) !void {
     try w.writeByte('[');
     for (results, 0..) |result, i| {
@@ -2087,6 +2153,51 @@ fn extractMessageText(object: std.json.ObjectMap, buffer: []u8) !usize {
         else => {},
     }
     return writer.buffered().len;
+}
+
+fn extractMessageImages(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]ai_client.ChatContentPart {
+    const content = object.get("content") orelse return &.{};
+    if (content != .array) return &.{};
+    var count: usize = 0;
+    for (content.array.items) |item| {
+        if (item != .object) continue;
+        const block_type = getStringFieldObject(item.object, "type") orelse continue;
+        if (std.mem.eql(u8, block_type, "image")) count += 1;
+    }
+    if (count == 0) return &.{};
+
+    const parts = try allocator.alloc(ai_client.ChatContentPart, count);
+    var len: usize = 0;
+    errdefer {
+        for (parts[0..len]) |part| {
+            switch (part) {
+                .text => {},
+                .image => |image| {
+                    allocator.free(image.data);
+                    allocator.free(image.mime_type);
+                },
+            }
+        }
+        allocator.free(parts);
+    }
+
+    for (content.array.items) |item| {
+        if (item != .object) continue;
+        const block_type = getStringFieldObject(item.object, "type") orelse continue;
+        if (!std.mem.eql(u8, block_type, "image")) continue;
+        const data = getStringFieldObject(item.object, "data") orelse return error.InvalidSessionEntry;
+        const mime_type = getStringFieldObject(item.object, "mimeType") orelse return error.InvalidSessionEntry;
+        const owned_data = try allocator.dupe(u8, data);
+        errdefer allocator.free(owned_data);
+        const owned_mime_type = try allocator.dupe(u8, mime_type);
+        errdefer allocator.free(owned_mime_type);
+        parts[len] = .{ .image = .{
+            .data = owned_data,
+            .mime_type = owned_mime_type,
+        } };
+        len += 1;
+    }
+    return parts;
 }
 
 fn appendBoundedText(w: *std.Io.Writer, text: []const u8) !void {

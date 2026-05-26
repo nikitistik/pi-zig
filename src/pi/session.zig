@@ -230,6 +230,78 @@ pub const PersistentStore = struct {
         return self.leaf_id_buf[0..self.leaf_id_len];
     }
 
+    pub fn appendMessageWithContentParts(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        role: types.Role,
+        content: []const u8,
+        content_parts: []const ai_client.ChatContentPart,
+    ) ![]const u8 {
+        if (content_parts.len == 0) return self.appendMessage(io, allocator, role, content);
+        self.entry_counter += 1;
+
+        var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
+        var fixed = std.Io.Writer.fixed(&entry_id_buf);
+        try fixed.print("m-{d}", .{self.entry_counter});
+        const entry_id = fixed.buffered();
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"type\":\"message\",\"id\":");
+        try writeJsonString(w, entry_id);
+        try w.writeAll(",\"parentId\":");
+        if (self.leaf_id_len == 0) {
+            try w.writeAll("null");
+        } else {
+            try writeJsonString(w, self.leaf_id_buf[0..self.leaf_id_len]);
+        }
+        try w.writeAll(",\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll(",\"message\":{\"role\":");
+        try writeJsonString(w, role.label());
+        try w.writeAll(",\"content\":[");
+        var emitted = false;
+        if (content.len > 0) {
+            try w.writeAll("{\"type\":\"text\",\"text\":");
+            try writeJsonString(w, content);
+            try w.writeByte('}');
+            emitted = true;
+        }
+        for (content_parts) |part| {
+            switch (part) {
+                .text => |text| {
+                    if (emitted) try w.writeByte(',');
+                    try w.writeAll("{\"type\":\"text\",\"text\":");
+                    try writeJsonString(w, text);
+                    try w.writeByte('}');
+                    emitted = true;
+                },
+                .image => |image| {
+                    if (emitted) try w.writeByte(',');
+                    try w.writeAll("{\"type\":\"image\",\"data\":");
+                    try writeJsonString(w, image.data);
+                    try w.writeAll(",\"mimeType\":");
+                    try writeJsonString(w, image.mime_type);
+                    try w.writeByte('}');
+                    emitted = true;
+                },
+            }
+        }
+        try w.writeAll("]}}\n");
+
+        try appendBytes(io, self.path(), out.written());
+        try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, entry_id);
+        switch (role) {
+            .user => self.user_messages += 1,
+            .assistant => self.assistant_messages += 1,
+            .tool => self.tool_results += 1,
+            .system => {},
+        }
+        return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+
     pub fn appendAssistantToolCallMessage(
         self: *PersistentStore,
         io: std.Io,

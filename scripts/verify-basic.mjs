@@ -138,6 +138,17 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'image rpc observed' } }] }));
       return;
     }
+    if (user.includes('rpc image history replay')) {
+      const priorContent = userMessageIncluding('image input rpc')?.content;
+      if (!hasSmokeImage(priorContent) || (body.tools?.length ?? 0) === 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing persisted rpc image history content part', priorContent, tools: body.tools }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc image history observed' } }] }));
+      return;
+    }
     if (user.includes('expect no tools')) {
       if ((body.tools?.length ?? 0) !== 0) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -3229,6 +3240,36 @@ try {
   const rpcProviderImagePrompt = rpcProviderImageResponses.find((response) => response.id === 'rpc-provider-image-prompt');
   if (!rpcProviderImagePrompt?.success || rpcProviderImagePrompt?.data?.text !== 'image rpc observed') {
     throw new Error('rpc provider prompt smoke did not send image content parts');
+  }
+  const rpcProviderImageJsonl = fs.readFileSync(rpcProviderImageSessionFile, 'utf8');
+  if (
+    !rpcProviderImageJsonl.includes('"content":[{"type":"text","text":"image input rpc"},{"type":"image","data":"aW1hZ2Utc21va2U="') ||
+    !rpcProviderImageJsonl.includes('"mimeType":"image/png"')
+  ) {
+    throw new Error('rpc provider image smoke did not persist image content in durable JSONL');
+  }
+  const rpcProviderImageReplayOutput = run(
+    ['rpc', rpcProviderImageSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-provider-image-replay-prompt', type: 'prompt', message: 'rpc image history replay' }),
+      JSON.stringify({ id: 'rpc-provider-image-replay-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderImageReplayResponses = rpcProviderImageReplayOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderImageReplayPrompt = rpcProviderImageReplayResponses.find((response) => response.id === 'rpc-provider-image-replay-prompt');
+  if (!rpcProviderImageReplayPrompt?.success || rpcProviderImageReplayPrompt?.data?.text !== 'rpc image history observed') {
+    throw new Error('rpc provider prompt smoke did not replay persisted image content parts');
+  }
+  const rpcProviderImageReplayMessages = rpcProviderImageReplayResponses.find((response) => response.id === 'rpc-provider-image-replay-messages');
+  const rpcProviderImageReplayUser = rpcProviderImageReplayMessages?.data?.messages?.find((message) => message.role === 'user' && message.content === 'image input rpc');
+  if (
+    rpcProviderImageReplayUser?.images?.[0]?.type !== 'image' ||
+    rpcProviderImageReplayUser?.images?.[0]?.data !== 'aW1hZ2Utc21va2U=' ||
+    rpcProviderImageReplayUser?.images?.[0]?.mimeType !== 'image/png'
+  ) {
+    throw new Error('rpc get_messages smoke did not expose persisted user image content');
   }
 
   const rpcProviderQueuedImageSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-queued-image-smoke.jsonl');
