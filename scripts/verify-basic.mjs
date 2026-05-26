@@ -1308,6 +1308,16 @@ const topLevelJsonSession = fs.readFileSync(topLevelJsonSessionFile, 'utf8');
 if (!topLevelJsonSession.includes('"role":"user","content":"hello json mode"') || !topLevelJsonSession.includes('"role":"assistant"')) {
   throw new Error('top-level --mode json smoke did not persist user and assistant foundation messages');
 }
+const topLevelExportFile = 'zig-out/pi-zig-top-level-export.html';
+fs.rmSync(topLevelExportFile, { force: true });
+const topLevelExportOutput = run(['--export', topLevelJsonSessionFile, topLevelExportFile]);
+if (!topLevelExportOutput.includes(`Exported to: ${topLevelExportFile}`)) {
+  throw new Error('top-level --export smoke did not report the requested output path');
+}
+const topLevelExportHtml = fs.readFileSync(topLevelExportFile, 'utf8');
+if (!topLevelExportHtml.includes('pi-zig session') || !topLevelExportHtml.includes('hello json mode')) {
+  throw new Error('top-level --export smoke did not render JSONL session messages to HTML');
+}
 
 const topLevelRpcSessionFile = 'zig-out/pi-zig-top-level-rpc-smoke.jsonl';
 fs.rmSync(topLevelRpcSessionFile, { force: true });

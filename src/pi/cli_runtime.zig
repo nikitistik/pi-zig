@@ -37,9 +37,19 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         return models.writeListModelsJson(init.io, parsed.list_models_pattern);
     }
 
-    if (parsed.export_path) |_| {
-        try writeStderr(init.io, "Error: --export is not implemented in pi-zig top-level mode yet; use RPC export_html foundation instead.\n");
-        return error.UnsupportedCliFeature;
+    if (parsed.export_path) |input_path| {
+        const output_path = if (parsed.messages_len > 0) parsed.messages[0] else null;
+        const written_path = session.exportHtmlFromFile(init.io, init.gpa, input_path, output_path) catch |err| {
+            try writeStderr(init.io, "Error: ");
+            try writeStderr(init.io, @errorName(err));
+            try writeStderr(init.io, "\n");
+            return err;
+        };
+        defer init.gpa.free(written_path);
+        try writeStdout(init.io, "Exported to: ");
+        try writeStdout(init.io, written_path);
+        try writeStdout(init.io, "\n");
+        return;
     }
 
     const mode = parsed.mode orelse cli.Mode.text;
@@ -85,6 +95,7 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
         \\  --model <pattern>             Model pattern parsed for upstream CLI parity
         \\  --thinking <level>            Thinking level parsed for upstream CLI parity
         \\  --list-models [search]        List generated upstream model catalog
+        \\  --export <session> [output]   Export a session JSONL file to HTML
         \\  --help, -h                    Show this help
         \\  --version, -v                 Show version
         \\
@@ -103,7 +114,7 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
         \\  system-prompt                   Build the effective system prompt text
         \\
         \\Current top-level scope: print/json/rpc entry-point foundation. Provider execution,
-        \\interactive TUI, npm/git package install/update, extensions, export, and full agent loop remain incomplete.
+        \\interactive TUI, extension execution, provider execution, and full agent loop remain incomplete.
         \\
     );
 }

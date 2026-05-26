@@ -65,6 +65,7 @@ zig build run -- context-files
 zig build run -- context-files --no-context-files
 zig build run -- system-prompt --date 2026-05-26 --json --no-context-files
 npm run test # includes auth storage, extension discovery, settings-manager migration/write-safety, settings/package filters, local packages, context files, system prompt assembly, and ancestor .agents command discovery fixtures
+zig-out/bin/pi-zig --export zig-out/pi-zig-top-level-json-smoke.jsonl zig-out/pi-zig-top-level-export.html
 printf '{"type":"get_state"}\n' | zig build run -- rpc zig-out/pi-zig-session.jsonl
 printf '{"type":"get_available_models"}\n{"type":"set_model","provider":"anthropic","modelId":"claude-haiku-4-5"}\n{"type":"get_state"}\n' | zig build run -- rpc zig-out/pi-zig-session.jsonl
 printf '{"type":"prompt","message":"hello"}\n{"type":"get_session_stats"}\n{"type":"export_html","outputPath":"zig-out/pi-zig-session.html"}\n' | zig build run -- rpc zig-out/pi-zig-session.jsonl

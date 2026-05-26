@@ -62,6 +62,7 @@ const parity: ParityRow[] = [
   { area: 'Built-in tools', status: 'in_progress', target: 'read, bash, ls, grep, find, write, edit, RPC bash smokes' },
   { area: 'Sessions', status: 'in_progress', target: 'Durable JSONL resume, stats, names, compact, fork, clone' },
   { area: 'Resources', status: 'in_progress', target: 'Prompt/skill commands, themes, context files, system prompt assembly' },
+  { area: 'HTML export', status: 'in_progress', target: 'Top-level --export plus RPC export_html local renderer' },
   { area: 'TUI renderer', status: 'not_started', target: 'Differential terminal rendering and editor' },
   { area: 'Prin7r injection', status: 'not_started', target: 'Backend plus Preact app surface' }
 ];
@@ -111,6 +112,7 @@ const commands = [
   'zig build run -- context-files --no-context-files',
   'zig build run -- system-prompt --date 2026-05-26 --json --no-context-files',
   'npm run test # verifies auth storage, extension discovery, settings-manager migrations, package filters, local packages, context files, system prompt assembly, and ancestor .agents discovery',
+  'zig-out/bin/pi-zig --export zig-out/pi-zig-top-level-json-smoke.jsonl zig-out/pi-zig-top-level-export.html',
   'printf \'{"type":"get_commands"}\\n\' | zig-out/bin/pi-zig rpc zig-out/pi-zig-session.jsonl',
   'printf \'{"type":"get_commands"}\\n\' | zig-out/bin/pi-zig --mode rpc --session zig-out/pi-zig-session.jsonl --skill explicit/skills --prompt-template explicit/prompts',
   'zig-out/bin/pi-zig -p "hello top-level print"',
