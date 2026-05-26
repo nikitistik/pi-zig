@@ -629,7 +629,13 @@ const Runtime = struct {
         return null;
     }
 
-    fn runAgentIfAuthenticatedOnce(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, prompt: []const u8) !?agent.RunResult {
+    fn runAgentIfAuthenticatedOnce(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+        prompt_image_parts: []const ai_client.ChatContentPart,
+    ) !?agent.RunResult {
         const model = self.selected_model orelse return null;
         const env = self.env orelse return null;
         const api_key = try auth.resolveProviderApiKey(io, allocator, env, model.provider) orelse return null;
@@ -640,12 +646,15 @@ const Runtime = struct {
         defer shell_settings.deinit(allocator);
         var history = try self.buildAgentHistory(allocator);
         defer deinitAgentHistory(allocator, &history);
+        const prompt_content_parts = try buildPromptContentParts(allocator, prompt, prompt_image_parts);
+        defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
 
         return try agent.runPrompt(io, allocator, env, .{
             .provider = model.provider,
             .model = model.id,
             .api_key = api_key,
             .prompt = prompt,
+            .prompt_content_parts = prompt_content_parts,
             .system_prompt = runtime_system_prompt,
             .env = env,
             .shell_path = shell_settings.shell_path,
@@ -655,12 +664,18 @@ const Runtime = struct {
         });
     }
 
-    fn runAgentIfAuthenticated(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, prompt: []const u8) !?agent.RunResult {
+    fn runAgentIfAuthenticated(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+        prompt_image_parts: []const ai_client.ChatContentPart,
+    ) !?agent.RunResult {
         var retry_attempts: usize = 0;
         self.last_retry_attempts = 0;
         self.last_retry_delay_ms = 0;
         while (true) {
-            return self.runAgentIfAuthenticatedOnce(io, allocator, prompt) catch |err| {
+            return self.runAgentIfAuthenticatedOnce(io, allocator, prompt, prompt_image_parts) catch |err| {
                 if (!self.auto_retry_enabled or !isRetryableAgentError(err) or retry_attempts >= self.auto_retry_max_attempts) return err;
                 retry_attempts += 1;
                 self.last_retry_attempts = retry_attempts;
@@ -905,6 +920,7 @@ const Runtime = struct {
         io: std.Io,
         allocator: std.mem.Allocator,
         messages: []const []const u8,
+        prompt_image_parts: []const ai_client.ChatContentPart,
         last_result: *?agent.RunResult,
     ) !void {
         if (messages.len == 0) return;
@@ -913,7 +929,7 @@ const Runtime = struct {
         }
 
         const prompt = self.messages[self.message_count - 1].text();
-        const maybe_run_result = try self.runAgentIfAuthenticated(io, allocator, prompt);
+        const maybe_run_result = try self.runAgentIfAuthenticated(io, allocator, prompt, prompt_image_parts);
         var run_result = maybe_run_result orelse return;
         errdefer run_result.deinit(allocator);
 
@@ -941,12 +957,12 @@ const Runtime = struct {
         while (self.steering_queue.count > 0 or self.follow_up_queue.count > 0) {
             if (self.steering_queue.count > 0) {
                 const count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, &batch);
-                try self.runUserBatch(io, allocator, batch[0..count], last_result);
+                try self.runUserBatch(io, allocator, batch[0..count], &.{}, last_result);
                 self.steering_queue.dropPrefix(count);
                 continue;
             }
             const count = self.drainQueueBatch(&self.follow_up_queue, self.follow_up_mode, &batch);
-            try self.runUserBatch(io, allocator, batch[0..count], last_result);
+            try self.runUserBatch(io, allocator, batch[0..count], &.{}, last_result);
             self.follow_up_queue.dropPrefix(count);
         }
     }
@@ -985,6 +1001,7 @@ const Runtime = struct {
         id: ?[]const u8,
         command: []const u8,
         message: []const u8,
+        image_parts: []const ai_client.ChatContentPart,
     ) !void {
         var last_result: ?agent.RunResult = null;
         defer if (last_result) |result| result.deinit(allocator);
@@ -992,7 +1009,7 @@ const Runtime = struct {
         var initial_batch: [1 + max_pending_messages][]const u8 = undefined;
         initial_batch[0] = message;
         const steering_count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, initial_batch[1..]);
-        self.runUserBatch(io, allocator, initial_batch[0 .. 1 + steering_count], &last_result) catch |err| {
+        self.runUserBatch(io, allocator, initial_batch[0 .. 1 + steering_count], image_parts, &last_result) catch |err| {
             return writeError(w, id, command, @errorName(err));
         };
         self.steering_queue.dropPrefix(steering_count);
@@ -1015,7 +1032,11 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "prompt requires a string message");
             };
-            return self.handlePromptCommand(io, allocator, w, id, command, message);
+            const image_parts = parseRpcImages(allocator, value) catch {
+                return writeError(w, id, command, "prompt images must be ImageContent objects with type=image, data, and mimeType");
+            };
+            defer freeRpcImages(allocator, image_parts);
+            return self.handlePromptCommand(io, allocator, w, id, command, message, image_parts);
         }
 
         if (std.mem.eql(u8, command, "steer")) {
@@ -1572,6 +1593,80 @@ fn getOptionalTimeoutMillisecondsField(value: std.json.Value, name: []const u8) 
     const milliseconds = @round(seconds * 1000.0);
     if (milliseconds > @as(f64, @floatFromInt(std.math.maxInt(i64)))) return error.InvalidTimeout;
     return @max(1, @as(i64, @intFromFloat(milliseconds)));
+}
+
+fn parseRpcImages(allocator: std.mem.Allocator, value: std.json.Value) ![]ai_client.ChatContentPart {
+    if (value != .object) return &.{};
+    const images = value.object.get("images") orelse return &.{};
+    if (images != .array) return error.InvalidRpcImages;
+    if (images.array.items.len == 0) return &.{};
+
+    const parts = try allocator.alloc(ai_client.ChatContentPart, images.array.items.len);
+    var len: usize = 0;
+    errdefer {
+        for (parts[0..len]) |part| {
+            switch (part) {
+                .text => {},
+                .image => |image| {
+                    allocator.free(image.data);
+                    allocator.free(image.mime_type);
+                },
+            }
+        }
+        allocator.free(parts);
+    }
+
+    for (images.array.items) |item| {
+        if (item != .object) return error.InvalidRpcImages;
+        const image_type = getStringFieldObject(item.object, "type") orelse return error.InvalidRpcImages;
+        if (!std.mem.eql(u8, image_type, "image")) return error.InvalidRpcImages;
+        const data = getStringFieldObject(item.object, "data") orelse return error.InvalidRpcImages;
+        const mime_type = getStringFieldObject(item.object, "mimeType") orelse return error.InvalidRpcImages;
+        const owned_data = try allocator.dupe(u8, data);
+        errdefer allocator.free(owned_data);
+        const owned_mime_type = try allocator.dupe(u8, mime_type);
+        errdefer allocator.free(owned_mime_type);
+        parts[len] = .{ .image = .{
+            .data = owned_data,
+            .mime_type = owned_mime_type,
+        } };
+        len += 1;
+    }
+    return parts;
+}
+
+fn freeRpcImages(allocator: std.mem.Allocator, parts: []ai_client.ChatContentPart) void {
+    if (parts.len == 0) return;
+    for (parts) |part| {
+        switch (part) {
+            .text => {},
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        }
+    }
+    allocator.free(parts);
+}
+
+fn buildPromptContentParts(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    image_parts: []const ai_client.ChatContentPart,
+) ![]ai_client.ChatContentPart {
+    if (image_parts.len == 0) return &.{};
+    const text_parts: usize = if (prompt.len > 0) 1 else 0;
+    const parts = try allocator.alloc(ai_client.ChatContentPart, text_parts + image_parts.len);
+    var index: usize = 0;
+    if (prompt.len > 0) {
+        parts[index] = .{ .text = prompt };
+        index += 1;
+    }
+    for (image_parts) |part| {
+        parts[index] = part;
+        index += 1;
+    }
+    return parts;
 }
 
 fn getStringFieldObject(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {

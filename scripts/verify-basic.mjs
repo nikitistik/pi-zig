@@ -121,6 +121,19 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'image agent observed' } }] }));
       return;
     }
+    if (user.includes('image input rpc')) {
+      const content = lastUserMessage?.content;
+      const hasText = Array.isArray(content) && content.some((part) => part?.type === 'text' && part.text?.includes('image input rpc'));
+      const hasImage = Array.isArray(content) && content.some((part) => part?.type === 'image_url' && part.image_url?.url === 'data:image/png;base64,aW1hZ2Utc21va2U=');
+      if (!hasText || !hasImage || (body.tools?.length ?? 0) === 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing rpc image content part', content, tools: body.tools }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'image rpc observed' } }] }));
+      return;
+    }
     if (user.includes('expect no tools')) {
       if ((body.tools?.length ?? 0) !== 0) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -3166,6 +3179,28 @@ try {
     !rpcProviderContextPrompt?.data?.text?.includes('rpc provider project context sentinel')
   ) {
     throw new Error('rpc provider prompt smoke did not build a runtime system prompt with context and tool metadata');
+  }
+
+  const rpcProviderImageSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-image-smoke.jsonl');
+  fs.rmSync(rpcProviderImageSessionFile, { force: true });
+  const rpcProviderImageOutput = run(
+    ['rpc', rpcProviderImageSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-provider-image-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({
+        id: 'rpc-provider-image-prompt',
+        type: 'prompt',
+        message: 'image input rpc',
+        images: [{ type: 'image', data: 'aW1hZ2Utc21va2U=', mimeType: 'image/png' }]
+      }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderImageResponses = rpcProviderImageOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderImagePrompt = rpcProviderImageResponses.find((response) => response.id === 'rpc-provider-image-prompt');
+  if (!rpcProviderImagePrompt?.success || rpcProviderImagePrompt?.data?.text !== 'image rpc observed') {
+    throw new Error('rpc provider prompt smoke did not send image content parts');
   }
 
   const rpcProviderHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-history-smoke.jsonl');
