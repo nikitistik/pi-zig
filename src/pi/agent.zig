@@ -747,6 +747,7 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
 
     if (parsed.value != .object) return toolError(try allocator.dupe(u8, "bash tool arguments must be a JSON object."));
     const command = requiredString(parsed.value, "command") orelse return toolError(try allocator.dupe(u8, "bash tool arguments are missing command."));
+    const timeout_ms = optionalTimeoutMilliseconds(parsed.value, "timeout") catch return toolError(try allocator.dupe(u8, "bash tool timeout must be a non-negative finite number."));
 
     try emitToolUpdate(options, call, "", false, false);
     var update_context = BashShellUpdateContext{
@@ -756,6 +757,7 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
     const shell_result = tools.runShellCaptureWithUpdates(io, allocator, command, .{
         .update_context = &update_context,
         .on_update = handleBashShellUpdate,
+        .timeout_ms = timeout_ms,
     }) catch |err| {
         return toolError(try std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)}));
     };
@@ -896,6 +898,25 @@ fn optionalUsize(value: std.json.Value, name: []const u8) !?usize {
         },
         else => return error.InvalidToolArgument,
     }
+}
+
+fn optionalTimeoutMilliseconds(value: std.json.Value, name: []const u8) !?i64 {
+    const field = fieldValue(value, name) orelse return null;
+    const seconds: f64 = switch (field) {
+        .integer => |integer| blk: {
+            if (integer < 0) return error.InvalidToolArgument;
+            break :blk @floatFromInt(integer);
+        },
+        .float => |float| blk: {
+            if (float < 0 or !std.math.isFinite(float)) return error.InvalidToolArgument;
+            break :blk float;
+        },
+        else => return error.InvalidToolArgument,
+    };
+    if (seconds <= 0) return null;
+    const milliseconds = @round(seconds * 1000.0);
+    if (milliseconds > @as(f64, @floatFromInt(std.math.maxInt(i64)))) return error.InvalidToolArgument;
+    return @max(1, @as(i64, @intFromFloat(milliseconds)));
 }
 
 test "unsupported tool call returns a tool result instead of aborting" {
@@ -1153,6 +1174,28 @@ test "bash tool emits intermediate output update snapshots" {
     try std.testing.expect(ctx.saw_empty_start);
     try std.testing.expect(ctx.saw_first_snapshot);
     try std.testing.expect(ctx.saw_combined_snapshot);
+}
+
+test "bash tool timeout returns partial output as an error result" {
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_bash_timeout"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"command\":\"printf before-timeout; sleep 1; printf after-timeout\",\"timeout\":0.1}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "before-timeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "after-timeout") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Command timed out after 0.100 seconds") != null);
 }
 
 test "prepare next turn can update request state before should-stop runs" {

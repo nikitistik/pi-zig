@@ -36,6 +36,7 @@ pub const ShellCaptureOptions = struct {
     on_update: ?ShellUpdateCallback = null,
     update_throttle_ms: i64 = default_bash_update_throttle_ms,
     update_min_bytes: usize = default_bash_update_min_bytes,
+    timeout_ms: ?i64 = null,
 };
 
 pub const GrepOptions = struct {
@@ -591,8 +592,10 @@ pub fn runShellCaptureWithUpdates(
     var last_update_len: usize = 0;
     var last_update_ms: ?i64 = null;
     var dirty = false;
+    var timed_out = false;
+    const fill_timeout = shellReadTimeout(io, options.timeout_ms);
 
-    while (multi_reader.fill(64, .none)) |_| {
+    while (multi_reader.fill(64, fill_timeout)) |_| {
         if (stdout_reader.buffered().len > max_bash_capture_bytes) return error.StreamTooLong;
         if (stderr_reader.buffered().len > max_bash_capture_bytes) return error.StreamTooLong;
 
@@ -607,11 +610,15 @@ pub fn runShellCaptureWithUpdates(
         }
     } else |err| switch (err) {
         error.EndOfStream => {},
+        error.Timeout => {
+            timed_out = true;
+            child.kill(io);
+        },
         else => |e| return e,
     }
 
     try multi_reader.checkAnyError();
-    const term = try child.wait(io);
+    const term = if (timed_out) null else try child.wait(io);
 
     const stdout_slice = try multi_reader.toOwnedSlice(0);
     defer allocator.free(stdout_slice);
@@ -625,16 +632,25 @@ pub fn runShellCaptureWithUpdates(
     const raw_output = try combineShellOutput(allocator, stdout_slice, stderr_slice);
     defer allocator.free(raw_output);
 
-    const exit_code: ?u8 = switch (term) {
+    const exit_code: ?u8 = if (term) |child_term| switch (child_term) {
         .exited => |code| code,
         else => null,
-    };
-    const formatted = try formatShellOutput(allocator, io, raw_output, exit_code);
+    } else null;
+    const timeout_message = if (timed_out)
+        try timeoutStatusMessage(allocator, options.timeout_ms.?)
+    else
+        null;
+    defer if (timeout_message) |message| allocator.free(message);
+    const formatted = if (timeout_message) |message|
+        try formatShellOutputWithStatus(allocator, io, raw_output, exit_code, message, "")
+    else
+        try formatShellOutput(allocator, io, raw_output, exit_code);
     errdefer allocator.free(formatted.output);
 
     return .{
         .output = formatted.output,
         .exit_code = exit_code,
+        .cancelled = timed_out,
         .truncated = formatted.truncated,
         .full_output_path = formatted.full_output_path,
     };
@@ -798,6 +814,17 @@ fn writeRestoredLineEndings(w: *std.Io.Writer, content: []const u8, line_ending:
 }
 
 fn formatShellOutput(allocator: std.mem.Allocator, io: std.Io, raw_output: []const u8, exit_code: ?u8) !ShellOutput {
+    return formatShellOutputWithStatus(allocator, io, raw_output, exit_code, null, "(no output)");
+}
+
+fn formatShellOutputWithStatus(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    raw_output: []const u8,
+    exit_code: ?u8,
+    status_message: ?[]const u8,
+    empty_text: []const u8,
+) !ShellOutput {
     const truncation = try truncateTail(allocator, raw_output, default_bash_max_lines, default_bash_max_bytes);
     defer allocator.free(truncation.content);
 
@@ -808,8 +835,8 @@ fn formatShellOutput(allocator: std.mem.Allocator, io: std.Io, raw_output: []con
 
     if (truncation.content.len > 0) {
         try out.writer.writeAll(truncation.content);
-    } else if (exit_code == null or exit_code.? == 0) {
-        try out.writer.writeAll("(no output)");
+    } else if (empty_text.len > 0 and (exit_code == null or exit_code.? == 0)) {
+        try out.writer.writeAll(empty_text);
     }
 
     if (truncation.truncated) {
@@ -834,7 +861,10 @@ fn formatShellOutput(allocator: std.mem.Allocator, io: std.Io, raw_output: []con
         }
     }
 
-    if (exit_code) |code| {
+    if (status_message) |message| {
+        if (out.written().len > 0) try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(message);
+    } else if (exit_code) |code| {
         if (code != 0) {
             if (out.written().len > 0) try out.writer.writeAll("\n\n");
             try out.writer.print("Command exited with code {d}", .{code});
@@ -849,6 +879,33 @@ fn formatShellOutput(allocator: std.mem.Allocator, io: std.Io, raw_output: []con
         .truncated = truncation.truncated,
         .full_output_path = if (truncation.truncated) bash_full_output_path else null,
     };
+}
+
+fn shellReadTimeout(io: std.Io, maybe_timeout_ms: ?i64) std.Io.Timeout {
+    const timeout_ms = maybe_timeout_ms orelse return .none;
+    if (timeout_ms <= 0) return .none;
+    const duration: std.Io.Clock.Duration = .{
+        .raw = .fromMilliseconds(timeout_ms),
+        .clock = .awake,
+    };
+    return .{ .deadline = .fromNow(io, duration) };
+}
+
+fn timeoutStatusMessage(allocator: std.mem.Allocator, timeout_ms: i64) ![]u8 {
+    const whole_seconds = @divTrunc(timeout_ms, 1000);
+    const fractional_ms = @mod(timeout_ms, 1000);
+    if (fractional_ms == 0) {
+        return std.fmt.allocPrint(allocator, "Command timed out after {d} seconds", .{whole_seconds});
+    }
+    const hundreds: u8 = @intCast(@divTrunc(fractional_ms, 100));
+    const tens: u8 = @intCast(@divTrunc(@mod(fractional_ms, 100), 10));
+    const ones: u8 = @intCast(@mod(fractional_ms, 10));
+    const fractional_digits = [_]u8{
+        '0' + hundreds,
+        '0' + tens,
+        '0' + ones,
+    };
+    return std.fmt.allocPrint(allocator, "Command timed out after {d}.{s} seconds", .{ whole_seconds, &fractional_digits });
 }
 
 fn formatShellOutputSnapshot(allocator: std.mem.Allocator, io: std.Io, raw_output: []const u8) !ShellOutput {

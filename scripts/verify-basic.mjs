@@ -271,6 +271,49 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'slow bash updates complete: ' + toolOutput } }] }));
       return;
     }
+    if (user.includes('timeout bash tool')) {
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        const toolCall = {
+          index: 0,
+          id: 'call_timeout_bash_1',
+          type: 'function',
+          function: {
+            name: 'bash',
+            arguments: JSON.stringify({ command: 'printf before-timeout; sleep 1; printf after-timeout', timeout: 0.1 })
+          }
+        };
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { tool_calls: [toolCall] } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCall] } }] }));
+        return;
+      }
+      if (toolMessages.at(-1).tool_call_id !== 'call_timeout_bash_1') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'timeout bash result did not preserve tool_call_id' }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content;
+      if (!toolOutput.includes('before-timeout') || toolOutput.includes('after-timeout') || !toolOutput.includes('Command timed out after 0.100 seconds')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unexpected timeout bash output', toolOutput }));
+        return;
+      }
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content: 'timeout bash complete' } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'timeout bash complete' } }] }));
+      return;
+    }
     if (user.includes('tool loop')) {
       if (!hasBashTool) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2183,6 +2226,30 @@ try {
     !providerJsonBashUpdateLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('slow bash updates complete: slow-firstslow-second'))
   ) {
     throw new Error('top-level JSON mode smoke did not emit intermediate bash output update snapshots');
+  }
+
+  const providerJsonTimeoutToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-bash-timeout-model', '-p', 'please run timeout bash tool'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const timeoutToolTexts = providerJsonTimeoutToolLines.flatMap((line) => [
+    line.partialResult?.content?.[0]?.text,
+    line.result?.content?.[0]?.text,
+    ...(line.toolResults ?? []).map((result) => result.content)
+  ].filter(Boolean));
+  if (
+    !providerJsonTimeoutToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_timeout_bash_1' && JSON.stringify(line.partialResult).includes('before-timeout')) ||
+    !providerJsonTimeoutToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && line.toolCallId === 'call_timeout_bash_1' && line.isError === true && JSON.stringify(line.result).includes('Command timed out after 0.100 seconds')) ||
+    timeoutToolTexts.some((text) => text.includes('after-timeout')) ||
+    !providerJsonTimeoutToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_timeout_bash_1' && result.isError === true)) ||
+    !providerJsonTimeoutToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('timeout bash complete'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not preserve partial output from a timed out bash tool call');
   }
 
   const providerJsonStreamingToolLines = run(
