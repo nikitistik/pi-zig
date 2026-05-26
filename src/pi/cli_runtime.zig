@@ -46,6 +46,11 @@ const JsonStreamContext = struct {
     final_text: *std.Io.Writer.Allocating,
 };
 
+const JsonToolEventContext = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+};
+
 pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     const parsed = cli.parse(argv);
 
@@ -158,7 +163,7 @@ fn runTextPrintFoundation(
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, false);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, false, null, null, null);
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -185,7 +190,25 @@ fn runJsonPrintFoundation(
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, true);
+    const session_id = if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral";
+    try emitJsonPrelude(io, allocator, session_id);
+
+    var tool_event_context = JsonToolEventContext{
+        .io = io,
+        .allocator = allocator,
+    };
+
+    const response = try buildPrintResponse(
+        io,
+        allocator,
+        env,
+        parsed,
+        prompt,
+        true,
+        &tool_event_context,
+        handleJsonToolStart,
+        handleJsonToolEnd,
+    );
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -196,27 +219,6 @@ fn runJsonPrintFoundation(
     var writer = std.Io.File.stdout().writer(io, &buf);
     const w = &writer.interface;
 
-    try w.writeAll("{\"type\":\"session\",\"version\":3,\"id\":");
-    if (store) |*persistent| {
-        try writeJsonString(w, persistent.sessionId());
-    } else {
-        try writeJsonString(w, "pi-zig-ephemeral");
-    }
-    try w.writeAll(",\"timestamp\":\"local-foundation\",\"cwd\":\".\"}\n");
-    try w.writeAll("{\"type\":\"agent_start\"}\n");
-    try w.writeAll("{\"type\":\"turn_start\"}\n");
-    for (response.tool_results) |tool_result| {
-        try writeToolExecutionStartJson(w, tool_result);
-        try w.writeByte('\n');
-        try writeToolExecutionEndJson(w, tool_result);
-        try w.writeByte('\n');
-        try w.writeAll("{\"type\":\"message_start\",\"message\":");
-        try writeToolResultMessageJson(w, tool_result);
-        try w.writeAll("}\n");
-        try w.writeAll("{\"type\":\"message_end\",\"message\":");
-        try writeToolResultMessageJson(w, tool_result);
-        try w.writeAll("}\n");
-    }
     try w.writeAll("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
     try w.writeAll("{\"type\":\"message_update\",\"message\":");
     try writeAssistantMessageJson(w, response.final_text);
@@ -345,6 +347,31 @@ fn handleJsonStreamTextDelta(ctx_ptr: *anyopaque, delta: []const u8) anyerror!vo
     try w.writeAll(",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":");
     try writeJsonString(w, delta);
     try w.writeAll("}}\n");
+    try writeStreamingJsonLine(ctx.io, ctx.allocator, line.written());
+}
+
+fn handleJsonToolStart(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall) anyerror!void {
+    const ctx: *JsonToolEventContext = @ptrCast(@alignCast(ctx_ptr));
+    var line: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer line.deinit();
+    try writeToolCallExecutionStartJson(&line.writer, call);
+    try line.writer.writeByte('\n');
+    try writeStreamingJsonLine(ctx.io, ctx.allocator, line.written());
+}
+
+fn handleJsonToolEnd(ctx_ptr: *anyopaque, tool_result: agent.ToolResult) anyerror!void {
+    const ctx: *JsonToolEventContext = @ptrCast(@alignCast(ctx_ptr));
+    var line: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    try writeToolExecutionEndJson(w, tool_result);
+    try w.writeByte('\n');
+    try w.writeAll("{\"type\":\"message_start\",\"message\":");
+    try writeToolResultMessageJson(w, tool_result);
+    try w.writeAll("}\n");
+    try w.writeAll("{\"type\":\"message_end\",\"message\":");
+    try writeToolResultMessageJson(w, tool_result);
+    try w.writeAll("}\n");
     try writeStreamingJsonLine(ctx.io, ctx.allocator, line.written());
 }
 
@@ -568,6 +595,9 @@ fn buildPrintResponse(
     parsed: cli.ParsedArgs,
     prompt: []const u8,
     stream_turns: bool,
+    tool_event_context: ?*anyopaque,
+    on_tool_start: ?agent.ToolStartCallback,
+    on_tool_end: ?agent.ToolEndCallback,
 ) !agent.RunResult {
     if (parsed.provider == null or parsed.model == null) {
         return .{ .final_text = try buildFoundationResponse(allocator, parsed, prompt) };
@@ -597,6 +627,9 @@ fn buildPrintResponse(
         .system_prompt = runtime_system_prompt,
         .tool_set = toolSetFromParsed(parsed),
         .stream_turns = stream_turns,
+        .tool_event_context = tool_event_context,
+        .on_tool_start = on_tool_start,
+        .on_tool_end = on_tool_end,
     }) catch |err| {
         try writeStderr(io, "Provider request failed: ");
         try writeStderr(io, @errorName(err));
@@ -695,6 +728,16 @@ fn writeToolExecutionStartJson(w: *std.Io.Writer, tool_result: agent.ToolResult)
     try writeJsonString(w, tool_result.tool_name);
     try w.writeAll(",\"args\":");
     try writeRawJsonObjectOrString(w, tool_result.arguments_json);
+    try w.writeByte('}');
+}
+
+fn writeToolCallExecutionStartJson(w: *std.Io.Writer, call: ai_client.ChatToolCall) !void {
+    try w.writeAll("{\"type\":\"tool_execution_start\",\"toolCallId\":");
+    try writeJsonString(w, call.id);
+    try w.writeAll(",\"toolName\":");
+    try writeJsonString(w, call.name);
+    try w.writeAll(",\"args\":");
+    try writeRawJsonObjectOrString(w, call.arguments_json);
     try w.writeByte('}');
 }
 

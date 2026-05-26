@@ -2058,6 +2058,11 @@ try {
   ) {
     throw new Error('top-level JSON mode smoke did not emit provider-backed tool execution events');
   }
+  const providerJsonToolStartIndex = providerJsonToolLines.findIndex((line) => line.type === 'tool_execution_start');
+  const providerJsonAssistantStartIndex = providerJsonToolLines.findIndex((line) => line.type === 'message_start' && line.message?.role === 'assistant');
+  if (providerJsonToolStartIndex < 0 || providerJsonAssistantStartIndex < 0 || providerJsonToolStartIndex > providerJsonAssistantStartIndex) {
+    throw new Error('top-level JSON mode smoke did not emit live tool events before final assistant output');
+  }
 
   const providerJsonStreamingToolLines = run(
     ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-stream-tool-model', '-p', 'please run the streaming tool loop'],

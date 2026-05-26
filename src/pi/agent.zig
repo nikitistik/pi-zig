@@ -2,6 +2,9 @@ const std = @import("std");
 const ai_client = @import("ai_client.zig");
 const tools = @import("tools.zig");
 
+pub const ToolStartCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!void;
+pub const ToolEndCallback = *const fn (ctx: *anyopaque, result: ToolResult) anyerror!void;
+
 pub const RunOptions = struct {
     provider: []const u8,
     model: []const u8,
@@ -12,6 +15,9 @@ pub const RunOptions = struct {
     max_turns: usize = 8,
     tool_set: ToolSet = .all,
     stream_turns: bool = false,
+    tool_event_context: ?*anyopaque = null,
+    on_tool_start: ?ToolStartCallback = null,
+    on_tool_end: ?ToolEndCallback = null,
 };
 
 pub const ToolSet = struct {
@@ -234,12 +240,18 @@ pub fn runPrompt(
         response.tool_calls = &.{};
 
         for (tool_calls) |call| {
+            if (options.on_tool_start) |callback| {
+                if (options.tool_event_context) |context| try callback(context, call);
+            }
             const tool_execution = try executeToolCall(io, allocator, call);
             errdefer allocator.free(tool_execution.content);
             const tool_call_id = try allocator.dupe(u8, call.id);
             errdefer allocator.free(tool_call_id);
             const traced_tool_result = try createToolResultTrace(allocator, call, tool_execution.content, tool_execution.is_error);
             errdefer traced_tool_result.deinit(allocator);
+            if (options.on_tool_end) |callback| {
+                if (options.tool_event_context) |context| try callback(context, traced_tool_result);
+            }
             try tool_results.append(allocator, traced_tool_result);
             try messages.append(allocator, .{
                 .role = .tool,
