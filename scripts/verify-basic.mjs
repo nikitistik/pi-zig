@@ -1272,13 +1272,80 @@ if (!tools.builtins.includes('read') || !tools.builtins.includes('bash')) {
   throw new Error('tools smoke missing built-ins');
 }
 
-const parsedArgs = JSON.parse(run(['parse-args', '--provider', 'openai', '--thinking', 'xhigh', '-p', 'say ok', '@README.md']));
+const parsedArgs = JSON.parse(run([
+  'parse-args',
+  '--provider', 'openai',
+  '--model', 'gpt-4o',
+  '--api-key', 'test-key-ref',
+  '--system-prompt', 'system base',
+  '--append-system-prompt', 'extra one',
+  '--append-system-prompt', 'extra two',
+  '--mode', 'json',
+  '--thinking', 'xhigh',
+  '--continue',
+  '--resume',
+  '--no-session',
+  '--session', 'session.jsonl',
+  '--fork', 'fork.jsonl',
+  '--session-dir', 'zig-out/sessions',
+  '--models', 'anthropic/*,openai/*',
+  '--tools', 'read,bash',
+  '--no-tools',
+  '--no-builtin-tools',
+  '--list-models', 'haiku',
+  '--offline',
+  '--verbose',
+  '--no-context-files',
+  '--export', 'out.html',
+  '--extension', 'ext.ts',
+  '--no-extensions',
+  '--skill', 'skill.md',
+  '--no-skills',
+  '--prompt-template', 'prompt.md',
+  '--no-prompt-templates',
+  '--theme', 'theme.json',
+  '--no-themes',
+  '-p', 'say ok',
+  '@README.md',
+  '--unknown-flag=value'
+]));
 if (
   parsedArgs.provider !== 'openai' ||
+  parsedArgs.model !== 'gpt-4o' ||
+  parsedArgs.apiKey !== 'test-key-ref' ||
+  parsedArgs.systemPrompt !== 'system base' ||
+  parsedArgs.appendSystemPrompts.join('|') !== 'extra one|extra two' ||
+  parsedArgs.mode !== 'json' ||
   parsedArgs.thinking !== 'xhigh' ||
   parsedArgs.print !== true ||
+  parsedArgs.continue !== true ||
+  parsedArgs.resume !== true ||
+  parsedArgs.noSession !== true ||
+  parsedArgs.session !== 'session.jsonl' ||
+  parsedArgs.fork !== 'fork.jsonl' ||
+  parsedArgs.sessionDir !== 'zig-out/sessions' ||
+  parsedArgs.models !== 'anthropic/*,openai/*' ||
+  parsedArgs.tools !== 'read,bash' ||
+  parsedArgs.noTools !== true ||
+  parsedArgs.noBuiltinTools !== true ||
+  parsedArgs.listModels !== true ||
+  parsedArgs.listModelsPattern !== 'haiku' ||
+  parsedArgs.offline !== true ||
+  parsedArgs.verbose !== true ||
+  parsedArgs.noContextFiles !== true ||
+  parsedArgs.export !== 'out.html' ||
+  parsedArgs.extensions[0] !== 'ext.ts' ||
+  parsedArgs.noExtensions !== true ||
+  parsedArgs.skills[0] !== 'skill.md' ||
+  parsedArgs.noSkills !== true ||
+  parsedArgs.promptTemplates[0] !== 'prompt.md' ||
+  parsedArgs.noPromptTemplates !== true ||
+  parsedArgs.themes[0] !== 'theme.json' ||
+  parsedArgs.noThemes !== true ||
   parsedArgs.messages[0] !== 'say ok' ||
-  parsedArgs.fileArgs[0] !== 'README.md'
+  parsedArgs.fileArgs[0] !== 'README.md' ||
+  parsedArgs.unknownFlags[0]?.name !== 'unknown-flag' ||
+  parsedArgs.unknownFlags[0]?.value !== 'value'
 ) {
   throw new Error('parse-args smoke did not match upstream-style parsing');
 }

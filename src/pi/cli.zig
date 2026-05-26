@@ -260,15 +260,61 @@ pub fn writeParsedArgsJson(io: std.Io, parsed: ParsedArgs) !void {
     try w.writeAll(",");
     try writeMaybeString(w, "model", parsed.model);
     try w.writeAll(",");
+    try writeMaybeString(w, "apiKey", parsed.api_key);
+    try w.writeAll(",");
+    try writeMaybeString(w, "systemPrompt", parsed.system_prompt);
+    try w.writeAll(",");
+    try writeStringArray(w, "appendSystemPrompts", parsed.append_system_prompts[0..parsed.append_system_prompts_len]);
+    try w.writeAll(",");
     try writeMaybeMode(w, "mode", parsed.mode);
     try w.writeAll(",");
     try writeMaybeThinking(w, "thinking", parsed.thinking);
     try w.print(
-        ",\"print\":{},\"help\":{},\"version\":{},\"continue\":{},\"resume\":{},\"noSession\":{},\"listModels\":{},\"offline\":{},\"verbose\":{},\"noContextFiles\":{}",
-        .{ parsed.print, parsed.help, parsed.version, parsed.continue_session, parsed.resume_session, parsed.no_session, parsed.list_models, parsed.offline, parsed.verbose, parsed.no_context_files },
+        ",\"print\":{},\"help\":{},\"version\":{},\"continue\":{},\"resume\":{},\"noSession\":{}",
+        .{ parsed.print, parsed.help, parsed.version, parsed.continue_session, parsed.resume_session, parsed.no_session },
+    );
+    try w.writeAll(",");
+    try writeMaybeString(w, "session", parsed.session);
+    try w.writeAll(",");
+    try writeMaybeString(w, "fork", parsed.fork);
+    try w.writeAll(",");
+    try writeMaybeString(w, "sessionDir", parsed.session_dir);
+    try w.writeAll(",");
+    try writeMaybeString(w, "models", parsed.models);
+    try w.writeAll(",");
+    try writeMaybeString(w, "tools", parsed.tools);
+    try w.print(
+        ",\"noTools\":{},\"noBuiltinTools\":{},\"listModels\":{},\"offline\":{},\"verbose\":{},\"noContextFiles\":{}",
+        .{ parsed.no_tools, parsed.no_builtin_tools, parsed.list_models, parsed.offline, parsed.verbose, parsed.no_context_files },
     );
     try w.writeAll(",");
     try writeMaybeString(w, "listModelsPattern", parsed.list_models_pattern);
+    try w.writeAll(",");
+    try writeMaybeString(w, "export", parsed.export_path);
+    try w.writeAll(",");
+    try writeStringArray(w, "extensions", parsed.extensions[0..parsed.extensions_len]);
+    try w.print(
+        ",\"noExtensions\":{}",
+        .{parsed.no_extensions},
+    );
+    try w.writeAll(",");
+    try writeStringArray(w, "skills", parsed.skills[0..parsed.skills_len]);
+    try w.print(
+        ",\"noSkills\":{}",
+        .{parsed.no_skills},
+    );
+    try w.writeAll(",");
+    try writeStringArray(w, "promptTemplates", parsed.prompt_templates[0..parsed.prompt_templates_len]);
+    try w.print(
+        ",\"noPromptTemplates\":{}",
+        .{parsed.no_prompt_templates},
+    );
+    try w.writeAll(",");
+    try writeStringArray(w, "themes", parsed.themes[0..parsed.themes_len]);
+    try w.print(
+        ",\"noThemes\":{}",
+        .{parsed.no_themes},
+    );
     try w.writeAll(",");
     try writeStringArray(w, "messages", parsed.messages[0..parsed.messages_len]);
     try w.writeAll(",");
