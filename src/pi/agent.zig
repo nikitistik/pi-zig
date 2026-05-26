@@ -118,13 +118,29 @@ pub const ToolSet = struct {
 
 pub const RunResult = struct {
     final_text: []u8,
+    tool_call_batches: []ToolCallBatch = &.{},
     tool_results: []ToolResult = &.{},
     tool_results_count: usize = 0,
 
     pub fn deinit(self: RunResult, allocator: std.mem.Allocator) void {
         allocator.free(self.final_text);
+        for (self.tool_call_batches) |batch| batch.deinit(allocator);
+        allocator.free(self.tool_call_batches);
         for (self.tool_results) |result| result.deinit(allocator);
         allocator.free(self.tool_results);
+    }
+};
+
+pub const ToolCallBatch = struct {
+    content: []u8,
+    tool_calls: []ai_client.ChatToolCall,
+    first_tool_result_index: usize,
+    tool_results_count: usize,
+
+    pub fn deinit(self: ToolCallBatch, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        for (self.tool_calls) |call| call.deinit(allocator);
+        allocator.free(self.tool_calls);
     }
 };
 
@@ -288,6 +304,11 @@ pub fn runPrompt(
         for (tool_results.items) |result| result.deinit(allocator);
         tool_results.deinit(allocator);
     }
+    var tool_call_batches: std.ArrayList(ToolCallBatch) = .empty;
+    errdefer {
+        for (tool_call_batches.items) |batch| batch.deinit(allocator);
+        tool_call_batches.deinit(allocator);
+    }
 
     var tool_definitions_buf: [all_tool_definitions.len]ai_client.ChatToolDefinition = undefined;
     const tool_definitions = enabledToolDefinitions(options.tool_set, &tool_definitions_buf);
@@ -322,6 +343,7 @@ pub fn runPrompt(
             response.text = null;
             return .{
                 .final_text = text,
+                .tool_call_batches = try tool_call_batches.toOwnedSlice(allocator),
                 .tool_results = try tool_results.toOwnedSlice(allocator),
                 .tool_results_count = tool_results_count,
             };
@@ -333,6 +355,12 @@ pub fn runPrompt(
 
         var terminating_results: usize = 0;
         const batch_results_start = tool_results.items.len;
+        try tool_call_batches.append(allocator, .{
+            .content = try allocator.dupe(u8, messages.items[messages.items.len - 1].content),
+            .tool_calls = try cloneToolCalls(allocator, tool_calls),
+            .first_tool_result_index = batch_results_start,
+            .tool_results_count = tool_calls.len,
+        });
         for (tool_calls) |call| {
             try checkCancellation(options);
             if (options.on_tool_start) |callback| {
@@ -378,6 +406,7 @@ pub fn runPrompt(
         if (should_stop) {
             return .{
                 .final_text = try allocator.dupe(u8, ""),
+                .tool_call_batches = try tool_call_batches.toOwnedSlice(allocator),
                 .tool_results = try tool_results.toOwnedSlice(allocator),
                 .tool_results_count = tool_results_count,
             };
@@ -386,6 +415,7 @@ pub fn runPrompt(
         if (terminating_results == tool_calls.len) {
             return .{
                 .final_text = try allocator.dupe(u8, ""),
+                .tool_call_batches = try tool_call_batches.toOwnedSlice(allocator),
                 .tool_results = try tool_results.toOwnedSlice(allocator),
                 .tool_results_count = tool_results_count,
             };

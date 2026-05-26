@@ -18,6 +18,10 @@ const max_command_bytes = 4 * 1024;
 const max_session_name_bytes = 256;
 const max_session_file_bytes = 16 * 1024 * 1024;
 const max_session_path_bytes = std.Io.Dir.max_path_bytes;
+const max_tool_calls_per_message = 16;
+const max_tool_call_id_bytes = 128;
+const max_tool_name_bytes = 64;
+const max_tool_arguments_bytes = 4 * 1024;
 const max_pending_messages = 32;
 const max_auto_retry_attempts = 3;
 const default_auto_retry_base_delay_ms = 0;
@@ -68,6 +72,27 @@ const QueueMode = enum {
     }
 };
 
+const StoredToolCall = struct {
+    id_len: usize = 0,
+    id: [max_tool_call_id_bytes]u8 = undefined,
+    name_len: usize = 0,
+    name: [max_tool_name_bytes]u8 = undefined,
+    arguments_json_len: usize = 0,
+    arguments_json: [max_tool_arguments_bytes]u8 = undefined,
+
+    fn idText(self: *const StoredToolCall) []const u8 {
+        return self.id[0..self.id_len];
+    }
+
+    fn nameText(self: *const StoredToolCall) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    fn argumentsJson(self: *const StoredToolCall) []const u8 {
+        return self.arguments_json[0..self.arguments_json_len];
+    }
+};
+
 const StoredMessage = struct {
     role: StoredRole = .user,
     id_len: usize = 0,
@@ -81,6 +106,14 @@ const StoredMessage = struct {
     truncated: bool = false,
     full_output_path_len: usize = 0,
     full_output_path: [max_session_path_bytes]u8 = undefined,
+    tool_call_id_len: usize = 0,
+    tool_call_id: [max_tool_call_id_bytes]u8 = undefined,
+    tool_name_len: usize = 0,
+    tool_name: [max_tool_name_bytes]u8 = undefined,
+    tool_is_error: bool = false,
+    tool_terminate: bool = false,
+    tool_calls_count: usize = 0,
+    tool_calls: [max_tool_calls_per_message]StoredToolCall = undefined,
 
     fn entryId(self: *const StoredMessage) []const u8 {
         return self.id[0..self.id_len];
@@ -97,6 +130,16 @@ const StoredMessage = struct {
     fn fullOutputPath(self: *const StoredMessage) ?[]const u8 {
         if (self.full_output_path_len == 0) return null;
         return self.full_output_path[0..self.full_output_path_len];
+    }
+
+    fn toolCallId(self: *const StoredMessage) ?[]const u8 {
+        if (self.tool_call_id_len == 0) return null;
+        return self.tool_call_id[0..self.tool_call_id_len];
+    }
+
+    fn toolName(self: *const StoredMessage) ?[]const u8 {
+        if (self.tool_name_len == 0) return null;
+        return self.tool_name[0..self.tool_name_len];
     }
 };
 
@@ -242,8 +285,34 @@ const Runtime = struct {
             switch (message.role) {
                 .system => _ = try new_store.appendMessage(io, allocator, .system, message.text()),
                 .user => _ = try new_store.appendMessage(io, allocator, .user, message.text()),
-                .assistant => _ = try new_store.appendMessage(io, allocator, .assistant, message.text()),
-                .tool => _ = try new_store.appendMessage(io, allocator, .tool, message.text()),
+                .assistant => {
+                    if (message.tool_calls_count > 0) {
+                        var calls: [max_tool_calls_per_message]ai_client.ChatToolCall = undefined;
+                        for (message.tool_calls[0..message.tool_calls_count], 0..) |*call, index| {
+                            calls[index] = .{
+                                .id = @constCast(call.idText()),
+                                .name = @constCast(call.nameText()),
+                                .arguments_json = @constCast(call.argumentsJson()),
+                            };
+                        }
+                        _ = try new_store.appendAssistantToolCallMessage(io, allocator, message.text(), calls[0..message.tool_calls_count]);
+                    } else {
+                        _ = try new_store.appendMessage(io, allocator, .assistant, message.text());
+                    }
+                },
+                .tool => {
+                    if (message.toolCallId()) |_| {
+                        _ = try new_store.appendToolResultMessage(io, allocator, .{
+                            .tool_call_id = message.toolCallId().?,
+                            .tool_name = message.toolName() orelse "",
+                            .content = message.text(),
+                            .is_error = message.tool_is_error,
+                            .terminate = message.tool_terminate,
+                        });
+                    } else {
+                        _ = try new_store.appendMessage(io, allocator, .tool, message.text());
+                    }
+                },
                 .bash_execution => {
                     const result: tools.ShellResult = .{
                         .output = message.content[0..message.len],
@@ -326,6 +395,12 @@ const Runtime = struct {
             var text_buf: [max_message_bytes]u8 = undefined;
             const text_len = try extractMessageText(message.object, &text_buf);
             try self.addLoadedMessage(role, id, text_buf[0..text_len]);
+            const slot = &self.messages[self.message_count - 1];
+            if (role == .assistant) {
+                try copyToolCallsFromMessage(message.object, slot);
+            } else if (role == .tool) {
+                try copyToolResultFieldsFromMessage(message.object, slot);
+            }
             if (role == .assistant) {
                 const provider = getStringFieldObject(message.object, "provider") orelse return;
                 const model_id = getStringFieldObject(message.object, "model") orelse return;
@@ -350,6 +425,11 @@ const Runtime = struct {
         slot.cancelled = false;
         slot.truncated = false;
         slot.full_output_path_len = 0;
+        slot.tool_call_id_len = 0;
+        slot.tool_name_len = 0;
+        slot.tool_is_error = false;
+        slot.tool_terminate = false;
+        slot.tool_calls_count = 0;
         self.message_count += 1;
     }
 
@@ -382,6 +462,11 @@ const Runtime = struct {
         slot.truncated = result.truncated or output.len < result.output.len;
         slot.full_output_path_len = full_output_path.len;
         if (full_output_path.len > 0) @memcpy(slot.full_output_path[0..full_output_path.len], full_output_path);
+        slot.tool_call_id_len = 0;
+        slot.tool_name_len = 0;
+        slot.tool_is_error = false;
+        slot.tool_terminate = false;
+        slot.tool_calls_count = 0;
         self.message_count += 1;
     }
 
@@ -554,7 +639,8 @@ const Runtime = struct {
         for (self.messages[0..limit]) |*message| {
             switch (message.role) {
                 .user => try appendHistoryMessage(allocator, &history, .user, message.text()),
-                .assistant => try appendHistoryMessage(allocator, &history, .assistant, message.text()),
+                .assistant => try appendAssistantHistoryMessage(allocator, &history, message),
+                .tool => try appendToolHistoryMessage(allocator, &history, message),
                 .bash_execution => try appendOwnedHistoryMessage(allocator, &history, .user, try self.bashExecutionHistoryText(allocator, message)),
                 else => {},
             }
@@ -572,9 +658,56 @@ const Runtime = struct {
         try history.append(allocator, .{ .role = role, .content = content });
     }
 
+    fn appendAssistantHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), message: *const StoredMessage) !void {
+        var chat_message = ai_client.ChatMessage{
+            .role = .assistant,
+            .content = try allocator.dupe(u8, message.text()),
+            .tool_calls = &.{},
+        };
+        errdefer deinitHistoryMessage(allocator, chat_message);
+        if (message.tool_calls_count > 0) {
+            const calls = try allocator.alloc(ai_client.ChatToolCall, message.tool_calls_count);
+            var copied: usize = 0;
+            errdefer {
+                for (calls[0..copied]) |call| call.deinit(allocator);
+                allocator.free(calls);
+            }
+            for (message.tool_calls[0..message.tool_calls_count], 0..) |*call, index| {
+                calls[index] = .{
+                    .id = try allocator.dupe(u8, call.idText()),
+                    .name = try allocator.dupe(u8, call.nameText()),
+                    .arguments_json = try allocator.dupe(u8, call.argumentsJson()),
+                };
+                copied += 1;
+            }
+            chat_message.tool_calls = calls;
+        }
+        try history.append(allocator, chat_message);
+    }
+
+    fn appendToolHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), message: *const StoredMessage) !void {
+        var chat_message = ai_client.ChatMessage{
+            .role = .tool,
+            .content = try allocator.dupe(u8, message.text()),
+            .tool_call_id = null,
+        };
+        errdefer deinitHistoryMessage(allocator, chat_message);
+        if (message.toolCallId()) |id| {
+            chat_message.tool_call_id = try allocator.dupe(u8, id);
+        }
+        try history.append(allocator, chat_message);
+    }
+
     fn deinitAgentHistory(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage)) void {
-        for (history.items) |message| allocator.free(message.content);
+        for (history.items) |message| deinitHistoryMessage(allocator, message);
         history.deinit(allocator);
+    }
+
+    fn deinitHistoryMessage(allocator: std.mem.Allocator, message: ai_client.ChatMessage) void {
+        allocator.free(message.content);
+        if (message.tool_call_id) |tool_call_id| allocator.free(tool_call_id);
+        for (message.tool_calls) |call| call.deinit(allocator);
+        if (message.tool_calls.len > 0) allocator.free(message.tool_calls);
     }
 
     fn bashExecutionHistoryText(self: *Runtime, allocator: std.mem.Allocator, message: *const StoredMessage) ![]u8 {
@@ -605,10 +738,50 @@ const Runtime = struct {
     }
 
     fn addAgentResultMessages(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, result: agent.RunResult) !void {
-        for (result.tool_results[0..result.tool_results_count]) |tool_result| {
-            try self.addMessage(io, allocator, .tool, tool_result.content);
+        var next_tool_result_index: usize = 0;
+        for (result.tool_call_batches) |batch| {
+            while (next_tool_result_index < batch.first_tool_result_index and next_tool_result_index < result.tool_results_count) : (next_tool_result_index += 1) {
+                try self.addToolResultMessage(io, allocator, result.tool_results[next_tool_result_index]);
+            }
+            try self.addAssistantToolCallMessage(io, allocator, batch.content, batch.tool_calls);
+            const end = @min(result.tool_results_count, batch.first_tool_result_index + batch.tool_results_count);
+            while (next_tool_result_index < end) : (next_tool_result_index += 1) {
+                try self.addToolResultMessage(io, allocator, result.tool_results[next_tool_result_index]);
+            }
+        }
+        while (next_tool_result_index < result.tool_results_count) : (next_tool_result_index += 1) {
+            try self.addToolResultMessage(io, allocator, result.tool_results[next_tool_result_index]);
         }
         try self.addMessage(io, allocator, .assistant, result.final_text);
+    }
+
+    fn addAssistantToolCallMessage(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        tool_calls: []const ai_client.ChatToolCall,
+    ) !void {
+        if (tool_calls.len > max_tool_calls_per_message) return error.ValueTooLong;
+        const entry_id = try self.store.appendAssistantToolCallMessage(io, allocator, content, tool_calls);
+        try self.addLoadedMessage(.assistant, entry_id, content);
+        var slot = &self.messages[self.message_count - 1];
+        for (tool_calls, 0..) |call, index| {
+            try copyBounded(&slot.tool_calls[index].id, &slot.tool_calls[index].id_len, call.id);
+            try copyBounded(&slot.tool_calls[index].name, &slot.tool_calls[index].name_len, call.name);
+            try copyBounded(&slot.tool_calls[index].arguments_json, &slot.tool_calls[index].arguments_json_len, call.arguments_json);
+        }
+        slot.tool_calls_count = tool_calls.len;
+    }
+
+    fn addToolResultMessage(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, result: agent.ToolResult) !void {
+        const entry_id = try self.store.appendToolResultMessage(io, allocator, result);
+        try self.addLoadedMessage(.tool, entry_id, result.content);
+        var slot = &self.messages[self.message_count - 1];
+        try copyBounded(&slot.tool_call_id, &slot.tool_call_id_len, result.tool_call_id);
+        try copyBounded(&slot.tool_name, &slot.tool_name_len, result.tool_name);
+        slot.tool_is_error = result.is_error;
+        slot.tool_terminate = result.terminate;
     }
 
     fn writePromptAgentResult(
@@ -1113,6 +1286,33 @@ const Runtime = struct {
         } else {
             try w.writeAll(",\"content\":");
             try writeJsonString(w, message.text());
+            if (message.role == .assistant and message.tool_calls_count > 0) {
+                try w.writeAll(",\"toolCalls\":[");
+                for (message.tool_calls[0..message.tool_calls_count], 0..) |*call, index| {
+                    if (index != 0) try w.writeByte(',');
+                    try w.writeAll("{\"id\":");
+                    try writeJsonString(w, call.idText());
+                    try w.writeAll(",\"name\":");
+                    try writeJsonString(w, call.nameText());
+                    try w.writeAll(",\"argumentsJson\":");
+                    try writeJsonString(w, call.argumentsJson());
+                    try w.writeByte('}');
+                }
+                try w.writeByte(']');
+            } else if (message.role == .tool) {
+                if (message.toolCallId()) |tool_call_id| {
+                    try w.writeAll(",\"toolCallId\":");
+                    try writeJsonString(w, tool_call_id);
+                }
+                if (message.toolName()) |tool_name| {
+                    try w.writeAll(",\"toolName\":");
+                    try writeJsonString(w, tool_name);
+                }
+                try w.writeAll(",\"isError\":");
+                try w.writeAll(if (message.tool_is_error) "true" else "false");
+                try w.writeAll(",\"terminate\":");
+                try w.writeAll(if (message.tool_terminate) "true" else "false");
+            }
         }
         try w.writeByte('}');
     }
@@ -1444,6 +1644,45 @@ fn parseStoredRole(role: []const u8) ?StoredRole {
     if (std.mem.eql(u8, role, "tool") or std.mem.eql(u8, role, "toolResult")) return .tool;
     if (std.mem.eql(u8, role, "bashExecution")) return .bash_execution;
     return null;
+}
+
+fn copyToolCallsFromMessage(object: std.json.ObjectMap, message: *StoredMessage) !void {
+    message.tool_calls_count = 0;
+    const content = object.get("content") orelse return;
+    if (content != .array) return;
+    for (content.array.items) |item| {
+        if (item != .object) continue;
+        const block_type = getStringFieldObject(item.object, "type") orelse continue;
+        if (!std.mem.eql(u8, block_type, "toolCall")) continue;
+        if (message.tool_calls_count >= max_tool_calls_per_message) return error.ValueTooLong;
+        const id = getStringFieldObject(item.object, "id") orelse return error.InvalidSessionEntry;
+        const name = getStringFieldObject(item.object, "name") orelse return error.InvalidSessionEntry;
+        const arguments_json = getStringFieldObject(item.object, "argumentsJson") orelse "{}";
+        var target = &message.tool_calls[message.tool_calls_count];
+        try copyBounded(&target.id, &target.id_len, id);
+        try copyBounded(&target.name, &target.name_len, name);
+        try copyBounded(&target.arguments_json, &target.arguments_json_len, arguments_json);
+        message.tool_calls_count += 1;
+    }
+}
+
+fn copyToolResultFieldsFromMessage(object: std.json.ObjectMap, message: *StoredMessage) !void {
+    message.tool_call_id_len = 0;
+    message.tool_name_len = 0;
+    if (getStringFieldObject(object, "toolCallId")) |id| {
+        try copyBounded(&message.tool_call_id, &message.tool_call_id_len, id);
+    }
+    if (getStringFieldObject(object, "toolName")) |name| {
+        try copyBounded(&message.tool_name, &message.tool_name_len, name);
+    }
+    message.tool_is_error = getBoolFieldObject(object, "isError") orelse false;
+    message.tool_terminate = getBoolFieldObject(object, "terminate") orelse false;
+}
+
+fn copyBounded(buffer: []u8, len: *usize, value: []const u8) !void {
+    if (value.len > buffer.len) return error.ValueTooLong;
+    @memcpy(buffer[0..value.len], value);
+    len.* = value.len;
 }
 
 fn extractMessageText(object: std.json.ObjectMap, buffer: []u8) !usize {

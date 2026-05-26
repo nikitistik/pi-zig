@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai_client = @import("ai_client.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 
@@ -226,6 +227,92 @@ pub const PersistentStore = struct {
             .tool => self.tool_results += 1,
             .system => {},
         }
+        return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+
+    pub fn appendAssistantToolCallMessage(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        tool_calls: []const ai_client.ChatToolCall,
+    ) ![]const u8 {
+        var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
+        const id = try self.nextEntryId(&entry_id_buf);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll("{\"type\":\"message\",\"id\":");
+        try writeJsonString(w, id);
+        try w.writeAll(",\"parentId\":");
+        try self.writeLeafParent(w);
+        try w.writeAll(",\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll(",\"message\":{\"role\":\"assistant\",\"content\":[");
+        var emitted = false;
+        if (content.len > 0) {
+            try w.writeAll("{\"type\":\"text\",\"text\":");
+            try writeJsonString(w, content);
+            try w.writeByte('}');
+            emitted = true;
+        }
+        for (tool_calls) |call| {
+            if (emitted) try w.writeByte(',');
+            try w.writeAll("{\"type\":\"toolCall\",\"id\":");
+            try writeJsonString(w, call.id);
+            try w.writeAll(",\"name\":");
+            try writeJsonString(w, call.name);
+            try w.writeAll(",\"argumentsJson\":");
+            try writeJsonString(w, call.arguments_json);
+            if (std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{})) |parsed_arguments| {
+                defer parsed_arguments.deinit();
+                try w.writeAll(",\"arguments\":");
+                try w.writeAll(std.mem.trim(u8, call.arguments_json, " \t\r\n"));
+            } else |_| {}
+            try w.writeByte('}');
+            emitted = true;
+        }
+        try w.writeAll("]}}\n");
+        try appendBytes(io, self.path(), out.written());
+        try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
+        self.assistant_messages += 1;
+        self.tool_calls += tool_calls.len;
+        return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+
+    pub fn appendToolResultMessage(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        result: anytype,
+    ) ![]const u8 {
+        var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
+        const id = try self.nextEntryId(&entry_id_buf);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll("{\"type\":\"message\",\"id\":");
+        try writeJsonString(w, id);
+        try w.writeAll(",\"parentId\":");
+        try self.writeLeafParent(w);
+        try w.writeAll(",\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll(",\"message\":{\"role\":\"tool\",\"toolCallId\":");
+        try writeJsonString(w, result.tool_call_id);
+        try w.writeAll(",\"toolName\":");
+        try writeJsonString(w, result.tool_name);
+        try w.writeAll(",\"content\":");
+        try writeJsonString(w, result.content);
+        try w.writeAll(",\"isError\":");
+        try w.writeAll(if (result.is_error) "true" else "false");
+        try w.writeAll(",\"terminate\":");
+        try w.writeAll(if (result.terminate) "true" else "false");
+        try w.writeAll("}}\n");
+        try appendBytes(io, self.path(), out.written());
+        try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
+        self.tool_results += 1;
         return self.leaf_id_buf[0..self.leaf_id_len];
     }
 

@@ -608,6 +608,28 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc truncated bash history observed' } }] }));
       return;
     }
+    if (user.includes('rpc tool history check')) {
+      const assistantToolHistory = body.messages.find(
+        (message) =>
+          message.role === 'assistant' &&
+          Array.isArray(message.tool_calls) &&
+          message.tool_calls.some((call) => call.id === 'call_tool_loop_1' && call.function?.name === 'bash')
+      );
+      const toolHistory = body.messages.find(
+        (message) =>
+          message.role === 'tool' &&
+          message.tool_call_id === 'call_tool_loop_1' &&
+          String(message.content ?? '').includes('tool-loop-ok')
+      );
+      if (!assistantToolHistory || !toolHistory) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing prior assistant/tool-call transcript history', messages: body.messages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc tool history observed' } }] }));
+      return;
+    }
     const defaultContent = 'mock provider response for ' + body.model + ': ' + user + (system ? ' [system=' + system + ']' : '');
     if (body.stream === true) {
       writeStreamEvents([{ choices: [{ delta: { content: defaultContent } }] }]);
@@ -3081,32 +3103,57 @@ try {
   const rpcProviderMessages = rpcProviderResponses.find((response) => response.id === 'rpc-provider-messages');
   if (
     rpcProviderMessages?.data?.messages?.[0]?.role !== 'user' ||
-    rpcProviderMessages?.data?.messages?.[1]?.role !== 'tool' ||
-    !rpcProviderMessages?.data?.messages?.[1]?.content?.includes('tool-loop-ok') ||
-    rpcProviderMessages?.data?.messages?.[2]?.role !== 'assistant' ||
-    !rpcProviderMessages?.data?.messages?.[2]?.content?.includes('tool loop complete: tool-loop-ok')
+    rpcProviderMessages?.data?.messages?.[1]?.role !== 'assistant' ||
+    rpcProviderMessages?.data?.messages?.[1]?.toolCalls?.[0]?.id !== 'call_tool_loop_1' ||
+    rpcProviderMessages?.data?.messages?.[1]?.toolCalls?.[0]?.name !== 'bash' ||
+    rpcProviderMessages?.data?.messages?.[2]?.role !== 'tool' ||
+    rpcProviderMessages?.data?.messages?.[2]?.toolCallId !== 'call_tool_loop_1' ||
+    !rpcProviderMessages?.data?.messages?.[2]?.content?.includes('tool-loop-ok') ||
+    rpcProviderMessages?.data?.messages?.[3]?.role !== 'assistant' ||
+    !rpcProviderMessages?.data?.messages?.[3]?.content?.includes('tool loop complete: tool-loop-ok')
   ) {
-    throw new Error('rpc get_messages smoke did not include provider-backed user/tool/assistant turns');
+    throw new Error('rpc get_messages smoke did not include provider-backed user/assistant-tool/tool/assistant turns');
   }
   const rpcProviderStats = rpcProviderResponses.find((response) => response.id === 'rpc-provider-stats');
   if (
     rpcProviderStats?.data?.userMessages !== 1 ||
-    rpcProviderStats?.data?.assistantMessages !== 1 ||
-    rpcProviderStats?.data?.toolCalls !== 0 ||
+    rpcProviderStats?.data?.assistantMessages !== 2 ||
+    rpcProviderStats?.data?.toolCalls !== 1 ||
     rpcProviderStats?.data?.toolResults !== 1 ||
-    rpcProviderStats?.data?.totalMessages !== 3
+    rpcProviderStats?.data?.totalMessages !== 4
   ) {
-    throw new Error('rpc provider session stats did not count user/tool/assistant turns');
+    throw new Error('rpc provider session stats did not count user/assistant-tool/tool/assistant turns');
   }
   const rpcProviderJsonl = fs.readFileSync(rpcProviderSessionFile, 'utf8');
   if (
     !rpcProviderJsonl.includes('"provider":"openai"') ||
     !rpcProviderJsonl.includes('"modelId":"gpt-4o"') ||
+    !rpcProviderJsonl.includes('"type":"toolCall"') ||
+    !rpcProviderJsonl.includes('"id":"call_tool_loop_1"') ||
     !rpcProviderJsonl.includes('"role":"tool"') ||
+    !rpcProviderJsonl.includes('"toolCallId":"call_tool_loop_1"') ||
     !rpcProviderJsonl.includes('"tool-loop-ok"') ||
     !rpcProviderJsonl.includes('"role":"assistant"')
   ) {
-    throw new Error('rpc provider durable JSONL did not persist provider-backed tool and assistant messages');
+    throw new Error('rpc provider durable JSONL did not persist provider-backed assistant tool-call and tool result messages');
+  }
+
+  const rpcProviderToolHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-tool-history-smoke.jsonl');
+  fs.rmSync(rpcProviderToolHistorySessionFile, { force: true });
+  const rpcProviderToolHistoryOutput = run(
+    ['rpc', rpcProviderToolHistorySessionFile],
+    [
+      JSON.stringify({ id: 'rpc-tool-history-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-tool-history-first', type: 'prompt', message: 'please run the tool loop' }),
+      JSON.stringify({ id: 'rpc-tool-history-check', type: 'prompt', message: 'rpc tool history check' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderToolHistoryResponses = rpcProviderToolHistoryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderToolHistoryCheck = rpcProviderToolHistoryResponses.find((response) => response.id === 'rpc-tool-history-check');
+  if (!rpcProviderToolHistoryCheck?.success || rpcProviderToolHistoryCheck?.data?.text !== 'rpc tool history observed') {
+    throw new Error('rpc provider prompt smoke did not send prior assistant tool-call and tool result history to the provider');
   }
 } finally {
   rpcFakeProvider.stop();
