@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent = @import("agent.zig");
+const ai_client = @import("ai_client.zig");
 const auth = @import("auth.zig");
 const commands = @import("commands.zig");
 const context_files = @import("context_files.zig");
@@ -418,6 +419,8 @@ const Runtime = struct {
         defer allocator.free(api_key);
         const runtime_system_prompt = try buildRuntimeSystemPrompt(io, allocator, env);
         defer allocator.free(runtime_system_prompt);
+        var history = try self.buildAgentHistory(allocator);
+        defer history.deinit(allocator);
 
         return try agent.runPrompt(io, allocator, env, .{
             .provider = model.provider,
@@ -425,8 +428,25 @@ const Runtime = struct {
             .api_key = api_key,
             .prompt = prompt,
             .system_prompt = runtime_system_prompt,
+            .history = history.items,
             .tool_set = .all,
         });
+    }
+
+    fn buildAgentHistory(self: *Runtime, allocator: std.mem.Allocator) !std.ArrayList(ai_client.ChatMessage) {
+        var history: std.ArrayList(ai_client.ChatMessage) = .empty;
+        errdefer history.deinit(allocator);
+
+        var limit = self.message_count;
+        if (limit > 0) limit -= 1;
+        for (self.messages[0..limit]) |*message| {
+            switch (message.role) {
+                .user => try history.append(allocator, .{ .role = .user, .content = message.text() }),
+                .assistant => try history.append(allocator, .{ .role = .assistant, .content = message.text() }),
+                else => {},
+            }
+        }
+        return history;
     }
 
     fn addAgentResultMessages(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, result: agent.RunResult) !void {

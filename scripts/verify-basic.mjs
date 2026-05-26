@@ -266,6 +266,18 @@ const server = http.createServer((req, res) => {
       }));
       return;
     }
+    if (user.includes('second rpc history')) {
+      const hasPriorUser = body.messages.some((message) => message.role === 'user' && message.content === 'first rpc history');
+      const hasPriorAssistant = body.messages.some((message) => message.role === 'assistant' && String(message.content ?? '').includes('first rpc history'));
+      if (!hasPriorUser || !hasPriorAssistant) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing prior RPC history', messages: body.messages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc history observed' } }] }));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       choices: [{
@@ -2406,6 +2418,32 @@ try {
     !rpcProviderContextPrompt?.data?.text?.includes('rpc provider project context sentinel')
   ) {
     throw new Error('rpc provider prompt smoke did not build a runtime system prompt with context and tool metadata');
+  }
+
+  const rpcProviderHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-history-smoke.jsonl');
+  fs.rmSync(rpcProviderHistorySessionFile, { force: true });
+  const rpcProviderHistoryOutput = run(
+    ['rpc', rpcProviderHistorySessionFile],
+    [
+      JSON.stringify({ id: 'rpc-provider-history-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-provider-history-first', type: 'prompt', message: 'first rpc history' }),
+      JSON.stringify({ id: 'rpc-provider-history-second', type: 'prompt', message: 'second rpc history' }),
+      JSON.stringify({ id: 'rpc-provider-history-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderHistoryResponses = rpcProviderHistoryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderHistorySecond = rpcProviderHistoryResponses.find((response) => response.id === 'rpc-provider-history-second');
+  if (!rpcProviderHistorySecond?.success || rpcProviderHistorySecond?.data?.text !== 'rpc history observed') {
+    throw new Error('rpc provider prompt smoke did not send prior user/assistant history to the provider');
+  }
+  const rpcProviderHistoryMessages = rpcProviderHistoryResponses.find((response) => response.id === 'rpc-provider-history-messages');
+  if (
+    rpcProviderHistoryMessages?.data?.messages?.filter((message) => message.role === 'user').length !== 2 ||
+    rpcProviderHistoryMessages?.data?.messages?.filter((message) => message.role === 'assistant').length !== 2
+  ) {
+    throw new Error('rpc provider history smoke did not persist both user/assistant turns');
   }
 
   const rpcProviderOutput = run(

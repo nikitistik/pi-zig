@@ -8,6 +8,7 @@ pub const RunOptions = struct {
     api_key: []const u8,
     prompt: []const u8,
     system_prompt: ?[]const u8 = null,
+    history: []const ai_client.ChatMessage = &.{},
     max_turns: usize = 8,
     tool_set: ToolSet = .all,
 };
@@ -182,6 +183,9 @@ pub fn runPrompt(
             });
         }
     }
+    for (options.history) |message| {
+        try messages.append(allocator, try cloneChatMessage(allocator, message));
+    }
     try messages.append(allocator, .{
         .role = .user,
         .content = try allocator.dupe(u8, options.prompt),
@@ -250,6 +254,41 @@ fn borrowMessages(allocator: std.mem.Allocator, messages: []const OwnedMessage) 
         borrowed[index] = message.borrowed();
     }
     return borrowed;
+}
+
+fn cloneChatMessage(allocator: std.mem.Allocator, message: ai_client.ChatMessage) !OwnedMessage {
+    var owned = OwnedMessage{
+        .role = message.role,
+        .content = try allocator.dupe(u8, message.content),
+        .tool_call_id = null,
+        .tool_calls = &.{},
+    };
+    errdefer owned.deinit(allocator);
+    if (message.tool_call_id) |tool_call_id| {
+        owned.tool_call_id = try allocator.dupe(u8, tool_call_id);
+    }
+    if (message.tool_calls.len > 0) {
+        owned.tool_calls = try cloneToolCalls(allocator, message.tool_calls);
+    }
+    return owned;
+}
+
+fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai_client.ChatToolCall) ![]ai_client.ChatToolCall {
+    const cloned = try allocator.alloc(ai_client.ChatToolCall, tool_calls.len);
+    var len: usize = 0;
+    errdefer {
+        for (cloned[0..len]) |call| call.deinit(allocator);
+        allocator.free(cloned);
+    }
+    for (tool_calls) |call| {
+        cloned[len] = .{
+            .id = try allocator.dupe(u8, call.id),
+            .name = try allocator.dupe(u8, call.name),
+            .arguments_json = try allocator.dupe(u8, call.arguments_json),
+        };
+        len += 1;
+    }
+    return cloned;
 }
 
 fn enabledToolDefinitions(
