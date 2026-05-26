@@ -19,6 +19,14 @@ const SourceKind = enum {
     local,
 };
 
+const InstallMethod = enum {
+    npm,
+    pnpm,
+    yarn,
+    bun,
+    unknown,
+};
+
 const ParsedSource = struct {
     kind: SourceKind,
     source: []const u8,
@@ -64,7 +72,7 @@ const PackageOptions = struct {
     conflicting_options: ?[]const u8 = null,
 };
 
-pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, args: []const []const u8) !bool {
+pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, exe_path: []const u8, args: []const []const u8) !bool {
     const options = parsePackageCommand(args) orelse return false;
 
     if (options.help) {
@@ -157,7 +165,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
                 try writeStdout(io, "\n");
             }
             if (options.self) {
-                if (try runSelfUpdate(io, allocator, env, agent_dir, options.force)) {
+                if (runSelfUpdate(io, allocator, env, cwd, agent_dir, exe_path, options.force) catch |err| return exitPackageError(io, err)) {
                     try writeStdout(io, "Updated ");
                     try writeStdout(io, config.app_name);
                     try writeStdout(io, "\n");
@@ -1222,43 +1230,306 @@ fn parsePackageVersion(version: []const u8) ?ParsedPackageVersion {
     };
 }
 
-fn runSelfUpdate(
+fn selfUpdateArgv(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    exe_path: []const u8,
+    update_package_name: []const u8,
+) !std.ArrayList([]const u8) {
+    const method = detectInstallMethod(exe_path);
+    if (method == .unknown) {
+        try writeSelfUpdateUnavailable(io, method, null, false, false, exe_path, update_package_name);
+        return error.PackageCommandFailed;
+    }
+
+    const package_dir = try entrypointPackageDir(io, allocator, cwd, exe_path);
+    defer if (package_dir) |dir| allocator.free(dir);
+
+    const managed = if (package_dir) |dir|
+        try isManagedByGlobalPackageManager(io, allocator, env, agent_dir, method, dir)
+    else
+        false;
+
+    var argv = try selfUpdateArgvForMethod(io, allocator, env, agent_dir, method, update_package_name);
+    errdefer argv.deinit(allocator);
+    if (!managed) {
+        try writeSelfUpdateUnavailable(io, method, argv.items, false, false, exe_path, update_package_name);
+        return error.PackageCommandFailed;
+    }
+
+    const writable = if (package_dir) |dir| isSelfUpdatePathWritable(io, dir) else false;
+    if (!writable) {
+        try writeSelfUpdateUnavailable(io, method, argv.items, true, false, exe_path, update_package_name);
+        return error.PackageCommandFailed;
+    }
+
+    return argv;
+}
+
+fn selfUpdateArgvForMethod(
     io: std.Io,
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
     agent_dir: []const u8,
+    method: InstallMethod,
+    update_package_name: []const u8,
+) !std.ArrayList([]const u8) {
+    var argv: std.ArrayList([]const u8) = .empty;
+    switch (method) {
+        .npm => {
+            argv = try npmBaseArgv(io, allocator, env, agent_dir);
+            try argv.append(allocator, "install");
+            try argv.append(allocator, "-g");
+            try argv.append(allocator, "--ignore-scripts");
+            try argv.append(allocator, update_package_name);
+        },
+        .pnpm => {
+            try argv.append(allocator, "pnpm");
+            try argv.append(allocator, "install");
+            try argv.append(allocator, "-g");
+            try argv.append(allocator, "--ignore-scripts");
+            try argv.append(allocator, update_package_name);
+        },
+        .yarn => {
+            try argv.append(allocator, "yarn");
+            try argv.append(allocator, "global");
+            try argv.append(allocator, "add");
+            try argv.append(allocator, "--ignore-scripts");
+            try argv.append(allocator, update_package_name);
+        },
+        .bun => {
+            try argv.append(allocator, "bun");
+            try argv.append(allocator, "install");
+            try argv.append(allocator, "-g");
+            try argv.append(allocator, "--ignore-scripts");
+            try argv.append(allocator, update_package_name);
+        },
+        .unknown => {},
+    }
+    return argv;
+}
+
+fn detectInstallMethod(exe_path: []const u8) InstallMethod {
+    if (containsPathFragment(exe_path, "/pnpm/") or containsPathFragment(exe_path, "/.pnpm/")) return .pnpm;
+    if (containsPathFragment(exe_path, "/yarn/") or containsPathFragment(exe_path, "/.yarn/")) return .yarn;
+    if (containsPathFragment(exe_path, "/install/global/node_modules/")) return .bun;
+    if (containsPathFragment(exe_path, "/npm/") or containsPathFragment(exe_path, "/node_modules/")) return .npm;
+    return .unknown;
+}
+
+fn containsPathFragment(path: []const u8, needle: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(path, needle) != null;
+}
+
+fn entrypointPackageDir(io: std.Io, allocator: std.mem.Allocator, cwd: []const u8, exe_path: []const u8) !?[]u8 {
+    const resolved = try resolveLocalPath(allocator, cwd, exe_path);
+    defer allocator.free(resolved);
+    var dir = std.fs.path.dirname(resolved) orelse return null;
+
+    while (true) {
+        const package_json = try std.fs.path.join(allocator, &.{ dir, "package.json" });
+        defer allocator.free(package_json);
+        if (pathExists(io, package_json)) return try allocator.dupe(u8, dir);
+
+        const parent = std.fs.path.dirname(dir) orelse return null;
+        if (std.mem.eql(u8, parent, dir)) return null;
+        dir = parent;
+    }
+}
+
+fn isManagedByGlobalPackageManager(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+    method: InstallMethod,
+    package_dir: []const u8,
+) !bool {
+    var roots: std.ArrayList([]u8) = .empty;
+    defer {
+        for (roots.items) |root| allocator.free(root);
+        roots.deinit(allocator);
+    }
+    try appendGlobalPackageRoots(io, allocator, env, agent_dir, method, package_dir, &roots);
+    for (roots.items) |root| {
+        if (isPathInsideRoot(package_dir, root)) return true;
+    }
+    return false;
+}
+
+fn appendGlobalPackageRoots(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+    method: InstallMethod,
+    package_dir: []const u8,
+    roots: *std.ArrayList([]u8),
+) !void {
+    switch (method) {
+        .npm => {
+            var argv = try npmBaseArgv(io, allocator, env, agent_dir);
+            defer argv.deinit(allocator);
+            try argv.append(allocator, "root");
+            try argv.append(allocator, "-g");
+            if (try commandOutputTrimmed(io, allocator, argv.items)) |root| {
+                try roots.append(allocator, root);
+            }
+            if (try inferredNpmRoot(allocator, package_dir)) |root| {
+                try roots.append(allocator, root);
+            }
+        },
+        .pnpm => {
+            const argv = [_][]const u8{ "pnpm", "root", "-g" };
+            if (try commandOutputTrimmed(io, allocator, &argv)) |root| {
+                defer allocator.free(root);
+                try roots.append(allocator, try allocator.dupe(u8, root));
+                if (std.fs.path.dirname(root)) |parent| {
+                    try roots.append(allocator, try allocator.dupe(u8, parent));
+                }
+            }
+        },
+        .yarn => {
+            const argv = [_][]const u8{ "yarn", "global", "dir" };
+            if (try commandOutputTrimmed(io, allocator, &argv)) |dir| {
+                defer allocator.free(dir);
+                try roots.append(allocator, try allocator.dupe(u8, dir));
+                try roots.append(allocator, try std.fs.path.join(allocator, &.{ dir, "node_modules" }));
+            }
+        },
+        .bun => {
+            if (env.get("HOME")) |home| {
+                try roots.append(allocator, try std.fs.path.join(allocator, &.{ home, ".bun", "install", "global", "node_modules" }));
+            }
+            const argv = [_][]const u8{ "bun", "pm", "bin", "-g" };
+            if (try commandOutputTrimmed(io, allocator, &argv)) |bin_path| {
+                defer allocator.free(bin_path);
+                if (std.fs.path.dirname(bin_path)) |parent| {
+                    try roots.append(allocator, try std.fs.path.join(allocator, &.{ parent, "install", "global", "node_modules" }));
+                }
+            }
+        },
+        .unknown => {},
+    }
+}
+
+fn commandOutputTrimmed(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !?[]u8 {
+    const stdout = runCommandCaptureQuiet(io, allocator, argv, null) catch return null;
+    defer allocator.free(stdout);
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn inferredNpmRoot(allocator: std.mem.Allocator, package_dir: []const u8) !?[]u8 {
+    const parent = std.fs.path.dirname(package_dir) orelse return null;
+    const parent_base = std.fs.path.basename(parent);
+    var root: ?[]const u8 = null;
+    if (std.mem.startsWith(u8, parent_base, "@")) {
+        if (std.fs.path.dirname(parent)) |scope_parent| {
+            if (std.mem.eql(u8, std.fs.path.basename(scope_parent), "node_modules")) root = scope_parent;
+        }
+    } else if (std.mem.eql(u8, parent_base, "node_modules")) {
+        root = parent;
+    }
+    return if (root) |value| try allocator.dupe(u8, value) else null;
+}
+
+fn isPathInsideRoot(path: []const u8, root: []const u8) bool {
+    if (root.len == 0) return false;
+    if (std.mem.eql(u8, path, root)) return true;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return path.len > root.len and (root[root.len - 1] == '/' or path[root.len] == '/');
+}
+
+fn isSelfUpdatePathWritable(io: std.Io, package_dir: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io, package_dir, .{ .write = true }) catch return false;
+    const parent = std.fs.path.dirname(package_dir) orelse return false;
+    std.Io.Dir.accessAbsolute(io, parent, .{ .write = true }) catch return false;
+    return true;
+}
+
+fn writeSelfUpdateUnavailable(
+    io: std.Io,
+    method: InstallMethod,
+    argv: ?[]const []const u8,
+    managed: bool,
+    writable: bool,
+    exe_path: []const u8,
+    update_package_name: []const u8,
+) !void {
+    try writeStderr(io, "error: ");
+    try writeStderr(io, config.app_name);
+    try writeStderr(io, " cannot self-update this installation.\n");
+
+    if (argv) |command_argv| {
+        if (managed and !writable) {
+            try writeStderr(io, "This installation is managed by a global ");
+            try writeStderr(io, installMethodName(method));
+            try writeStderr(io, " install, but the install path is not writable. Update it yourself with: ");
+            try writeCommandDisplay(io, command_argv);
+            try writeStderr(io, "\n");
+        } else {
+            try writeStderr(io, "This installation is not managed by a global ");
+            try writeStderr(io, installMethodName(method));
+            try writeStderr(io, " install. Update it with the package manager, wrapper, or source checkout that provides it.\n");
+        }
+    } else {
+        try writeStderr(io, "Update ");
+        try writeStderr(io, update_package_name);
+        try writeStderr(io, " using the package manager, wrapper, or source checkout that provides this installation.\n");
+    }
+
+    if (exe_path.len > 0) {
+        try writeStderr(io, "\nLocation of ");
+        try writeStderr(io, config.app_name);
+        try writeStderr(io, " executable: ");
+        try writeStderr(io, exe_path);
+        try writeStderr(io, "\n");
+    }
+}
+
+fn writeCommandDisplay(io: std.Io, argv: []const []const u8) !void {
+    for (argv, 0..) |arg, index| {
+        if (index > 0) try writeStderr(io, " ");
+        if (std.mem.indexOfAny(u8, arg, " \t") != null) {
+            try writeStderr(io, "\"");
+            try writeStderr(io, arg);
+            try writeStderr(io, "\"");
+        } else {
+            try writeStderr(io, arg);
+        }
+    }
+}
+
+fn installMethodName(method: InstallMethod) []const u8 {
+    return switch (method) {
+        .npm => "npm",
+        .pnpm => "pnpm",
+        .yarn => "yarn",
+        .bun => "bun",
+        .unknown => "unknown",
+    };
+}
+
+fn runSelfUpdate(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    exe_path: []const u8,
     force: bool,
 ) !bool {
     const update_package_name = try selfUpdatePackageName(io, allocator, env, force);
     defer allocator.free(update_package_name);
     if (update_package_name.len == 0) return false;
 
-    var argv = try npmBaseArgv(io, allocator, env, agent_dir);
+    var argv = try selfUpdateArgv(io, allocator, env, cwd, agent_dir, exe_path, update_package_name);
     defer argv.deinit(allocator);
-    const manager = packageManagerName(argv.items);
-
-    if (std.mem.eql(u8, manager, "pnpm")) {
-        try argv.append(allocator, "install");
-        try argv.append(allocator, "-g");
-        try argv.append(allocator, "--ignore-scripts");
-        try argv.append(allocator, update_package_name);
-    } else if (std.mem.eql(u8, manager, "yarn")) {
-        try argv.append(allocator, "global");
-        try argv.append(allocator, "add");
-        try argv.append(allocator, "--ignore-scripts");
-        try argv.append(allocator, update_package_name);
-    } else if (std.mem.eql(u8, manager, "bun")) {
-        try argv.append(allocator, "install");
-        try argv.append(allocator, "-g");
-        try argv.append(allocator, "--ignore-scripts");
-        try argv.append(allocator, update_package_name);
-    } else {
-        try argv.append(allocator, "install");
-        try argv.append(allocator, "-g");
-        try argv.append(allocator, "--ignore-scripts");
-        try argv.append(allocator, update_package_name);
-    }
-
     try runCommand(io, allocator, argv.items, null);
     return true;
 }

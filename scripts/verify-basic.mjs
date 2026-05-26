@@ -591,13 +591,36 @@ const packageCommandGlobalPackage = path.join(packageCommandProject, 'packages/g
 const packageCommandProjectPackage = path.join(packageCommandProject, 'packages/project-local');
 const packageCommandFakeBin = path.join(packageCommandRoot, 'fake-bin');
 const packageCommandRecord = path.join(packageCommandRoot, 'commands.jsonl');
+const packageCommandGlobalPrefix = path.join(packageCommandRoot, 'global-prefix');
+const packageCommandManagedPackageDir = path.join(
+  packageCommandGlobalPrefix,
+  'lib/node_modules/@earendil-works/pi-coding-agent'
+);
+const packageCommandManagedBin = path.join(packageCommandManagedPackageDir, 'bin/pi-zig');
 const packageCommandEnv = {
   ...process.env,
   HOME: packageCommandHome,
   PATH: `${packageCommandFakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
   PI_ZIG_FAKE_COMMAND_RECORD: packageCommandRecord,
+  PI_ZIG_FAKE_GLOBAL_PREFIX: packageCommandGlobalPrefix,
   PI_ZIG_FAKE_LATEST_RESPONSE: JSON.stringify({ version: '0.1.0' })
 };
+function runPackageManaged(args, input, options = {}) {
+  return execFileSync(packageCommandManagedBin, args, { encoding: 'utf8', input, ...options });
+}
+function runPackageManagedFail(args, input, options = {}) {
+  try {
+    const stdout = execFileSync(packageCommandManagedBin, args, { encoding: 'utf8', input, ...options });
+    throw new Error(`expected managed package command to fail but it succeeded: ${args.join(' ')}\n${stdout}`);
+  } catch (error) {
+    if (error.status === undefined) throw error;
+    return {
+      status: error.status,
+      stdout: error.stdout ?? '',
+      stderr: error.stderr ?? ''
+    };
+  }
+}
 function readPackageCommandRecords() {
   const text = fs.existsSync(packageCommandRecord) ? fs.readFileSync(packageCommandRecord, 'utf8').trim() : '';
   return text ? text.split('\n').map((line) => JSON.parse(line)) : [];
@@ -606,6 +629,9 @@ fs.rmSync(packageCommandRoot, { recursive: true, force: true });
 fs.mkdirSync(packageCommandGlobalPackage, { recursive: true });
 fs.mkdirSync(packageCommandProjectPackage, { recursive: true });
 fs.mkdirSync(packageCommandFakeBin, { recursive: true });
+fs.mkdirSync(path.dirname(packageCommandManagedBin), { recursive: true });
+fs.writeFileSync(path.join(packageCommandManagedPackageDir, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent' }));
+fs.symlinkSync(bin, packageCommandManagedBin);
 fs.writeFileSync(
   path.join(packageCommandFakeBin, 'npm'),
   `#!/usr/bin/env node
@@ -623,14 +649,19 @@ function packageName(spec) {
   return at > start ? spec.slice(0, at) : spec;
 }
 const root = optionValue('--prefix') || optionValue('--cwd') || process.cwd();
+if (args[0] === 'root' && args[1] === '-g') {
+  console.log(path.join(process.env.PI_ZIG_FAKE_GLOBAL_PREFIX, 'lib/node_modules'));
+  process.exit(0);
+}
 if (args[0] === 'view' && args[2] === 'version') {
   const name = args[1];
   console.log(JSON.stringify(name === 'current-extension' ? '1.0.0' : '2.0.0'));
   process.exit(0);
 }
-if (args[0] === 'install') {
+const installIndex = args.indexOf('install');
+if (installIndex >= 0) {
   fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true });
-  for (const spec of args.slice(1)) {
+  for (const spec of args.slice(installIndex + 1)) {
     if (spec.startsWith('--')) break;
     const name = packageName(spec);
     if (!name) continue;
@@ -640,8 +671,9 @@ if (args[0] === 'install') {
   }
   process.exit(0);
 }
-if (args[0] === 'uninstall') {
-  const name = args[1];
+const uninstallIndex = args.indexOf('uninstall');
+if (uninstallIndex >= 0) {
+  const name = args[uninstallIndex + 1];
   if (name) fs.rmSync(path.join(root, 'node_modules', ...name.split('/')), { recursive: true, force: true });
   process.exit(0);
 }
@@ -754,8 +786,16 @@ run(['remove', 'git:github.com/example/fake-extension', '--local'], undefined, {
 if (fs.existsSync(npmInstallPath) || fs.existsSync(currentNpmInstallPath) || fs.existsSync(gitInstallPath)) {
   throw new Error('package remove smoke did not remove managed npm and git installs');
 }
+const packageSelfUnsupported = runFail(['update', '--self', '--force'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+if (
+  packageSelfUnsupported.status !== 1 ||
+  !packageSelfUnsupported.stderr.includes('cannot self-update this installation') ||
+  !packageSelfUnsupported.stderr.includes('Location of pi-zig executable:')
+) {
+  throw new Error('package self-update smoke did not fail visibly for unmanaged checkout binary');
+}
 const packageSelfNoUpdateRecordCount = readPackageCommandRecords().length;
-const packageSelfNoUpdateOutput = run(['update', '--self'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+const packageSelfNoUpdateOutput = runPackageManaged(['update', '--self'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
 const packageSelfNoUpdateRecords = readPackageCommandRecords().slice(packageSelfNoUpdateRecordCount);
 if (
   !packageSelfNoUpdateOutput.includes('pi-zig is already up to date (v0.1.0)') ||
@@ -764,15 +804,29 @@ if (
 ) {
   throw new Error('package self-update smoke did not check latest release and skip current version');
 }
+fs.chmodSync(packageCommandManagedPackageDir, 0o555);
+const packageSelfUnwritable = runPackageManagedFail(['update', '--self', '--force'], undefined, {
+  cwd: packageCommandProject,
+  env: packageCommandEnv
+});
+fs.chmodSync(packageCommandManagedPackageDir, 0o755);
+if (
+  packageSelfUnwritable.status !== 1 ||
+  !packageSelfUnwritable.stderr.includes('managed by a global npm install') ||
+  !packageSelfUnwritable.stderr.includes('install path is not writable')
+) {
+  throw new Error('package self-update smoke did not reject managed but unwritable install paths');
+}
 const packageSelfForceRecordCount = readPackageCommandRecords().length;
-const packageSelfUpdateOutput = run(['update', '--self', '--force'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+const packageSelfUpdateOutput = runPackageManaged(['update', '--self', '--force'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
 const packageSelfUpdateRecords = readPackageCommandRecords().slice(packageSelfForceRecordCount);
 if (
   !packageSelfUpdateOutput.includes('Updated pi-zig') ||
   packageSelfUpdateRecords.some((record) => record.command === 'curl') ||
+  !packageSelfUpdateRecords.some((record) => record.command === 'npm' && record.args[0] === 'root' && record.args[1] === '-g') ||
   !packageSelfUpdateRecords.some((record) =>
     record.command === 'npm' &&
-    record.args[0] === 'install' &&
+    record.args.includes('install') &&
     record.args.includes('-g') &&
     record.args.includes('--ignore-scripts') &&
     record.args.includes('@earendil-works/pi-coding-agent')

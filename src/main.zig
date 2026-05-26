@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
         return writeAll(init.io, pi.config.version ++ "\n");
     }
 
-    if (try pi.package_manager.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
+    if (try pi.package_manager.run(init.io, init.arena.allocator(), init.environ_map, args[0], args[1..])) return;
     if (try pi.auth.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
     if (try pi.extensions.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
     if (try pi.settings.run(init.io, init.arena.allocator(), init.environ_map, args[1..])) return;
