@@ -699,6 +699,13 @@ const gitInstallPath = path.join(packageCommandProject, '.pi/git/github.com/exam
 if (!fs.existsSync(npmInstallPath) || !fs.existsSync(gitInstallPath)) {
   throw new Error('package npm/git install smoke did not create managed install paths');
 }
+const packageUpdateSuggestion = runFail(['update', 'fake-extension'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+if (
+  packageUpdateSuggestion.status !== 1 ||
+  !packageUpdateSuggestion.stderr.includes('No matching package found for fake-extension. Did you mean npm:fake-extension?')
+) {
+  throw new Error('package update smoke did not suggest configured npm: source for shorthand input');
+}
 const packageManagedList = run(['list'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
 if (
   !packageManagedList.includes(path.join(packageCommandHome, '.pi/agent/npm/node_modules/fake-extension')) ||

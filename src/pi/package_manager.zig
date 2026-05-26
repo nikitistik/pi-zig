@@ -116,9 +116,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
             removeInstalledSource(io, allocator, env, cwd, agent_dir, parsed, options.local) catch |err| return exitPackageError(io, err);
             const removed = try removeSourceFromSettings(io, allocator, env, cwd, agent_dir, source, options.local);
             if (!removed) {
-                try writeStderr(io, "No matching package found for ");
-                try writeStderr(io, source);
-                try writeStderr(io, "\n");
+                try writeNoMatchingPackageMessage(io, allocator, agent_dir, source);
                 std.process.exit(1);
             }
             try writeStdout(io, "Removed ");
@@ -489,6 +487,79 @@ fn packageSourceString(value: std.json.Value) ?[]const u8 {
     }
 }
 
+fn writeNoMatchingPackageMessage(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    agent_dir: []const u8,
+    source: []const u8,
+) !void {
+    try writeStderr(io, "No matching package found for ");
+    try writeStderr(io, source);
+    if (try suggestedConfiguredSource(io, allocator, agent_dir, source)) |suggestion| {
+        defer allocator.free(suggestion);
+        try writeStderr(io, ". Did you mean ");
+        try writeStderr(io, suggestion);
+        try writeStderr(io, "?");
+    }
+    try writeStderr(io, "\n");
+}
+
+fn suggestedConfiguredSource(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    agent_dir: []const u8,
+    source: []const u8,
+) !?[]u8 {
+    const user_settings = try settingsPath(allocator, agent_dir, false);
+    defer allocator.free(user_settings);
+    if (try suggestedConfiguredSourceInSettings(io, allocator, user_settings, source)) |suggestion| return suggestion;
+
+    const project_settings = try settingsPath(allocator, agent_dir, true);
+    defer allocator.free(project_settings);
+    return suggestedConfiguredSourceInSettings(io, allocator, project_settings, source);
+}
+
+fn suggestedConfiguredSourceInSettings(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    settings_path: []const u8,
+    source: []const u8,
+) !?[]u8 {
+    var parsed_settings = try loadSettings(io, allocator, settings_path);
+    defer parsed_settings.deinit();
+    if (parsed_settings.value != .object) return null;
+    const packages = parsed_settings.value.object.get("packages") orelse return null;
+    if (packages != .array) return null;
+
+    const trimmed = std.mem.trim(u8, source, " \t\r\n");
+    for (packages.array.items) |item| {
+        const configured = packageSourceString(item) orelse continue;
+        if (try sourceSuggestionMatches(allocator, trimmed, configured)) {
+            return try allocator.dupe(u8, configured);
+        }
+    }
+    return null;
+}
+
+fn sourceSuggestionMatches(allocator: std.mem.Allocator, source: []const u8, configured: []const u8) !bool {
+    const parsed = parseSource(configured);
+    switch (parsed.kind) {
+        .npm => return std.mem.eql(u8, source, parsed.name) or std.mem.eql(u8, source, parsed.spec),
+        .git => {
+            const shorthand = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parsed.host, parsed.path });
+            defer allocator.free(shorthand);
+            if (std.mem.eql(u8, source, shorthand)) return true;
+            if (parsed.ref) |ref| {
+                const shorthand_with_ref = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ shorthand, ref });
+                defer allocator.free(shorthand_with_ref);
+                return std.mem.eql(u8, source, shorthand_with_ref);
+            }
+            return false;
+        },
+        .local => return false,
+    }
+}
+
 fn installSource(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -552,9 +623,7 @@ fn updateConfiguredPackages(
     try updateConfiguredPackagesForScope(io, allocator, env, cwd, agent_dir, true, target_key, &matched);
 
     if (source != null and !matched) {
-        try writeStderr(io, "No matching package found for ");
-        try writeStderr(io, source.?);
-        try writeStderr(io, "\n");
+        try writeNoMatchingPackageMessage(io, allocator, agent_dir, source.?);
         return error.PackageCommandFailed;
     }
 }
