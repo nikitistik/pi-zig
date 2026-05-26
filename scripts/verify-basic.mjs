@@ -41,6 +41,7 @@ async function startFakeProviderServer() {
       '-e',
       `
 import http from 'node:http';
+import fs from 'node:fs';
 const requestCounts = new Map();
 const tinyPngBase64 = ${JSON.stringify(tinyPngBase64)};
 function eventStreamU32(value) {
@@ -1808,6 +1809,14 @@ const server = http.createServer((req, res) => {
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc compaction history observed' } }] }));
+      return;
+    }
+    if (user.includes('rpc provider abort in flight')) {
+      fs.writeFileSync('zig-out/pi-zig-rpc-provider-abort-in-flight.started', 'started');
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: 'rpc provider abort unexpectedly completed' } }] }));
+      }, 1200);
       return;
     }
     const defaultContent = 'mock provider response for ' + body.model + ': ' + user + (system ? ' [system=' + system + ']' : '');
@@ -4835,6 +4844,132 @@ try {
       throw new Error(`rpc retry abort delay smoke did not cancel retry sleep\nstdout:\n${stdout}\nstderr:\n${stderr}`);
     }
   }
+
+  async function runRpcProviderAbortInFlightSmoke() {
+    const sessionFile = path.resolve('zig-out/pi-zig-rpc-provider-abort-in-flight-smoke.jsonl');
+    const markerFile = path.resolve('zig-out/pi-zig-rpc-provider-abort-in-flight.started');
+    fs.rmSync(sessionFile, { force: true });
+    fs.rmSync(markerFile, { force: true });
+    const child = spawn(bin, ['rpc', sessionFile], {
+      env: rpcProviderEnv,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    let pending = '';
+    const lines = [];
+    const waiters = [];
+    function failWaiters(error) {
+      while (waiters.length > 0) {
+        const waiter = waiters.pop();
+        clearTimeout(waiter.timeout);
+        waiter.reject(error);
+      }
+    }
+    function resolveWaiters(line) {
+      for (let index = 0; index < waiters.length;) {
+        const waiter = waiters[index];
+        if (waiter.predicate(line)) {
+          waiters.splice(index, 1);
+          clearTimeout(waiter.timeout);
+          waiter.resolve(line);
+        } else {
+          index += 1;
+        }
+      }
+    }
+    function waitForLine(predicate, timeoutMs = 2500) {
+      const existing = lines.find(predicate);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          const error = new Error(`timed out waiting for RPC line\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+          const index = waiters.findIndex((waiter) => waiter.reject === reject);
+          if (index !== -1) waiters.splice(index, 1);
+          reject(error);
+        }, timeoutMs);
+        waiters.push({ predicate, resolve, reject, timeout });
+      });
+    }
+    function waitForFile(file, timeoutMs = 1000) {
+      return new Promise((resolve, reject) => {
+        const started = Date.now();
+        const interval = setInterval(() => {
+          if (fs.existsSync(file)) {
+            clearInterval(interval);
+            resolve();
+            return;
+          }
+          if (Date.now() - started > timeoutMs) {
+            clearInterval(interval);
+            reject(new Error(`timed out waiting for ${file}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          }
+        }, 25);
+      });
+    }
+    function writeCommand(command) {
+      child.stdin.write(`${JSON.stringify(command)}\n`);
+    }
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      pending += chunk;
+      while (pending.includes('\n')) {
+        const newline = pending.indexOf('\n');
+        const rawLine = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (rawLine.trim().length === 0) continue;
+        try {
+          const line = JSON.parse(rawLine);
+          lines.push(line);
+          resolveWaiters(line);
+        } catch (error) {
+          failWaiters(new Error(`failed to parse RPC JSON line: ${rawLine}\n${error.message}`));
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const exitPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`rpc provider abort in-flight smoke timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      }, 7000);
+      child.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once('exit', (code, signal) => {
+        clearTimeout(timeout);
+        if (code !== 0) {
+          reject(new Error(`rpc provider abort in-flight smoke exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          return;
+        }
+        resolve();
+      });
+    });
+
+    writeCommand({ id: 'rpc-provider-abort-in-flight-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' });
+    await waitForLine((line) => line.id === 'rpc-provider-abort-in-flight-model' && line.success === true);
+    writeCommand({ id: 'rpc-provider-abort-in-flight-prompt', type: 'prompt', message: 'rpc provider abort in flight' });
+    await waitForFile(markerFile);
+    writeCommand({ id: 'rpc-provider-abort-in-flight-abort', type: 'abort' });
+    const abortResponse = await waitForLine((line) => line.id === 'rpc-provider-abort-in-flight-abort', 700);
+    const promptResponse = await waitForLine((line) => line.id === 'rpc-provider-abort-in-flight-prompt', 2500);
+    child.stdin.end();
+    await exitPromise;
+
+    if (
+      !abortResponse?.success ||
+      promptResponse?.success !== false ||
+      promptResponse?.error !== 'AgentAborted' ||
+      stdout.includes('rpc provider abort unexpectedly completed')
+    ) {
+      throw new Error(`rpc provider abort in-flight smoke did not cancel the active prompt\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+  }
   const rpcExtensionHookFixture = path.resolve('zig-out/pi-zig-rpc-extension-hook-fixture');
   fs.rmSync(rpcExtensionHookFixture, { recursive: true, force: true });
   fs.mkdirSync(rpcExtensionHookFixture, { recursive: true });
@@ -5398,6 +5533,7 @@ export default function(pi: any): void {
   }
 
   await runRpcRetryAbortDelaySmoke();
+  await runRpcProviderAbortInFlightSmoke();
 
   const rpcProviderOutput = run(
     ['rpc', rpcProviderSessionFile],

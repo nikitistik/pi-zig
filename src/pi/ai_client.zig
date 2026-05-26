@@ -63,12 +63,16 @@ pub const ChatToolDefinition = struct {
     parameters_json: []const u8,
 };
 
+pub const CancellationCallback = *const fn (ctx: *anyopaque) bool;
+
 pub const ChatTurnRequest = struct {
     provider: []const u8,
     model: []const u8,
     api_key: []const u8,
     messages: []const ChatMessage,
     tools: []const ChatToolDefinition = &.{},
+    cancellation_context: ?*anyopaque = null,
+    should_cancel: ?CancellationCallback = null,
 };
 
 pub const ChatCompletionResult = struct {
@@ -88,11 +92,32 @@ pub const ChatCompletionError = error{
     ProviderRequestFailed,
     ProviderResponseInvalid,
     EmptyPrompt,
+    AgentAborted,
 } || std.mem.Allocator.Error || std.http.Client.FetchError;
 
 pub const StreamTextCallback = *const fn (ctx: *anyopaque, delta: []const u8) anyerror!void;
 const StreamDataCallback = *const fn (ctx: *anyopaque, data: []const u8) anyerror!void;
 const max_provider_error_body_bytes = 16 * 1024;
+
+const CancellationState = struct {
+    context: ?*anyopaque = null,
+    should_cancel: ?CancellationCallback = null,
+};
+
+fn cancellationState(request: ChatTurnRequest) CancellationState {
+    return .{
+        .context = request.cancellation_context,
+        .should_cancel = request.should_cancel,
+    };
+}
+
+fn checkCancellation(state: CancellationState) ChatCompletionError!void {
+    if (state.should_cancel) |callback| {
+        if (state.context) |context| {
+            if (callback(context)) return error.AgentAborted;
+        }
+    }
+}
 
 fn providerErrorForStatus(status: std.http.Status) ChatCompletionError {
     return providerErrorForStatusAndBody(status, "");
@@ -254,6 +279,7 @@ pub fn runChatTurn(
     env: *const std.process.Environ.Map,
     request: ChatTurnRequest,
 ) ChatCompletionError!ChatCompletionResult {
+    try checkCancellation(cancellationState(request));
     if (isAnthropicMessagesProvider(request.provider)) {
         return runAnthropicMessagesTurn(io, allocator, env, request);
     }
@@ -301,6 +327,7 @@ pub fn runChatTurn(
             .user_agent = .{ .override = user_agent },
         },
     });
+    try checkCancellation(cancellationState(request));
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
@@ -363,6 +390,7 @@ fn streamChatTurnData(
     callback_context: *anyopaque,
     callback: StreamDataCallback,
 ) !void {
+    try checkCancellation(cancellationState(request));
     if (isAnthropicMessagesProvider(request.provider)) {
         return streamAnthropicMessagesData(io, allocator, env, request, callback_context, callback);
     }
@@ -412,9 +440,12 @@ fn streamChatTurnData(
     var body_writer = try request_handle.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(payload);
     try body_writer.end();
+    try checkCancellation(cancellationState(request));
     try request_handle.connection.?.flush();
+    try checkCancellation(cancellationState(request));
 
     var response = try request_handle.receiveHead(&.{});
+    try checkCancellation(cancellationState(request));
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
@@ -423,16 +454,18 @@ fn streamChatTurnData(
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    try readDoneTerminatedSseStream(reader, callback_context, callback);
+    try readDoneTerminatedSseStream(reader, callback_context, callback, cancellationState(request));
 }
 
 fn readDoneTerminatedSseStream(
     reader: *std.Io.Reader,
     callback_context: *anyopaque,
     callback: StreamDataCallback,
+    cancellation: CancellationState,
 ) !void {
     var saw_done = false;
     while (true) {
+        try checkCancellation(cancellation);
         const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
             error.ReadFailed => return error.ProviderResponseInvalid,
             else => return err,
@@ -448,6 +481,7 @@ fn readDoneTerminatedSseStream(
             break;
         }
         try callback(callback_context, data);
+        try checkCancellation(cancellation);
     }
     if (!saw_done) return error.ProviderResponseInvalid;
 }
@@ -535,6 +569,7 @@ fn runAnthropicMessagesTurn(
         },
         .extra_headers = extra_headers,
     });
+    try checkCancellation(cancellationState(request));
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
@@ -588,9 +623,12 @@ fn streamAnthropicMessagesData(
     var body_writer = try request_handle.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(payload);
     try body_writer.end();
+    try checkCancellation(cancellationState(request));
     try request_handle.connection.?.flush();
+    try checkCancellation(cancellationState(request));
 
     var response = try request_handle.receiveHead(&.{});
+    try checkCancellation(cancellationState(request));
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
@@ -599,7 +637,7 @@ fn streamAnthropicMessagesData(
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    try readAnthropicSseStream(allocator, reader, callback_context, callback);
+    try readAnthropicSseStream(allocator, reader, callback_context, callback, cancellationState(request));
 }
 
 fn runGoogleGenerateContentTurn(
@@ -640,6 +678,7 @@ fn runGoogleGenerateContentTurn(
         },
         .extra_headers = &extra_headers,
     });
+    try checkCancellation(cancellationState(request));
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
@@ -691,9 +730,12 @@ fn streamGoogleGenerateContentData(
     var body_writer = try request_handle.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(payload);
     try body_writer.end();
+    try checkCancellation(cancellationState(request));
     try request_handle.connection.?.flush();
+    try checkCancellation(cancellationState(request));
 
     var response = try request_handle.receiveHead(&.{});
+    try checkCancellation(cancellationState(request));
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
@@ -702,7 +744,7 @@ fn streamGoogleGenerateContentData(
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    try readGoogleSseStream(reader, callback_context, callback);
+    try readGoogleSseStream(reader, callback_context, callback, cancellationState(request));
 }
 
 fn runGoogleVertexGenerateContentTurn(
@@ -746,6 +788,7 @@ fn runGoogleVertexGenerateContentTurn(
         },
         .extra_headers = extra_headers,
     });
+    try checkCancellation(cancellationState(request));
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
@@ -800,9 +843,12 @@ fn streamGoogleVertexGenerateContentData(
     var body_writer = try request_handle.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(payload);
     try body_writer.end();
+    try checkCancellation(cancellationState(request));
     try request_handle.connection.?.flush();
+    try checkCancellation(cancellationState(request));
 
     var response = try request_handle.receiveHead(&.{});
+    try checkCancellation(cancellationState(request));
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
@@ -811,7 +857,7 @@ fn streamGoogleVertexGenerateContentData(
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    try readGoogleSseStream(reader, callback_context, callback);
+    try readGoogleSseStream(reader, callback_context, callback, cancellationState(request));
 }
 
 fn runMistralChatTurn(
@@ -851,6 +897,7 @@ fn runMistralChatTurn(
             .user_agent = .{ .override = user_agent },
         },
     });
+    try checkCancellation(cancellationState(request));
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
@@ -901,9 +948,12 @@ fn streamMistralChatData(
     var body_writer = try request_handle.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(payload);
     try body_writer.end();
+    try checkCancellation(cancellationState(request));
     try request_handle.connection.?.flush();
+    try checkCancellation(cancellationState(request));
 
     var response = try request_handle.receiveHead(&.{});
+    try checkCancellation(cancellationState(request));
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
@@ -912,7 +962,7 @@ fn streamMistralChatData(
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    try readDoneTerminatedSseStream(reader, callback_context, callback);
+    try readDoneTerminatedSseStream(reader, callback_context, callback, cancellationState(request));
 }
 
 fn runBedrockConverseTurn(
@@ -984,9 +1034,12 @@ fn streamBedrockConverseData(
     var body_writer = try request_handle.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(payload);
     try body_writer.end();
+    try checkCancellation(cancellationState(request));
     try request_handle.connection.?.flush();
+    try checkCancellation(cancellationState(request));
 
     var response = try request_handle.receiveHead(&.{});
+    try checkCancellation(cancellationState(request));
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
@@ -995,7 +1048,7 @@ fn streamBedrockConverseData(
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    try readBedrockEventStream(allocator, reader, callback_context, callback);
+    try readBedrockEventStream(allocator, reader, callback_context, callback, cancellationState(request));
 }
 
 const AnthropicAuthHeader = struct {
@@ -1894,6 +1947,7 @@ fn readAnthropicSseStream(
     reader: *std.Io.Reader,
     callback_context: *anyopaque,
     callback: StreamDataCallback,
+    cancellation: CancellationState,
 ) !void {
     var data_writer: std.Io.Writer.Allocating = .init(allocator);
     defer data_writer.deinit();
@@ -1901,6 +1955,7 @@ fn readAnthropicSseStream(
     var saw_stop = false;
 
     while (true) {
+        try checkCancellation(cancellation);
         const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
             error.ReadFailed => return error.ProviderResponseInvalid,
             else => return err,
@@ -1913,6 +1968,7 @@ fn readAnthropicSseStream(
                 if (event_kind == .err) return error.ProviderRequestFailed;
                 const data = data_writer.written();
                 try callback(callback_context, data);
+                try checkCancellation(cancellation);
                 if (try isAnthropicMessageStopData(allocator, data)) saw_stop = true;
                 data_writer.deinit();
                 data_writer = .init(allocator);
@@ -1934,6 +1990,7 @@ fn readAnthropicSseStream(
         if (event_kind == .err) return error.ProviderRequestFailed;
         const data = data_writer.written();
         try callback(callback_context, data);
+        try checkCancellation(cancellation);
         if (try isAnthropicMessageStopData(allocator, data)) saw_stop = true;
     }
     if (!saw_stop) return error.ProviderResponseInvalid;
@@ -1943,9 +2000,11 @@ fn readGoogleSseStream(
     reader: *std.Io.Reader,
     callback_context: *anyopaque,
     callback: StreamDataCallback,
+    cancellation: CancellationState,
 ) !void {
     var saw_data = false;
     while (true) {
+        try checkCancellation(cancellation);
         const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
             error.ReadFailed => return error.ProviderResponseInvalid,
             else => return err,
@@ -1958,6 +2017,7 @@ fn readGoogleSseStream(
         const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
         if (data.len == 0) continue;
         try callback(callback_context, data);
+        try checkCancellation(cancellation);
         saw_data = true;
     }
     if (!saw_data) return error.ProviderResponseInvalid;
@@ -1968,9 +2028,11 @@ fn readBedrockEventStream(
     reader: *std.Io.Reader,
     callback_context: *anyopaque,
     callback: StreamDataCallback,
+    cancellation: CancellationState,
 ) !void {
     var saw_event = false;
     while (true) {
+        try checkCancellation(cancellation);
         const prelude = reader.takeArray(12) catch |err| switch (err) {
             error.EndOfStream => break,
             error.ReadFailed => return error.ProviderResponseInvalid,
@@ -2003,6 +2065,7 @@ fn readBedrockEventStream(
         }
         if (payload.len == 0) continue;
         try callback(callback_context, payload);
+        try checkCancellation(cancellation);
         saw_event = true;
     }
     if (!saw_event) return error.ProviderResponseInvalid;
@@ -3709,7 +3772,7 @@ test "parses native Anthropic SSE frames without done sentinel" {
             "event: message_stop\n" ++
             "data: {\"type\":\"message_stop\"}\n\n",
     );
-    try readAnthropicSseStream(std.testing.allocator, &reader, &context, handleStreamResultData);
+    try readAnthropicSseStream(std.testing.allocator, &reader, &context, handleStreamResultData, .{});
     const result = try accumulator.toResult();
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("native anthropic", result.text.?);
@@ -3728,7 +3791,7 @@ test "parses native Google SSE frames without done sentinel" {
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"native \"}]}}]}\n\n" ++
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"google\"}]},\"finishReason\":\"STOP\"}]}\n\n",
     );
-    try readGoogleSseStream(&reader, &context, handleStreamResultData);
+    try readGoogleSseStream(&reader, &context, handleStreamResultData, .{});
     const result = try accumulator.toResult();
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("native google", result.text.?);
@@ -3759,7 +3822,7 @@ test "parses native Bedrock event stream frames" {
     );
 
     var reader = std.Io.Reader.fixed(stream.written());
-    try readBedrockEventStream(std.testing.allocator, &reader, &context, handleStreamResultData);
+    try readBedrockEventStream(std.testing.allocator, &reader, &context, handleStreamResultData, .{});
     const result = try accumulator.toResult();
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("native bedrock", result.text.?);

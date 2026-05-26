@@ -350,6 +350,8 @@ pub fn runPrompt(
             .api_key = active_api_key orelse options.api_key,
             .messages = borrowed,
             .tools = tool_definitions_list.items,
+            .cancellation_context = options.cancellation_context,
+            .should_cancel = options.should_cancel,
         };
         var response = if (options.stream_turns)
             try ai_client.streamChatTurnWithTextCallback(io, allocator, env, request, options.text_event_context, options.on_text_delta)

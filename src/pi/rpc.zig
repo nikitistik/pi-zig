@@ -2209,7 +2209,8 @@ pub fn run(
 
 fn isActivePromptNonBlockingCommand(value: std.json.Value) bool {
     const command = getStringField(value, "type") orelse return false;
-    return std.mem.eql(u8, command, "abort_retry");
+    return std.mem.eql(u8, command, "abort") or
+        std.mem.eql(u8, command, "abort_retry");
 }
 
 fn isActiveBashNonBlockingCommand(value: std.json.Value) bool {
