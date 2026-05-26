@@ -1462,6 +1462,19 @@ const ls = run(['tool-ls', '.']);
 if (!ls.includes('README.md')) {
   throw new Error('tool-ls smoke did not list README.md');
 }
+const lsFixture = 'zig-out/pi-zig-ls-fixture';
+fs.rmSync(lsFixture, { recursive: true, force: true });
+fs.mkdirSync(path.join(lsFixture, 'dir'), { recursive: true });
+fs.writeFileSync(path.join(lsFixture, 'zeta.txt'), 'z');
+fs.writeFileSync(path.join(lsFixture, 'alpha.txt'), 'a');
+fs.writeFileSync(path.join(lsFixture, 'Beta.txt'), 'b');
+const sortedLs = run(['tool-ls', lsFixture, '3']);
+if (
+  !sortedLs.startsWith('alpha.txt\nBeta.txt\ndir/\n') ||
+  !sortedLs.includes('[3 entries limit reached. Use limit=6 for more]')
+) {
+  throw new Error('tool-ls smoke did not sort entries, mark directories, and report entry limits');
+}
 
 const grep = run(['tool-grep', 'Zig + Preact', 'README.md']);
 if (!grep.includes('Zig + Preact porting workspace')) {

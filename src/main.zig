@@ -120,7 +120,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "tool-ls")) {
         const path = if (args.len >= 3) args[2] else ".";
-        return pi.tools.listDir(init.io, path);
+        const limit = if (args.len >= 4) std.fmt.parseInt(usize, args[3], 10) catch return usage(init.io) else 500;
+        return pi.tools.listDir(init.io, init.gpa, path, limit);
     }
 
     if (std.mem.eql(u8, command, "tool-grep")) {
@@ -182,7 +183,7 @@ fn usage(io: std.Io) !void {
         \\  parse-args [pi CLI args...]
         \\  tool-read <path>
         \\  tool-bash <command>
-        \\  tool-ls [path]
+        \\  tool-ls [path] [limit]
         \\  tool-grep <pattern> <path>
         \\  tool-find <pattern> [path] [limit]
         \\  tool-write <path> <content>

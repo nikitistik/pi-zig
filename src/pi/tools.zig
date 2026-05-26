@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const default_find_limit = 1000;
+const default_ls_limit = 500;
 const max_edit_file_bytes = 4 * 1024 * 1024;
 
 pub const ShellResult = struct {
@@ -19,17 +20,49 @@ pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
 }
 
-pub fn listDir(io: std.Io, path: []const u8) !void {
+const ListEntry = struct {
+    name: []u8,
+    is_dir: bool,
+};
+
+pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit: usize) !void {
+    const effective_limit = if (limit == 0) default_ls_limit else limit;
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer dir.close(io);
+
+    var entries: std.ArrayList(ListEntry) = .empty;
+    defer {
+        for (entries.items) |entry| allocator.free(entry.name);
+        entries.deinit(allocator);
+    }
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        try entries.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.name),
+            .is_dir = entry.kind == .directory,
+        });
+    }
+    std.mem.sort(ListEntry, entries.items, {}, lessThanListEntry);
 
     var buf: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(io, &buf);
     const w = &writer.interface;
 
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        try w.print("{s}\t{s}\n", .{ kindLabel(entry.kind), entry.name });
+    if (entries.items.len == 0) {
+        try w.writeAll("(empty directory)\n");
+        try w.flush();
+        return;
+    }
+
+    const shown = @min(effective_limit, entries.items.len);
+    for (entries.items[0..shown]) |entry| {
+        try w.writeAll(entry.name);
+        if (entry.is_dir) try w.writeByte('/');
+        try w.writeByte('\n');
+    }
+    if (shown < entries.items.len) {
+        try w.print("\n[{d} entries limit reached. Use limit={d} for more]\n", .{ effective_limit, effective_limit * 2 });
     }
     try w.flush();
 }
@@ -147,20 +180,21 @@ pub fn runShellCapture(io: std.Io, allocator: std.mem.Allocator, command: []cons
     };
 }
 
-fn kindLabel(kind: std.Io.File.Kind) []const u8 {
-    return switch (kind) {
-        .block_device => "block",
-        .character_device => "char",
-        .directory => "dir",
-        .named_pipe => "pipe",
-        .sym_link => "link",
-        .file => "file",
-        .unix_domain_socket => "socket",
-        .whiteout => "whiteout",
-        .door => "door",
-        .event_port => "event_port",
-        .unknown => "unknown",
-    };
+fn lessThanListEntry(_: void, left: ListEntry, right: ListEntry) bool {
+    if (lessThanAsciiIgnoreCase(left.name, right.name)) return true;
+    if (lessThanAsciiIgnoreCase(right.name, left.name)) return false;
+    return std.mem.lessThan(u8, left.name, right.name);
+}
+
+fn lessThanAsciiIgnoreCase(left: []const u8, right: []const u8) bool {
+    var index: usize = 0;
+    while (index < left.len and index < right.len) : (index += 1) {
+        const a = std.ascii.toLower(left[index]);
+        const b = std.ascii.toLower(right[index]);
+        if (a < b) return true;
+        if (a > b) return false;
+    }
+    return left.len < right.len;
 }
 
 fn shouldSkipFindDir(name: []const u8) bool {
