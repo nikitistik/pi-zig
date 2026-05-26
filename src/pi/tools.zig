@@ -12,6 +12,10 @@ const default_bash_update_throttle_ms = 100;
 const default_bash_update_min_bytes = 4096;
 const max_bash_capture_bytes = 8 * 1024 * 1024;
 const bash_full_output_path = "zig-out/pi-zig-bash-full-output.log";
+const windows_git_bash_paths = [_][]const u8{
+    "C:\\Program Files\\Git\\bin\\bash.exe",
+    "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+};
 const grep_max_line_chars = 500;
 const max_read_file_bytes = 16 * 1024 * 1024;
 const max_edit_file_bytes = 4 * 1024 * 1024;
@@ -1133,9 +1137,16 @@ fn resolveShellPath(io: std.Io, custom_shell_path: ?[]const u8) ![]const u8 {
         return path;
     }
 
-    if (comptime builtin.os.tag == .windows) return "bash.exe";
+    if (comptime builtin.os.tag == .windows) return resolveWindowsShellPath(io);
     if (absolutePathExists(io, "/bin/bash")) return "/bin/bash";
     return "sh";
+}
+
+fn resolveWindowsShellPath(io: std.Io) []const u8 {
+    for (windows_git_bash_paths) |path| {
+        if (absolutePathExists(io, path)) return path;
+    }
+    return "bash.exe";
 }
 
 fn validateShellPath(io: std.Io, path: []const u8) !void {
@@ -1648,5 +1659,13 @@ test "shell path resolution validates custom paths and prefers bash on unix" {
         if (absolutePathExists(std.testing.io, "/bin/bash")) {
             try std.testing.expectEqualStrings("/bin/bash", try resolveShellPath(std.testing.io, null));
         }
+    }
+}
+
+test "windows shell path candidates include Git Bash before PATH fallback" {
+    try std.testing.expectEqualStrings("C:\\Program Files\\Git\\bin\\bash.exe", windows_git_bash_paths[0]);
+    try std.testing.expectEqualStrings("C:\\Program Files (x86)\\Git\\bin\\bash.exe", windows_git_bash_paths[1]);
+    if (comptime builtin.os.tag == .windows) {
+        _ = resolveWindowsShellPath(std.testing.io);
     }
 }
