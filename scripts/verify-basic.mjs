@@ -4958,13 +4958,30 @@ try {
     writeCommand({ id: 'rpc-provider-abort-in-flight-abort', type: 'abort' });
     const abortResponse = await waitForLine((line) => line.id === 'rpc-provider-abort-in-flight-abort', 700);
     const promptResponse = await waitForLine((line) => line.id === 'rpc-provider-abort-in-flight-prompt', 2500);
+    writeCommand({ id: 'rpc-provider-abort-in-flight-messages', type: 'get_messages' });
+    const messagesResponse = await waitForLine((line) => line.id === 'rpc-provider-abort-in-flight-messages', 2500);
     child.stdin.end();
     await exitPromise;
+    const sessionEntries = fs.readFileSync(sessionFile, 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const persistedAssistant = sessionEntries
+      .filter((entry) => entry.type === 'message' && entry.message?.role === 'assistant')
+      .at(-1)?.message;
+    const exposedAssistant = messagesResponse?.data?.messages
+      ?.filter((message) => message.role === 'assistant')
+      ?.at(-1);
 
     if (
       !abortResponse?.success ||
       promptResponse?.success !== false ||
       promptResponse?.error !== 'AgentAborted' ||
+      exposedAssistant?.stopReason !== 'aborted' ||
+      exposedAssistant?.errorMessage !== 'Request was aborted' ||
+      persistedAssistant?.stopReason !== 'aborted' ||
+      persistedAssistant?.errorMessage !== 'Request was aborted' ||
       stdout.includes('rpc provider abort unexpectedly completed')
     ) {
       throw new Error(`rpc provider abort in-flight smoke did not cancel the active prompt\nstdout:\n${stdout}\nstderr:\n${stderr}`);

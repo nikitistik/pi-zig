@@ -357,6 +357,58 @@ pub const PersistentStore = struct {
         return self.leaf_id_buf[0..self.leaf_id_len];
     }
 
+    pub fn appendAssistantStatusMessage(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        api: ?[]const u8,
+        provider: ?[]const u8,
+        model: ?[]const u8,
+        stop_reason: []const u8,
+        error_message: ?[]const u8,
+    ) ![]const u8 {
+        var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
+        const id = try self.nextEntryId(&entry_id_buf);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll("{\"type\":\"message\",\"id\":");
+        try writeJsonString(w, id);
+        try w.writeAll(",\"parentId\":");
+        try self.writeLeafParent(w);
+        try w.writeAll(",\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll(",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":");
+        try writeJsonString(w, content);
+        try w.writeAll("}]");
+        if (api) |value| {
+            try w.writeAll(",\"api\":");
+            try writeJsonString(w, value);
+        }
+        if (provider) |value| {
+            try w.writeAll(",\"provider\":");
+            try writeJsonString(w, value);
+        }
+        if (model) |value| {
+            try w.writeAll(",\"model\":");
+            try writeJsonString(w, value);
+        }
+        try w.writeAll(",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}}");
+        try w.writeAll(",\"stopReason\":");
+        try writeJsonString(w, stop_reason);
+        if (error_message) |message| {
+            try w.writeAll(",\"errorMessage\":");
+            try writeJsonString(w, message);
+        }
+        try w.writeAll("}}\n");
+        try appendBytes(io, self.path(), out.written());
+        try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
+        self.assistant_messages += 1;
+        return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+
     pub fn appendToolResultMessage(
         self: *PersistentStore,
         io: std.Io,

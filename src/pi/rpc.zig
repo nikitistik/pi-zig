@@ -25,6 +25,8 @@ const max_tool_name_bytes = 64;
 const max_tool_arguments_bytes = 4 * 1024;
 const max_tool_thought_signature_bytes = 2 * 1024;
 const max_compaction_kept_id_bytes = 32;
+const max_assistant_stop_reason_bytes = 16;
+const max_assistant_error_message_bytes = 512;
 const max_pending_messages = 32;
 const max_auto_retry_attempts = 3;
 const default_auto_retry_base_delay_ms = 0;
@@ -270,6 +272,10 @@ const StoredMessage = struct {
     tool_terminate: bool = false,
     tool_calls_count: usize = 0,
     tool_calls: [max_tool_calls_per_message]StoredToolCall = undefined,
+    assistant_stop_reason_len: usize = 0,
+    assistant_stop_reason: [max_assistant_stop_reason_bytes]u8 = undefined,
+    assistant_error_message_len: usize = 0,
+    assistant_error_message: [max_assistant_error_message_bytes]u8 = undefined,
     first_kept_entry_id_len: usize = 0,
     first_kept_entry_id: [max_compaction_kept_id_bytes]u8 = undefined,
     tokens_before: usize = 0,
@@ -303,6 +309,22 @@ const StoredMessage = struct {
 
     fn firstKeptEntryId(self: *const StoredMessage) []const u8 {
         return self.first_kept_entry_id[0..self.first_kept_entry_id_len];
+    }
+
+    fn assistantStopReason(self: *const StoredMessage) ?[]const u8 {
+        if (self.assistant_stop_reason_len == 0) return null;
+        return self.assistant_stop_reason[0..self.assistant_stop_reason_len];
+    }
+
+    fn assistantErrorMessage(self: *const StoredMessage) ?[]const u8 {
+        if (self.assistant_error_message_len == 0) return null;
+        return self.assistant_error_message[0..self.assistant_error_message_len];
+    }
+
+    fn isFailedAssistant(self: *const StoredMessage) bool {
+        if (self.role != .assistant) return false;
+        const reason = self.assistantStopReason() orelse return false;
+        return std.mem.eql(u8, reason, "error") or std.mem.eql(u8, reason, "aborted");
     }
 };
 
@@ -550,7 +572,18 @@ const Runtime = struct {
                 .system => _ = try new_store.appendMessage(io, allocator, .system, message.text()),
                 .user => _ = try new_store.appendMessageWithContentParts(io, allocator, .user, message.text(), message.image_parts),
                 .assistant => {
-                    if (message.tool_calls_count > 0) {
+                    if (message.isFailedAssistant()) {
+                        _ = try new_store.appendAssistantStatusMessage(
+                            io,
+                            allocator,
+                            message.text(),
+                            if (previous_model) |model| model.api else null,
+                            if (previous_model) |model| model.provider else null,
+                            if (previous_model) |model| model.id else null,
+                            message.assistantStopReason().?,
+                            message.assistantErrorMessage(),
+                        );
+                    } else if (message.tool_calls_count > 0) {
                         var calls: [max_tool_calls_per_message]ai_client.ChatToolCall = undefined;
                         for (message.tool_calls[0..message.tool_calls_count], 0..) |*call, index| {
                             calls[index] = .{
@@ -686,13 +719,16 @@ const Runtime = struct {
             image_parts = &.{};
             if (role == .assistant) {
                 try copyToolCallsFromMessage(message.object, slot);
+                try copyAssistantStatusFieldsFromMessage(message.object, slot);
             } else if (role == .tool) {
                 try copyToolResultFieldsFromMessage(message.object, slot);
             }
             if (role == .assistant) {
-                const provider = getStringFieldObject(message.object, "provider") orelse return;
-                const model_id = getStringFieldObject(message.object, "model") orelse return;
-                if (models.find(provider, model_id)) |model| self.selected_model = model;
+                if (getStringFieldObject(message.object, "provider")) |provider| {
+                    if (getStringFieldObject(message.object, "model")) |model_id| {
+                        if (models.find(provider, model_id)) |model| self.selected_model = model;
+                    }
+                }
             }
         }
     }
@@ -719,6 +755,8 @@ const Runtime = struct {
         slot.tool_is_error = false;
         slot.tool_terminate = false;
         slot.tool_calls_count = 0;
+        slot.assistant_stop_reason_len = 0;
+        slot.assistant_error_message_len = 0;
         slot.first_kept_entry_id_len = 0;
         slot.tokens_before = 0;
         self.message_count += 1;
@@ -789,6 +827,8 @@ const Runtime = struct {
         slot.tool_is_error = false;
         slot.tool_terminate = false;
         slot.tool_calls_count = 0;
+        slot.assistant_stop_reason_len = 0;
+        slot.assistant_error_message_len = 0;
         slot.first_kept_entry_id_len = 0;
         slot.tokens_before = 0;
         self.message_count += 1;
@@ -1175,7 +1215,9 @@ const Runtime = struct {
                     try appendHistoryMessage(allocator, history, .user, message.text());
                 }
             },
-            .assistant => try appendAssistantHistoryMessage(allocator, history, message),
+            .assistant => {
+                if (!message.isFailedAssistant()) try appendAssistantHistoryMessage(allocator, history, message);
+            },
             .tool => try appendToolHistoryMessage(allocator, history, message),
             .bash_execution => try appendOwnedHistoryMessage(allocator, history, .user, try self.bashExecutionHistoryText(allocator, message)),
             .compaction_summary => {},
@@ -1331,6 +1373,33 @@ const Runtime = struct {
         try self.addMessage(io, allocator, .assistant, result.final_text);
     }
 
+    fn addAssistantStatusMessage(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        content: []const u8,
+        stop_reason: []const u8,
+        error_message: ?[]const u8,
+    ) !void {
+        const selected = self.selected_model;
+        const entry_id = try self.store.appendAssistantStatusMessage(
+            io,
+            allocator,
+            content,
+            if (selected) |model| model.api else null,
+            if (selected) |model| model.provider else null,
+            if (selected) |model| model.id else null,
+            stop_reason,
+            error_message,
+        );
+        try self.addLoadedMessage(.assistant, entry_id, content);
+        var slot = &self.messages[self.message_count - 1];
+        try copyBounded(&slot.assistant_stop_reason, &slot.assistant_stop_reason_len, stop_reason);
+        if (error_message) |message| {
+            try copyBounded(&slot.assistant_error_message, &slot.assistant_error_message_len, message);
+        }
+    }
+
     fn addAssistantToolCallMessage(
         self: *Runtime,
         io: std.Io,
@@ -1408,7 +1477,7 @@ const Runtime = struct {
         }
 
         const prompt_message = messages[messages.len - 1];
-        const maybe_run_result = try self.runAgentIfAuthenticated(
+        const maybe_run_result = self.runAgentIfAuthenticated(
             io,
             allocator,
             w,
@@ -1418,7 +1487,12 @@ const Runtime = struct {
             messages[0 .. messages.len - 1],
             prompt_message.text,
             prompt_message.image_parts,
-        );
+        ) catch |err| {
+            if (err == error.AgentAborted) {
+                try self.addAssistantStatusMessage(io, allocator, "", "aborted", "Request was aborted");
+            }
+            return err;
+        };
         var run_result = maybe_run_result orelse return;
         errdefer run_result.deinit(allocator);
 
@@ -1984,6 +2058,16 @@ const Runtime = struct {
                 try w.writeAll(if (message.tool_is_error) "true" else "false");
                 try w.writeAll(",\"terminate\":");
                 try w.writeAll(if (message.tool_terminate) "true" else "false");
+            }
+            if (message.role == .assistant) {
+                if (message.assistantStopReason()) |reason| {
+                    try w.writeAll(",\"stopReason\":");
+                    try writeJsonString(w, reason);
+                }
+                if (message.assistantErrorMessage()) |error_message| {
+                    try w.writeAll(",\"errorMessage\":");
+                    try writeJsonString(w, error_message);
+                }
             }
         }
         try w.writeByte('}');
@@ -2786,6 +2870,17 @@ fn copyToolCallsFromMessage(object: std.json.ObjectMap, message: *StoredMessage)
             try copyBounded(&target.thought_signature, &target.thought_signature_len, signature);
         }
         message.tool_calls_count += 1;
+    }
+}
+
+fn copyAssistantStatusFieldsFromMessage(object: std.json.ObjectMap, message: *StoredMessage) !void {
+    message.assistant_stop_reason_len = 0;
+    message.assistant_error_message_len = 0;
+    if (getStringFieldObject(object, "stopReason")) |reason| {
+        try copyBounded(&message.assistant_stop_reason, &message.assistant_stop_reason_len, reason);
+    }
+    if (getStringFieldObject(object, "errorMessage")) |error_message| {
+        try copyBounded(&message.assistant_error_message, &message.assistant_error_message_len, error_message);
     }
 }
 
