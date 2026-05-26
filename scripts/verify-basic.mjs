@@ -520,6 +520,20 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc history observed' } }] }));
       return;
     }
+    if (user.includes('rpc bash history check')) {
+      const bashHistory = body.messages.find((message) => {
+        const content = String(message.content ?? '');
+        return message.role === 'user' && content.includes('Ran ') && content.includes('printf rpc-history-bash');
+      });
+      if (!bashHistory || !String(bashHistory.content).includes('rpc-history-bash')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing prior bashExecution history', messages: body.messages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc bash history observed' } }] }));
+      return;
+    }
     const defaultContent = 'mock provider response for ' + body.model + ': ' + user + (system ? ' [system=' + system + ']' : '');
     if (body.stream === true) {
       writeStreamEvents([{ choices: [{ delta: { content: defaultContent } }] }]);
@@ -2808,6 +2822,24 @@ try {
     rpcProviderHistoryMessages?.data?.messages?.filter((message) => message.role === 'assistant').length !== 2
   ) {
     throw new Error('rpc provider history smoke did not persist both user/assistant turns');
+  }
+
+  const rpcProviderBashHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-bash-history-smoke.jsonl');
+  fs.rmSync(rpcProviderBashHistorySessionFile, { force: true });
+  const rpcProviderBashHistoryOutput = run(
+    ['rpc', rpcProviderBashHistorySessionFile],
+    [
+      JSON.stringify({ id: 'rpc-provider-bash-history-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-provider-bash-history-bash', type: 'bash', command: 'printf rpc-history-bash' }),
+      JSON.stringify({ id: 'rpc-provider-bash-history-prompt', type: 'prompt', message: 'rpc bash history check' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderBashHistoryResponses = rpcProviderBashHistoryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderBashHistoryPrompt = rpcProviderBashHistoryResponses.find((response) => response.id === 'rpc-provider-bash-history-prompt');
+  if (!rpcProviderBashHistoryPrompt?.success || rpcProviderBashHistoryPrompt?.data?.text !== 'rpc bash history observed') {
+    throw new Error('rpc provider prompt smoke did not send prior bashExecution history to the provider');
   }
 
   const rpcProviderQueueSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-queue-smoke.jsonl');

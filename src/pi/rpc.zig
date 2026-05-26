@@ -492,7 +492,7 @@ const Runtime = struct {
         const shell_settings = try settings.loadShellSettings(io, allocator, env);
         defer shell_settings.deinit(allocator);
         var history = try self.buildAgentHistory(allocator);
-        defer history.deinit(allocator);
+        defer deinitAgentHistory(allocator, &history);
 
         return try agent.runPrompt(io, allocator, env, .{
             .provider = model.provider,
@@ -534,18 +534,57 @@ const Runtime = struct {
 
     fn buildAgentHistory(self: *Runtime, allocator: std.mem.Allocator) !std.ArrayList(ai_client.ChatMessage) {
         var history: std.ArrayList(ai_client.ChatMessage) = .empty;
-        errdefer history.deinit(allocator);
+        errdefer deinitAgentHistory(allocator, &history);
 
         var limit = self.message_count;
         if (limit > 0) limit -= 1;
         for (self.messages[0..limit]) |*message| {
             switch (message.role) {
-                .user => try history.append(allocator, .{ .role = .user, .content = message.text() }),
-                .assistant => try history.append(allocator, .{ .role = .assistant, .content = message.text() }),
+                .user => try appendHistoryMessage(allocator, &history, .user, message.text()),
+                .assistant => try appendHistoryMessage(allocator, &history, .assistant, message.text()),
+                .bash_execution => try appendOwnedHistoryMessage(allocator, &history, .user, try self.bashExecutionHistoryText(allocator, message)),
                 else => {},
             }
         }
         return history;
+    }
+
+    fn appendHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), role: ai_client.ChatRole, content: []const u8) !void {
+        const owned = try allocator.dupe(u8, content);
+        try appendOwnedHistoryMessage(allocator, history, role, owned);
+    }
+
+    fn appendOwnedHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), role: ai_client.ChatRole, content: []u8) !void {
+        errdefer allocator.free(content);
+        try history.append(allocator, .{ .role = role, .content = content });
+    }
+
+    fn deinitAgentHistory(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage)) void {
+        for (history.items) |message| allocator.free(message.content);
+        history.deinit(allocator);
+    }
+
+    fn bashExecutionHistoryText(self: *Runtime, allocator: std.mem.Allocator, message: *const StoredMessage) ![]u8 {
+        _ = self;
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+
+        try w.print("Ran `{s}`\n", .{message.commandText()});
+        if (message.text().len > 0) {
+            try w.print("```\n{s}\n```", .{message.text()});
+        } else {
+            try w.writeAll("(no output)");
+        }
+        if (message.cancelled) {
+            try w.writeAll("\n\n(command cancelled)");
+        } else if (message.exit_code) |code| {
+            if (code != 0) try w.print("\n\nCommand exited with code {d}", .{code});
+        }
+        if (message.truncated) {
+            try w.writeAll("\n\n[Output truncated.]");
+        }
+        return out.toOwnedSlice();
     }
 
     fn addAgentResultMessages(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, result: agent.RunResult) !void {
