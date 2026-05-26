@@ -1182,7 +1182,7 @@ fn resolveWindowsShellPath(
     if (try findWindowsBashOnPath(io, allocator)) |path| {
         return .{ .path = path, .owned = true };
     }
-    return .{ .path = "bash.exe" };
+    return error.ShellPathNotFound;
 }
 
 fn findWindowsBashOnPath(io: std.Io, allocator: std.mem.Allocator) !?[]u8 {

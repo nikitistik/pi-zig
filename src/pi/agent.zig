@@ -849,7 +849,8 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
         .command_prefix = if (options) |run_options| run_options.shell_command_prefix else null,
         .env = if (options) |run_options| run_options.env else null,
     }) catch |err| {
-        return toolError(try std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)}));
+        const shell_path = if (options) |run_options| run_options.shell_path else null;
+        return toolError(try bashSetupErrorMessage(allocator, err, shell_path));
     };
     defer allocator.free(shell_result.output);
 
@@ -860,6 +861,16 @@ fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, call: ai_client.Cha
         .content = content,
         .is_error = is_error,
     };
+}
+
+fn bashSetupErrorMessage(allocator: std.mem.Allocator, err: anyerror, custom_shell_path: ?[]const u8) ![]u8 {
+    if (err == error.ShellPathNotFound) {
+        if (custom_shell_path) |path| {
+            return std.fmt.allocPrint(allocator, "bash tool failed before execution: Custom shell path not found: {s}", .{path});
+        }
+        return allocator.dupe(u8, "bash tool failed before execution: No bash shell found");
+    }
+    return std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)});
 }
 
 fn executeEditTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
@@ -1050,6 +1061,30 @@ test "invalid tool argument JSON returns a tool error result" {
     try std.testing.expect(result.is_error);
     try std.testing.expect(!result.terminate);
     try std.testing.expect(std.mem.startsWith(u8, result.content, "bash tool argument JSON is invalid:"));
+}
+
+test "bash missing custom shell path returns upstream-shaped setup error" {
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_missing_shell"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"command\":\"printf should-not-run\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithHooks(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .shell_path = "zig-out/pi-zig-missing-shell",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(
+        "bash tool failed before execution: Custom shell path not found: zig-out/pi-zig-missing-shell",
+        result.content,
+    );
 }
 
 test "before tool hook can block execution with an error result" {
