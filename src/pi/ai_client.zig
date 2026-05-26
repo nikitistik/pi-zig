@@ -135,6 +135,9 @@ pub fn runChatTurn(
     if (isGoogleGenerativeProvider(request.provider)) {
         return runGoogleGenerateContentTurn(io, allocator, env, request);
     }
+    if (isGoogleVertexProvider(request.provider)) {
+        return runGoogleVertexGenerateContentTurn(io, allocator, env, request);
+    }
     if (isMistralProvider(request.provider)) {
         return runMistralChatTurn(io, allocator, env, request);
     }
@@ -240,6 +243,9 @@ fn streamChatTurnData(
     }
     if (isGoogleGenerativeProvider(request.provider)) {
         return streamGoogleGenerateContentData(io, allocator, env, request, callback_context, callback);
+    }
+    if (isGoogleVertexProvider(request.provider)) {
+        return streamGoogleVertexGenerateContentData(io, allocator, env, request, callback_context, callback);
     }
     if (isMistralProvider(request.provider)) {
         return streamMistralChatData(io, allocator, env, request, callback_context, callback);
@@ -351,6 +357,10 @@ fn isAnthropicMessagesProvider(provider: []const u8) bool {
 
 fn isGoogleGenerativeProvider(provider: []const u8) bool {
     return std.mem.eql(u8, provider, "google");
+}
+
+fn isGoogleVertexProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "google-vertex");
 }
 
 fn isMistralProvider(provider: []const u8) bool {
@@ -551,6 +561,116 @@ fn streamGoogleGenerateContentData(
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = &extra_headers,
+    });
+    defer request_handle.deinit();
+
+    request_handle.transfer_encoding = .{ .content_length = payload.len };
+    var body_writer = try request_handle.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try request_handle.connection.?.flush();
+
+    var response = try request_handle.receiveHead(&.{});
+    if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
+        var transfer_buffer: [1024]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        _ = reader.discardRemaining() catch {};
+        return error.ProviderRequestFailed;
+    }
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    try readGoogleSseStream(reader, callback_context, callback);
+}
+
+fn runGoogleVertexGenerateContentTurn(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+) ChatCompletionError!ChatCompletionResult {
+    const endpoint = try googleVertexGenerateContentEndpointForProvider(allocator, env, request.model, false);
+    defer allocator.free(endpoint);
+
+    const payload = try buildGoogleGenerateContentPayload(allocator, request);
+    defer allocator.free(payload);
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var auth_header = try googleVertexAuthHeader(allocator, env, request.api_key);
+    defer auth_header.deinit(allocator);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    var extra_headers_buf: [1]std.http.Header = undefined;
+    const extra_headers = auth_header.extraHeaders(&extra_headers_buf);
+    const result = try client.fetch(.{
+        .location = .{ .url = endpoint },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .authorization = if (auth_header.authorization) |value| .{ .override = value } else .default,
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+        },
+        .extra_headers = extra_headers,
+    });
+
+    const body = response_body.written();
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        return error.ProviderRequestFailed;
+    }
+
+    return parseGoogleGenerateContentResult(allocator, body);
+}
+
+fn streamGoogleVertexGenerateContentData(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    const endpoint = try googleVertexGenerateContentEndpointForProvider(allocator, env, request.model, true);
+    defer allocator.free(endpoint);
+
+    const payload = try buildGoogleGenerateContentPayload(allocator, request);
+    defer allocator.free(payload);
+
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var auth_header = try googleVertexAuthHeader(allocator, env, request.api_key);
+    defer auth_header.deinit(allocator);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    var extra_headers_buf: [1]std.http.Header = undefined;
+    const extra_headers = auth_header.extraHeaders(&extra_headers_buf);
+    var request_handle = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .authorization = if (auth_header.authorization) |value| .{ .override = value } else .default,
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .extra_headers = extra_headers,
     });
     defer request_handle.deinit();
 
@@ -793,6 +913,45 @@ fn anthropicExtraHeaders(buf: *[5]std.http.Header, api_key: []const u8, oauth: b
     return buf[0..len];
 }
 
+const GoogleVertexAuthHeader = struct {
+    api_key: ?[]const u8 = null,
+    authorization: ?[]u8 = null,
+
+    fn deinit(self: *GoogleVertexAuthHeader, allocator: std.mem.Allocator) void {
+        if (self.authorization) |value| allocator.free(value);
+    }
+
+    fn extraHeaders(self: GoogleVertexAuthHeader, buf: *[1]std.http.Header) []const std.http.Header {
+        if (self.api_key) |api_key| {
+            buf[0] = .{ .name = "x-goog-api-key", .value = api_key };
+            return buf[0..1];
+        }
+        return buf[0..0];
+    }
+};
+
+fn googleVertexAuthHeader(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    api_key: []const u8,
+) !GoogleVertexAuthHeader {
+    if (!isGoogleVertexPlaceholderApiKey(api_key)) {
+        return .{ .api_key = api_key };
+    }
+    if (env.get("GOOGLE_CLOUD_ACCESS_TOKEN")) |access_token| {
+        if (access_token.len > 0) {
+            return .{ .authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token}) };
+        }
+    }
+    return error.ProviderRequestFailed;
+}
+
+fn isGoogleVertexPlaceholderApiKey(api_key: []const u8) bool {
+    return std.mem.eql(u8, api_key, "<authenticated>") or
+        std.mem.eql(u8, api_key, "gcp-vertex-credentials") or
+        (api_key.len >= 2 and api_key[0] == '<' and api_key[api_key.len - 1] == '>');
+}
+
 fn endpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, provider: []const u8) ![]u8 {
     if (env.get("PI_ZIG_PROVIDER_BASE_URL")) |base_url| {
         return endpointFromBaseUrl(allocator, base_url);
@@ -825,6 +984,75 @@ fn googleGenerateContentEndpointForProvider(
     const trimmed = base_url[0..end];
     const action = if (stream) "streamGenerateContent?alt=sse" else "generateContent";
     return std.fmt.allocPrint(allocator, "{s}/models/{s}:{s}", .{ trimmed, model, action });
+}
+
+fn googleVertexGenerateContentEndpointForProvider(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    model: []const u8,
+    stream: bool,
+) ![]u8 {
+    const base_url = env.get("PI_ZIG_PROVIDER_BASE_URL") orelse env.get("GOOGLE_VERTEX_BASE_URL") orelse "https://aiplatform.googleapis.com";
+    var end = base_url.len;
+    while (end > 0 and base_url[end - 1] == '/') end -= 1;
+    const trimmed = base_url[0..end];
+    const action = if (stream) "streamGenerateContent?alt=sse" else "generateContent";
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(trimmed);
+    if (!baseUrlPathHasApiVersion(trimmed)) try out.writer.writeAll("/v1");
+    try out.writer.writeByte('/');
+    try writeGoogleVertexModelResource(&out.writer, env, model);
+    try out.writer.print(":{s}", .{action});
+    return out.toOwnedSlice();
+}
+
+fn baseUrlPathHasApiVersion(base_url: []const u8) bool {
+    const scheme_end = std.mem.indexOf(u8, base_url, "://");
+    const path_start = if (scheme_end) |index|
+        (std.mem.indexOfScalarPos(u8, base_url, index + 3, '/') orelse return false)
+    else
+        (std.mem.indexOfScalar(u8, base_url, '/') orelse return false);
+    var segments = std.mem.splitScalar(u8, base_url[path_start + 1 ..], '/');
+    while (segments.next()) |segment| {
+        if (segment.len >= 2 and segment[0] == 'v' and isAllDigits(segment[1..])) return true;
+        if (segment.len >= 6 and std.mem.startsWith(u8, segment, "v") and std.mem.indexOf(u8, segment, "beta") != null) return true;
+    }
+    return false;
+}
+
+fn isAllDigits(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if (byte < '0' or byte > '9') return false;
+    }
+    return true;
+}
+
+fn writeGoogleVertexModelResource(
+    w: *std.Io.Writer,
+    env: *const std.process.Environ.Map,
+    model: []const u8,
+) !void {
+    if (std.mem.startsWith(u8, model, "projects/") or std.mem.startsWith(u8, model, "publishers/")) {
+        return writeUriPathPreservingSlashes(w, model);
+    }
+    const project = env.get("GOOGLE_CLOUD_PROJECT") orelse env.get("GCLOUD_PROJECT");
+    const location = env.get("GOOGLE_CLOUD_LOCATION");
+    if (project) |project_id| {
+        if (location) |location_id| {
+            try w.writeAll("projects/");
+            try writeUriPathSegment(w, project_id);
+            try w.writeAll("/locations/");
+            try writeUriPathSegment(w, location_id);
+            try w.writeAll("/publishers/google/models/");
+            try writeUriPathSegment(w, model);
+            return;
+        }
+    }
+    try w.writeAll("publishers/google/models/");
+    try writeUriPathSegment(w, model);
 }
 
 fn mistralChatEndpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
@@ -2759,6 +2987,16 @@ fn writeUriPathSegment(w: *std.Io.Writer, value: []const u8) !void {
     }
 }
 
+fn writeUriPathPreservingSlashes(w: *std.Io.Writer, value: []const u8) !void {
+    var segments = std.mem.splitScalar(u8, value, '/');
+    var first = true;
+    while (segments.next()) |segment| {
+        if (!first) try w.writeByte('/');
+        first = false;
+        try writeUriPathSegment(w, segment);
+    }
+}
+
 fn stripTrailingCarriageReturn(value: []const u8) []const u8 {
     if (value.len > 0 and value[value.len - 1] == '\r') return value[0 .. value.len - 1];
     return value;
@@ -3300,6 +3538,44 @@ test "Google provider base URL appends stream generate content endpoint" {
     const non_stream_endpoint = try googleGenerateContentEndpointForProvider(std.testing.allocator, &env, "gemini-test", false);
     defer std.testing.allocator.free(non_stream_endpoint);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/v1/models/gemini-test:generateContent", non_stream_endpoint);
+}
+
+test "Google Vertex provider base URL appends express and project generate content endpoints" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put("PI_ZIG_PROVIDER_BASE_URL", "http://127.0.0.1:43123/");
+    const express_endpoint = try googleVertexGenerateContentEndpointForProvider(std.testing.allocator, &env, "gemini-3-flash-preview", true);
+    defer std.testing.allocator.free(express_endpoint);
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:43123/v1/publishers/google/models/gemini-3-flash-preview:streamGenerateContent?alt=sse",
+        express_endpoint,
+    );
+
+    try env.put("GOOGLE_CLOUD_PROJECT", "test-project");
+    try env.put("GOOGLE_CLOUD_LOCATION", "us-central1");
+    const project_endpoint = try googleVertexGenerateContentEndpointForProvider(std.testing.allocator, &env, "gemini-3-flash-preview", false);
+    defer std.testing.allocator.free(project_endpoint);
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:43123/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-3-flash-preview:generateContent",
+        project_endpoint,
+    );
+}
+
+test "Google Vertex auth uses API key or explicit access token for placeholders" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    var api_key_auth = try googleVertexAuthHeader(std.testing.allocator, &env, "AIzaSyExampleRealisticLookingApiKey123456");
+    defer api_key_auth.deinit(std.testing.allocator);
+    try std.testing.expect(api_key_auth.authorization == null);
+    try std.testing.expectEqualStrings("AIzaSyExampleRealisticLookingApiKey123456", api_key_auth.api_key.?);
+
+    try env.put("GOOGLE_CLOUD_ACCESS_TOKEN", "ya29.vertex-token");
+    var bearer_auth = try googleVertexAuthHeader(std.testing.allocator, &env, "<authenticated>");
+    defer bearer_auth.deinit(std.testing.allocator);
+    try std.testing.expect(bearer_auth.api_key == null);
+    try std.testing.expectEqualStrings("Bearer ya29.vertex-token", bearer_auth.authorization.?);
 }
 
 test "Mistral provider base URL appends chat completions endpoint once" {

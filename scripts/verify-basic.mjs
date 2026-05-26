@@ -140,6 +140,67 @@ const server = http.createServer((req, res) => {
       return;
     }
     const requestUrl = new URL(req.url, 'http://127.0.0.1');
+    const isGoogleVertexGenerateContent = req.method === 'POST' &&
+      requestUrl.pathname.includes('/publishers/google/models/') &&
+      (requestUrl.pathname.endsWith(':streamGenerateContent') || requestUrl.pathname.endsWith(':generateContent'));
+    if (isGoogleVertexGenerateContent) {
+      if (req.headers['x-goog-api-key'] !== 'fake-vertex-key') {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing vertex auth', headers: req.headers }));
+        return;
+      }
+      const body = JSON.parse(rawBody);
+      const googlePartText = (part) => part?.text ?? part?.functionResponse?.response?.output ?? part?.functionResponse?.response?.error ?? '';
+      const googleContentText = (content) => Array.isArray(content?.parts)
+        ? content.parts.map(googlePartText).join('\\n')
+        : '';
+      const userText = body.contents?.filter((content) => content.role === 'user').map(googleContentText).join('\\n') ?? '';
+      const functionResponses = body.contents?.flatMap((content) => Array.isArray(content.parts) ? content.parts.filter((part) => part?.functionResponse) : []) ?? [];
+      const hasBashTool = body.tools?.some((tool) => tool?.functionDeclarations?.some((decl) => decl?.name === 'bash' && decl?.parametersJsonSchema?.type === 'object')) ?? false;
+      const writeVertexEvents = (events) => {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'close'
+        });
+        for (const event of events) {
+          res.write('data: ' + JSON.stringify(event) + '\\n\\n');
+        }
+        res.end();
+      };
+      if (userText.includes('native vertex stream tool events')) {
+        if (
+          !requestUrl.pathname.endsWith(':streamGenerateContent') ||
+          !decodeURIComponent(requestUrl.pathname).includes('/v1/publishers/google/models/gemini-3-flash-preview:streamGenerateContent') ||
+          !body.systemInstruction?.parts?.some((part) => part.text) ||
+          !hasBashTool
+        ) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native vertex request shape mismatch', body, pathname: requestUrl.pathname }));
+          return;
+        }
+        if (functionResponses.length === 0) {
+          writeVertexEvents([
+            { candidates: [{ content: { parts: [{ functionCall: { id: 'call_native_vertex_stream_1', name: 'bash', args: { command: 'printf native-vertex-ok' } } }] }, finishReason: 'STOP' }] }
+          ]);
+          return;
+        }
+        const lastResponse = functionResponses.at(-1)?.functionResponse;
+        if (lastResponse?.name !== 'bash' || String(lastResponse?.response?.output ?? '').trim() !== 'native-vertex-ok') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'native Vertex tool result mismatch', functionResponses }));
+          return;
+        }
+        writeVertexEvents([
+          { candidates: [{ content: { parts: [{ text: 'native vertex ' }] } }] },
+          { candidates: [{ content: { parts: [{ text: 'tool complete: native-vertex-ok' }] }, finishReason: 'STOP' }] }
+        ]);
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unknown native vertex request', body, pathname: requestUrl.pathname }));
+      return;
+    }
     const isGoogleGenerateContent = req.method === 'POST' &&
       requestUrl.pathname.includes('/models/') &&
       (requestUrl.pathname.endsWith(':streamGenerateContent') || requestUrl.pathname.endsWith(':generateContent'));
@@ -3080,6 +3141,32 @@ try {
     !providerJsonNativeGoogleToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('native google tool complete: native-google-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not run native Google streamed tool calls');
+  }
+
+  const nativeVertexEnv = {
+    ...envWithoutAnthropicAuth(),
+    GOOGLE_CLOUD_API_KEY: 'fake-vertex-key',
+    PI_ZIG_PROVIDER_BASE_URL: fakeProvider.baseUrl
+  };
+  const providerJsonNativeVertexToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'google-vertex', '--model', 'gemini-3-flash-preview', '-p', 'please run native vertex stream tool events'],
+    undefined,
+    { env: nativeVertexEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonNativeVertexToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_native_vertex_stream_1') ||
+    !providerJsonNativeVertexToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_native_vertex_stream_1' && JSON.stringify(line.partialResult).includes('native-vertex-ok')) ||
+    !providerJsonNativeVertexToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('native-vertex-ok')) ||
+    !providerJsonNativeVertexToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_native_vertex_stream_1')) ||
+    !providerJsonNativeVertexToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'native vertex ') ||
+    !providerJsonNativeVertexToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'tool complete: native-vertex-ok') ||
+    !providerJsonNativeVertexToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('native vertex tool complete: native-vertex-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not run native Google Vertex streamed tool calls');
   }
 
   const nativeMistralEnv = {
