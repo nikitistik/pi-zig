@@ -37,9 +37,20 @@ pub const ChatToolCall = struct {
     }
 };
 
+pub const ChatImageContent = struct {
+    data: []const u8,
+    mime_type: []const u8,
+};
+
+pub const ChatContentPart = union(enum) {
+    text: []const u8,
+    image: ChatImageContent,
+};
+
 pub const ChatMessage = struct {
     role: ChatRole,
     content: []const u8 = "",
+    content_parts: []const ChatContentPart = &.{},
     tool_call_id: ?[]const u8 = null,
     tool_calls: []const ChatToolCall = &.{},
 };
@@ -580,9 +591,35 @@ fn writeMessage(w: *std.Io.Writer, message: ChatMessage) !void {
             }
         }
         try w.writeAll(",\"content\":");
-        try writeJsonString(w, message.content);
+        if (message.content_parts.len > 0) {
+            try writeContentParts(w, message.content_parts);
+        } else {
+            try writeJsonString(w, message.content);
+        }
     }
     try w.writeByte('}');
+}
+
+fn writeContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
+    try w.writeByte('[');
+    for (parts, 0..) |part, index| {
+        if (index != 0) try w.writeByte(',');
+        switch (part) {
+            .text => |text| {
+                try w.writeAll("{\"type\":\"text\",\"text\":");
+                try writeJsonString(w, text);
+                try w.writeByte('}');
+            },
+            .image => |image| {
+                try w.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                try writeJsonStringFragment(w, image.mime_type);
+                try w.writeAll(";base64,");
+                try writeJsonStringFragment(w, image.data);
+                try w.writeAll("\"}}");
+            },
+        }
+    }
+    try w.writeByte(']');
 }
 
 fn writeToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void {
@@ -699,6 +736,27 @@ fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.encodeJsonString(value, .{}, w);
 }
 
+fn writeJsonStringFragment(w: *std.Io.Writer, value: []const u8) !void {
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            0x08 => try w.writeAll("\\b"),
+            0x0c => try w.writeAll("\\f"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            0x00...0x07, 0x0b, 0x0e...0x1f => {
+                const hex = "0123456789abcdef";
+                try w.writeAll("\\u00");
+                try w.writeByte(hex[byte >> 4]);
+                try w.writeByte(hex[byte & 0x0f]);
+            },
+            else => try w.writeByte(byte),
+        }
+    }
+}
+
 fn stripTrailingCarriageReturn(value: []const u8) []const u8 {
     if (value.len > 0 and value[value.len - 1] == '\r') return value[0 .. value.len - 1];
     return value;
@@ -711,6 +769,25 @@ test "parses OpenAI-compatible chat completion text" {
     const text = try parseOpenAICompatibleText(std.testing.allocator, body);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("hello from provider", text);
+}
+
+test "serializes OpenAI-compatible text and image content parts" {
+    const parts = [_]ChatContentPart{
+        .{ .text = "inspect this" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content_parts = parts[0..] },
+    };
+    const payload = try buildPayload(std.testing.allocator, .{
+        .provider = "openai",
+        .model = "mock-image-model",
+        .api_key = "unused",
+        .messages = messages[0..],
+    });
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"content\":[{\"type\":\"text\",\"text\":\"inspect this\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGVsbG8=\"}}]") != null);
 }
 
 test "parses OpenAI-compatible tool calls" {
