@@ -382,6 +382,10 @@ fn parseOpenAICompatibleStreamData(
         }
         return;
     }
+    if (isGoogleStreamChunk(parsed.value)) {
+        try parseGoogleStreamTextDeltas(parsed.value, callback_context, callback);
+        return;
+    }
     const delta = try firstStreamDelta(parsed.value) orelse return;
     const content = delta.object.get("content") orelse return;
     if (content == .null) return;
@@ -404,6 +408,10 @@ fn parseOpenAICompatibleStreamResultData(
     }
     if (isAnthropicStreamEvent(parsed.value)) {
         try accumulator.appendAnthropicStreamEvent(parsed.value, text_callback_context, text_callback);
+        return;
+    }
+    if (isGoogleStreamChunk(parsed.value)) {
+        try accumulator.appendGoogleStreamChunk(parsed.value, text_callback_context, text_callback);
         return;
     }
     const delta = try firstStreamDelta(parsed.value) orelse return;
@@ -448,6 +456,26 @@ fn anthropicStreamTextDelta(value: std.json.Value) !?[]const u8 {
     const delta_type = try requiredObjectString(delta, "type");
     if (!std.mem.eql(u8, delta_type, "text_delta")) return null;
     return try requiredObjectString(delta, "text");
+}
+
+fn isGoogleStreamChunk(value: std.json.Value) bool {
+    if (value != .object) return false;
+    return value.object.get("candidates") != null;
+}
+
+fn parseGoogleStreamTextDeltas(
+    value: std.json.Value,
+    callback_context: *anyopaque,
+    callback: StreamTextCallback,
+) !void {
+    const parts = try firstGoogleCandidateParts(value) orelse return;
+    for (parts) |part| {
+        if (part != .object) return error.ProviderResponseInvalid;
+        if (part.object.get("text")) |text| {
+            if (text != .string) return error.ProviderResponseInvalid;
+            if (text.string.len > 0) try callback(callback_context, text.string);
+        }
+    }
 }
 
 fn firstStreamDelta(value: std.json.Value) !?std.json.Value {
@@ -597,6 +625,25 @@ const StreamChatAccumulator = struct {
         }
     }
 
+    fn appendGoogleStreamChunk(
+        self: *StreamChatAccumulator,
+        value: std.json.Value,
+        text_callback_context: ?*anyopaque,
+        text_callback: ?StreamTextCallback,
+    ) !void {
+        const parts = try firstGoogleCandidateParts(value) orelse return;
+        for (parts) |part| {
+            if (part != .object) return error.ProviderResponseInvalid;
+            if (part.object.get("text")) |text| {
+                if (text != .string) return error.ProviderResponseInvalid;
+                try self.appendTextDelta(text.string, text_callback_context, text_callback);
+            }
+            if (part.object.get("functionCall")) |function_call| {
+                try self.appendGoogleFunctionCall(function_call);
+            }
+        }
+    }
+
     fn appendTextDelta(
         self: *StreamChatAccumulator,
         delta: []const u8,
@@ -688,6 +735,46 @@ const StreamChatAccumulator = struct {
         }
     }
 
+    fn appendGoogleFunctionCall(self: *StreamChatAccumulator, function_call: std.json.Value) !void {
+        if (function_call != .object) return error.ProviderResponseInvalid;
+        const index = self.tool_calls.items.len;
+        const call = try self.ensureToolCall(index);
+        call.seen = true;
+
+        const name = optionalObjectString(function_call, "name") catch |err| return err;
+        const actual_name = name orelse "";
+        if (actual_name.len == 0) return error.ProviderResponseInvalid;
+
+        if (try optionalObjectString(function_call, "id")) |provided_id| {
+            if (provided_id.len > 0 and !self.hasToolCallId(provided_id)) {
+                try call.id.writer.writeAll(provided_id);
+            }
+        }
+        if (call.id.written().len == 0) {
+            try call.id.writer.print("{s}_google_{d}", .{ actual_name, index + 1 });
+        }
+        try call.name.writer.writeAll(actual_name);
+
+        if (function_call.object.get("args")) |args| {
+            if (args == .null) {
+                try call.arguments_json.writer.writeAll("{}");
+            } else {
+                const arguments_json = try jsonValueToOwnedString(self.allocator, args);
+                defer self.allocator.free(arguments_json);
+                try call.arguments_json.writer.writeAll(arguments_json);
+            }
+        } else {
+            try call.arguments_json.writer.writeAll("{}");
+        }
+    }
+
+    fn hasToolCallId(self: *StreamChatAccumulator, id: []const u8) bool {
+        for (self.tool_calls.items) |*call| {
+            if (std.mem.eql(u8, call.id.written(), id)) return true;
+        }
+        return false;
+    }
+
     fn ensureToolCall(self: *StreamChatAccumulator, index: usize) !*StreamToolCallAccumulator {
         while (self.tool_calls.items.len <= index) {
             try self.tool_calls.append(self.allocator, StreamToolCallAccumulator.init(self.allocator));
@@ -769,6 +856,20 @@ fn isResponseFunctionCallItem(item: std.json.Value) !bool {
     const item_type = item.object.get("type") orelse return false;
     if (item_type != .string) return error.ProviderResponseInvalid;
     return std.mem.eql(u8, item_type.string, "function_call");
+}
+
+fn firstGoogleCandidateParts(value: std.json.Value) !?[]std.json.Value {
+    if (value != .object) return error.ProviderResponseInvalid;
+    const candidates = value.object.get("candidates") orelse return null;
+    if (candidates != .array) return error.ProviderResponseInvalid;
+    if (candidates.array.items.len == 0) return null;
+    const first = candidates.array.items[0];
+    if (first != .object) return error.ProviderResponseInvalid;
+    const content = first.object.get("content") orelse return null;
+    if (content != .object) return error.ProviderResponseInvalid;
+    const parts = content.object.get("parts") orelse return null;
+    if (parts != .array) return error.ProviderResponseInvalid;
+    return parts.array.items;
 }
 
 fn anthropicEventIndex(value: std.json.Value) !usize {
@@ -1152,6 +1253,36 @@ test "assembles Anthropic tool use stream events" {
     try std.testing.expectEqualStrings("call_anthropic", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"command\":\"printf anthropic-ok\"}", result.tool_calls[0].arguments_json);
+}
+
+test "assembles Google text stream chunks" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"candidates":[{"content":{"parts":[{"text":"google "}]}}]}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"candidates":[{"content":{"parts":[{"text":"text"}]},"finishReason":"STOP"}]}
+    , &accumulator, null, null);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("google text", result.text.?);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+}
+
+test "assembles Google function call stream chunks" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_google","name":"bash","args":{"command":"printf google-ok"}}}]},"finishReason":"STOP"}]}
+    , &accumulator, null, null);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.text == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_google", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf google-ok\"}", result.tool_calls[0].arguments_json);
 }
 
 test "provider base URL appends chat completions endpoint" {

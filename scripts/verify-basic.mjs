@@ -232,6 +232,47 @@ const server = http.createServer((req, res) => {
       ]);
       return;
     }
+    if (user.includes('google stream tool events')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected streaming request' }));
+        return;
+      }
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          {
+            candidates: [{
+              content: {
+                parts: [{ functionCall: { id: 'call_google_stream_1', name: 'bash', args: { command: 'printf google-tool-ok' } } }]
+              },
+              finishReason: 'STOP'
+            }]
+          }
+        ]);
+        return;
+      }
+      if (toolMessages.at(-1).tool_call_id !== 'call_google_stream_1') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Google tool result did not preserve tool_call_id', toolMessages }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolOutput !== 'google-tool-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unexpected Google tool output', toolOutput }));
+        return;
+      }
+      writeStreamEvents([
+        { candidates: [{ content: { parts: [{ text: 'google stream ' }] } }] },
+        { candidates: [{ content: { parts: [{ text: 'tool complete: ' + toolOutput }] }, finishReason: 'STOP' }] }
+      ]);
+      return;
+    }
     if (user.includes('streaming tool loop')) {
       if (body.stream !== true) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2657,6 +2698,27 @@ try {
     !providerJsonAnthropicToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('anthropic stream tool complete: anthropic-tool-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not assemble Anthropic streamed tool calls');
+  }
+
+  const providerJsonGoogleToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-google-tool-model', '-p', 'please run google stream tool events'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonGoogleToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_google_stream_1') ||
+    !providerJsonGoogleToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_google_stream_1' && JSON.stringify(line.partialResult).includes('google-tool-ok')) ||
+    !providerJsonGoogleToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('google-tool-ok')) ||
+    !providerJsonGoogleToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_google_stream_1')) ||
+    !providerJsonGoogleToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'google stream ') ||
+    !providerJsonGoogleToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'tool complete: google-tool-ok') ||
+    !providerJsonGoogleToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('google stream tool complete: google-tool-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not assemble Google streamed tool calls');
   }
 
   const providerJsonToolErrorLines = run(
