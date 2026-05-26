@@ -9,6 +9,7 @@ pub const BeforeToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.C
 pub const AfterToolCallCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall, result: ToolResult) anyerror!AfterToolCallResult;
 pub const PrepareNextTurnCallback = *const fn (ctx: *anyopaque, turn: TurnContext) anyerror!PrepareNextTurnResult;
 pub const ShouldStopAfterTurnCallback = *const fn (ctx: *anyopaque, turn: TurnContext) anyerror!bool;
+pub const CancellationCallback = *const fn (ctx: *anyopaque) bool;
 
 pub const RunOptions = struct {
     provider: []const u8,
@@ -29,6 +30,8 @@ pub const RunOptions = struct {
     turn_lifecycle_context: ?*anyopaque = null,
     prepare_next_turn: ?PrepareNextTurnCallback = null,
     should_stop_after_turn: ?ShouldStopAfterTurnCallback = null,
+    cancellation_context: ?*anyopaque = null,
+    should_cancel: ?CancellationCallback = null,
     text_event_context: ?*anyopaque = null,
     on_text_delta: ?TextDeltaCallback = null,
 };
@@ -280,6 +283,7 @@ pub fn runPrompt(
     defer if (active_api_key) |api_key| allocator.free(api_key);
     var turn: usize = 0;
     while (turn < options.max_turns) : (turn += 1) {
+        try checkCancellation(options);
         const borrowed = try borrowMessages(allocator, messages.items);
         defer allocator.free(borrowed);
 
@@ -295,6 +299,7 @@ pub fn runPrompt(
         else
             try ai_client.runChatTurn(io, allocator, env, request);
         defer response.deinit(allocator);
+        try checkCancellation(options);
 
         if (response.tool_calls.len == 0) {
             const text = if (response.text) |value| value else try allocator.dupe(u8, "");
@@ -313,11 +318,13 @@ pub fn runPrompt(
         var terminating_results: usize = 0;
         const batch_results_start = tool_results.items.len;
         for (tool_calls) |call| {
+            try checkCancellation(options);
             if (options.on_tool_start) |callback| {
                 if (options.tool_event_context) |context| try callback(context, call);
             }
             var tool_execution = try executeToolCallWithHooks(io, allocator, call, options);
             errdefer tool_execution.deinit(allocator);
+            try checkCancellation(options);
             const tool_call_id = try allocator.dupe(u8, call.id);
             errdefer allocator.free(tool_call_id);
             const trace_call: ai_client.ChatToolCall = .{
@@ -351,6 +358,7 @@ pub fn runPrompt(
             .provider = active_provider orelse options.provider,
             .model = active_model orelse options.model,
         }, &active_provider, &active_model, &active_api_key);
+        try checkCancellation(options);
         if (should_stop) {
             return .{
                 .final_text = try allocator.dupe(u8, ""),
@@ -520,6 +528,14 @@ fn replaceOwnedString(allocator: std.mem.Allocator, target: *?[]u8, value: []u8)
     target.* = value;
 }
 
+fn checkCancellation(options: RunOptions) !void {
+    if (options.should_cancel) |callback| {
+        if (options.cancellation_context) |context| {
+            if (callback(context)) return error.AgentAborted;
+        }
+    }
+}
+
 fn createToolResultTrace(
     allocator: std.mem.Allocator,
     call: ai_client.ChatToolCall,
@@ -548,6 +564,7 @@ fn executeToolCallWithHooks(
     call: ai_client.ChatToolCall,
     options: RunOptions,
 ) !ToolExecutionResult {
+    try checkCancellation(options);
     if (!isImplementedTool(call.name)) return executeToolCall(io, allocator, call);
 
     var effective_call = call;
@@ -566,6 +583,7 @@ fn executeToolCallWithHooks(
                 return toolError(try allocator.dupe(u8, reason));
             }
 
+            try checkCancellation(options);
             if (before_result.arguments_json) |arguments_json| {
                 effective_call.arguments_json = arguments_json;
                 overridden_arguments_json = arguments_json;
@@ -574,8 +592,10 @@ fn executeToolCallWithHooks(
         }
     }
 
+    try checkCancellation(options);
     var result = try executeToolCall(io, allocator, effective_call);
     errdefer result.deinit(allocator);
+    try checkCancellation(options);
 
     if (options.after_tool_call) |callback| {
         if (options.tool_hook_context) |context| {
@@ -608,6 +628,7 @@ fn executeToolCallWithHooks(
         }
     }
 
+    try checkCancellation(options);
     result.arguments_json = overridden_arguments_json;
     overridden_arguments_json = null;
     return result;
@@ -1067,4 +1088,80 @@ test "prepare next turn inserts a system prompt when the transcript has none" {
     try std.testing.expect(messages.items[0].role == .system);
     try std.testing.expect(messages.items[1].role == .user);
     try std.testing.expectEqualStrings("inserted system", messages.items[0].content);
+}
+
+test "agent run checks cancellation before provider requests" {
+    const CancelContext = struct {
+        checks: usize = 0,
+    };
+    const Hooks = struct {
+        fn shouldCancel(ctx_ptr: *anyopaque) bool {
+            const ctx: *CancelContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.checks += 1;
+            return true;
+        }
+    };
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var ctx = CancelContext{};
+
+    const result = runPrompt(std.testing.io, std.testing.allocator, &env, .{
+        .provider = "openai",
+        .model = "cancel-model",
+        .api_key = "fake-key",
+        .prompt = "should not reach provider",
+        .cancellation_context = &ctx,
+        .should_cancel = Hooks.shouldCancel,
+    });
+
+    try std.testing.expectError(error.AgentAborted, result);
+    try std.testing.expectEqual(@as(usize, 1), ctx.checks);
+}
+
+test "tool execution checks cancellation after before hook before executing" {
+    const CancelContext = struct {
+        allocator: std.mem.Allocator,
+        checks: usize = 0,
+        before_calls: usize = 0,
+    };
+    const Hooks = struct {
+        fn shouldCancel(ctx_ptr: *anyopaque) bool {
+            const ctx: *CancelContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.checks += 1;
+            return ctx.checks >= 2;
+        }
+
+        fn before(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall) anyerror!BeforeToolCallResult {
+            const ctx: *CancelContext = @ptrCast(@alignCast(ctx_ptr));
+            ctx.before_calls += 1;
+            try std.testing.expectEqualStrings("bash", call.name);
+            return .{
+                .arguments_json = try ctx.allocator.dupe(u8, "{\"command\":\"printf should-not-run\"}"),
+            };
+        }
+    };
+
+    var ctx = CancelContext{ .allocator = std.testing.allocator };
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_cancel_after_before"),
+        .name = try std.testing.allocator.dupe(u8, "bash"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"command\":\"printf original\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = executeToolCallWithHooks(std.testing.io, std.testing.allocator, call, .{
+        .provider = "",
+        .model = "",
+        .api_key = "",
+        .prompt = "",
+        .tool_hook_context = &ctx,
+        .before_tool_call = Hooks.before,
+        .cancellation_context = &ctx,
+        .should_cancel = Hooks.shouldCancel,
+    });
+
+    try std.testing.expectError(error.AgentAborted, result);
+    try std.testing.expectEqual(@as(usize, 2), ctx.checks);
+    try std.testing.expectEqual(@as(usize, 1), ctx.before_calls);
 }
