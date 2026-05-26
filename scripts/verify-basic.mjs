@@ -1659,6 +1659,23 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
       return;
     }
+    if (user.includes('rpc retry body overloaded')) {
+      const count = (requestCounts.get(user) ?? 0) + 1;
+      requestCounts.set(user, count);
+      if (count === 1) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'provider returned error: upstream connect reset before headers' } }));
+        return;
+      }
+      const content = 'rpc retry body overloaded recovered';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
     if (user.includes('rpc retry abort delay')) {
       const count = (requestCounts.get(user) ?? 0) + 1;
       requestCounts.set(user, count);
@@ -1674,6 +1691,18 @@ const server = http.createServer((req, res) => {
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
+    if (user.includes('rpc retry context overflow')) {
+      const count = (requestCounts.get(user) ?? 0) + 1;
+      requestCounts.set(user, count);
+      if (count > 1) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: 'context overflow was retried' } }] }));
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Your input exceeds the context window of this model' } }));
       return;
     }
     if (user.includes('rpc retry exhausted')) {
@@ -5247,6 +5276,42 @@ export default function(pi: any): void {
     throw new Error('rpc provider retry smoke did not recover from a transient provider failure');
   }
 
+  const rpcProviderRetryBodyOutput = run(
+    ['rpc', path.resolve('zig-out/pi-zig-rpc-provider-retry-body-smoke.jsonl')],
+    [
+      JSON.stringify({ id: 'rpc-retry-body-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-retry-body-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
+      JSON.stringify({ id: 'rpc-retry-body-prompt', type: 'prompt', message: 'rpc retry body overloaded' }),
+      JSON.stringify({ id: 'rpc-retry-body-state', type: 'get_state' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderRetryBodyResponses = rpcProviderRetryBodyOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderRetryBodyPrompt = rpcProviderRetryBodyResponses.find((response) => response.id === 'rpc-retry-body-prompt');
+  const rpcProviderRetryBodyState = rpcProviderRetryBodyResponses.find((response) => response.id === 'rpc-retry-body-state');
+  const rpcProviderRetryBodyEventSummary = rpcProviderRetryBodyResponses
+    .filter((response) => ['agent_end', 'auto_retry_start', 'auto_retry_end'].includes(response.type))
+    .map((response) => {
+      if (response.type === 'agent_end') return `agent_end:${response.willRetry}`;
+      if (response.type === 'auto_retry_start') return `auto_retry_start:${response.attempt}:${response.maxAttempts}:${response.delayMs}:${response.errorMessage}`;
+      return `auto_retry_end:${response.success}:${response.attempt}`;
+    });
+  if (
+    !rpcProviderRetryBodyPrompt?.success ||
+    rpcProviderRetryBodyPrompt?.data?.text !== 'rpc retry body overloaded recovered' ||
+    rpcProviderRetryBodyPrompt?.data?.retry?.attempts !== 1 ||
+    rpcProviderRetryBodyState?.data?.lastRetryAttempts !== 1 ||
+    JSON.stringify(rpcProviderRetryBodyEventSummary) !== JSON.stringify([
+      'agent_end:true',
+      'auto_retry_start:1:2:0:ProviderRequestFailed',
+      'auto_retry_end:true:1',
+      'agent_end:false'
+    ])
+  ) {
+    throw new Error('rpc provider retry body-text smoke did not recover from retryable provider error text');
+  }
+
   const rpcProviderRetryExhaustedOutput = run(
     ['rpc', path.resolve('zig-out/pi-zig-rpc-provider-retry-exhausted-smoke.jsonl')],
     [
@@ -5282,6 +5347,30 @@ export default function(pi: any): void {
     ])
   ) {
     throw new Error('rpc provider retry exhaustion smoke did not emit upstream-shaped retry events');
+  }
+
+  const rpcProviderRetryContextOutput = run(
+    ['rpc', path.resolve('zig-out/pi-zig-rpc-provider-retry-context-overflow-smoke.jsonl')],
+    [
+      JSON.stringify({ id: 'rpc-retry-context-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-retry-context-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
+      JSON.stringify({ id: 'rpc-retry-context-prompt', type: 'prompt', message: 'rpc retry context overflow' }),
+      JSON.stringify({ id: 'rpc-retry-context-state', type: 'get_state' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderRetryContextResponses = rpcProviderRetryContextOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderRetryContextPrompt = rpcProviderRetryContextResponses.find((response) => response.id === 'rpc-retry-context-prompt');
+  const rpcProviderRetryContextState = rpcProviderRetryContextResponses.find((response) => response.id === 'rpc-retry-context-state');
+  if (
+    rpcProviderRetryContextPrompt?.success !== false ||
+    rpcProviderRetryContextPrompt?.error !== 'ProviderClientError' ||
+    rpcProviderRetryContextState?.data?.lastRetryAttempts !== 0 ||
+    rpcProviderRetryContextResponses.some((response) => response.type === 'auto_retry_start' || response.type === 'auto_retry_end') ||
+    JSON.stringify(rpcProviderRetryContextResponses).includes('context overflow was retried')
+  ) {
+    throw new Error('rpc provider retry context-overflow smoke retried a compaction-class error');
   }
 
   const rpcProviderRetryClientErrorOutput = run(

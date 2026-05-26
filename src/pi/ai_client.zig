@@ -92,13 +92,127 @@ pub const ChatCompletionError = error{
 
 pub const StreamTextCallback = *const fn (ctx: *anyopaque, delta: []const u8) anyerror!void;
 const StreamDataCallback = *const fn (ctx: *anyopaque, data: []const u8) anyerror!void;
+const max_provider_error_body_bytes = 16 * 1024;
 
 fn providerErrorForStatus(status: std.http.Status) ChatCompletionError {
+    return providerErrorForStatusAndBody(status, "");
+}
+
+fn providerErrorForStatusAndBody(status: std.http.Status, body: []const u8) ChatCompletionError {
     const code = @intFromEnum(status);
-    return if (code == 429 or code >= 500)
+    if (isContextOverflowErrorText(body)) return error.ProviderClientError;
+    return if (code == 429 or code >= 500 or isRetryableProviderErrorText(body))
         error.ProviderRequestFailed
     else
         error.ProviderClientError;
+}
+
+fn providerErrorForStatusAndReader(allocator: std.mem.Allocator, status: std.http.Status, reader: *std.Io.Reader) ChatCompletionError {
+    const body = reader.allocRemaining(allocator, .limited(max_provider_error_body_bytes)) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => providerErrorForStatus(status),
+        };
+    };
+    defer allocator.free(body);
+    return providerErrorForStatusAndBody(status, body);
+}
+
+fn isRetryableProviderErrorText(text: []const u8) bool {
+    return containsAsciiIgnoreCase(text, "overloaded") or
+        containsWordsInOrderIgnoreCase(text, &.{ "throttling", "error" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "provider", "returned", "error" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "rate", "limit" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "too", "many", "requests" }) or
+        containsAsciiIgnoreCase(text, "429") or
+        containsAsciiIgnoreCase(text, "500") or
+        containsAsciiIgnoreCase(text, "502") or
+        containsAsciiIgnoreCase(text, "503") or
+        containsAsciiIgnoreCase(text, "504") or
+        containsWordsInOrderIgnoreCase(text, &.{ "service", "unavailable" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "server", "error" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "internal", "error" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "network", "error" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "connection", "error" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "connection", "refused" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "connection", "lost" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "websocket", "closed" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "websocket", "error" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "other", "side", "closed" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "fetch", "failed" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "upstream", "connect" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "reset", "before", "headers" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "socket", "hang", "up" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "ended", "without" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "stream", "ended", "before", "message_stop" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "http2", "request", "did", "not", "get", "a", "response" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "timed", "out" }) or
+        containsAsciiIgnoreCase(text, "timeout") or
+        containsAsciiIgnoreCase(text, "terminated") or
+        containsWordsInOrderIgnoreCase(text, &.{ "retry", "delay" });
+}
+
+fn isContextOverflowErrorText(text: []const u8) bool {
+    if (isKnownNonOverflowProviderErrorText(text)) return false;
+    return containsWordsInOrderIgnoreCase(text, &.{ "prompt", "too", "long" }) or
+        containsAsciiIgnoreCase(text, "request_too_large") or
+        containsWordsInOrderIgnoreCase(text, &.{ "input", "too", "long", "requested", "model" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "exceeds", "context", "window" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "exceeds", "maximum", "context", "length" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "input", "token", "count", "exceeds", "maximum" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "maximum", "prompt", "length", "is" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "reduce", "length", "messages" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "maximum", "context", "length", "is" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "longer", "model", "context", "length" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "exceeds", "limit" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "exceeds", "available", "context", "size" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "greater", "than", "context", "length" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "context", "window", "exceeds", "limit" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "exceeded", "model", "token", "limit" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "too", "large", "model", "maximum", "context", "length" }) or
+        containsAsciiIgnoreCase(text, "model_context_window_exceeded") or
+        containsWordsInOrderIgnoreCase(text, &.{ "prompt", "too", "long", "context", "length" }) or
+        containsAsciiIgnoreCase(text, "context_length_exceeded") or
+        containsWordsInOrderIgnoreCase(text, &.{ "context", "length", "exceeded" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "too", "many", "tokens" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "token", "limit", "exceeded" });
+}
+
+fn isKnownNonOverflowProviderErrorText(text: []const u8) bool {
+    return containsWordsInOrderIgnoreCase(text, &.{ "throttling", "error" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "service", "unavailable" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "rate", "limit" }) or
+        containsWordsInOrderIgnoreCase(text, &.{ "too", "many", "requests" });
+}
+
+fn containsWordsInOrderIgnoreCase(text: []const u8, words: []const []const u8) bool {
+    var start: usize = 0;
+    for (words) |word| {
+        const found = indexOfAsciiIgnoreCase(text[start..], word) orelse return false;
+        start += found + word.len;
+    }
+    return true;
+}
+
+fn containsAsciiIgnoreCase(text: []const u8, needle: []const u8) bool {
+    return indexOfAsciiIgnoreCase(text, needle) != null;
+}
+
+fn indexOfAsciiIgnoreCase(text: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > text.len) return null;
+    var index: usize = 0;
+    while (index + needle.len <= text.len) : (index += 1) {
+        var matched = true;
+        for (needle, 0..) |expected, offset| {
+            if (std.ascii.toLower(text[index + offset]) != std.ascii.toLower(expected)) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return index;
+    }
+    return null;
 }
 
 pub fn runChatCompletion(
@@ -190,7 +304,7 @@ pub fn runChatTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return providerErrorForStatus(result.status);
+        return providerErrorForStatusAndBody(result.status, body);
     }
 
     return parseOpenAICompatibleResult(allocator, body);
@@ -304,8 +418,7 @@ fn streamChatTurnData(
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
-        _ = reader.discardRemaining() catch {};
-        return providerErrorForStatus(response.head.status);
+        return providerErrorForStatusAndReader(allocator, response.head.status, reader);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -425,7 +538,7 @@ fn runAnthropicMessagesTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return providerErrorForStatus(result.status);
+        return providerErrorForStatusAndBody(result.status, body);
     }
 
     return parseAnthropicMessagesResult(allocator, body);
@@ -481,8 +594,7 @@ fn streamAnthropicMessagesData(
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
-        _ = reader.discardRemaining() catch {};
-        return providerErrorForStatus(response.head.status);
+        return providerErrorForStatusAndReader(allocator, response.head.status, reader);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -531,7 +643,7 @@ fn runGoogleGenerateContentTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return providerErrorForStatus(result.status);
+        return providerErrorForStatusAndBody(result.status, body);
     }
 
     return parseGoogleGenerateContentResult(allocator, body);
@@ -585,8 +697,7 @@ fn streamGoogleGenerateContentData(
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
-        _ = reader.discardRemaining() catch {};
-        return providerErrorForStatus(response.head.status);
+        return providerErrorForStatusAndReader(allocator, response.head.status, reader);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -638,7 +749,7 @@ fn runGoogleVertexGenerateContentTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return providerErrorForStatus(result.status);
+        return providerErrorForStatusAndBody(result.status, body);
     }
 
     return parseGoogleGenerateContentResult(allocator, body);
@@ -695,8 +806,7 @@ fn streamGoogleVertexGenerateContentData(
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
-        _ = reader.discardRemaining() catch {};
-        return providerErrorForStatus(response.head.status);
+        return providerErrorForStatusAndReader(allocator, response.head.status, reader);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -744,7 +854,7 @@ fn runMistralChatTurn(
 
     const body = response_body.written();
     if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
-        return providerErrorForStatus(result.status);
+        return providerErrorForStatusAndBody(result.status, body);
     }
 
     return parseOpenAICompatibleResult(allocator, body);
@@ -797,8 +907,7 @@ fn streamMistralChatData(
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
-        _ = reader.discardRemaining() catch {};
-        return providerErrorForStatus(response.head.status);
+        return providerErrorForStatusAndReader(allocator, response.head.status, reader);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -881,8 +990,7 @@ fn streamBedrockConverseData(
     if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
         var transfer_buffer: [1024]u8 = undefined;
         const reader = response.reader(&transfer_buffer);
-        _ = reader.discardRemaining() catch {};
-        return providerErrorForStatus(response.head.status);
+        return providerErrorForStatusAndReader(allocator, response.head.status, reader);
     }
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
@@ -3203,6 +3311,41 @@ test "parses OpenAI-compatible chat completion text" {
     const text = try parseOpenAICompatibleText(std.testing.allocator, body);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("hello from provider", text);
+}
+
+test "classifies retryable provider error text without retrying context overflow" {
+    try std.testing.expectEqual(error.ProviderRequestFailed, providerErrorForStatusAndBody(
+        .bad_request,
+        "{\"error\":{\"message\":\"provider returned error: upstream connect reset before headers\"}}",
+    ));
+    try std.testing.expectEqual(error.ProviderRequestFailed, providerErrorForStatusAndBody(
+        .bad_request,
+        "{\"error\":{\"message\":\"rate limit: too many requests\"}}",
+    ));
+    try std.testing.expectEqual(error.ProviderRequestFailed, providerErrorForStatusAndBody(
+        .bad_request,
+        "{\"error\":{\"message\":\"Throttling error: Too many tokens, please wait before trying again.\"}}",
+    ));
+    try std.testing.expectEqual(error.ProviderRequestFailed, providerErrorForStatusAndBody(
+        .too_many_requests,
+        "{\"error\":\"ordinary 429\"}",
+    ));
+    try std.testing.expectEqual(error.ProviderRequestFailed, providerErrorForStatusAndBody(
+        .service_unavailable,
+        "{\"error\":\"temporary outage\"}",
+    ));
+    try std.testing.expectEqual(error.ProviderClientError, providerErrorForStatusAndBody(
+        .bad_request,
+        "{\"error\":{\"message\":\"Your input exceeds the context window of this model\"}}",
+    ));
+    try std.testing.expectEqual(error.ProviderClientError, providerErrorForStatusAndBody(
+        .payload_too_large,
+        "{\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}",
+    ));
+    try std.testing.expectEqual(error.ProviderClientError, providerErrorForStatusAndBody(
+        .bad_request,
+        "{\"error\":\"bad user request\"}",
+    ));
 }
 
 test "serializes OpenAI-compatible text and image content parts" {
