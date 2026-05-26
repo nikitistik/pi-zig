@@ -204,6 +204,47 @@ const server = http.createServer((req, res) => {
       }));
       return;
     }
+    if (user.includes('failing read loop')) {
+      if (!hasTool('read')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing read tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_failing_read_1',
+                type: 'function',
+                function: {
+                  name: 'read',
+                  arguments: JSON.stringify({ path: 'zig-out/pi-zig-missing-provider-read.txt' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (!toolOutput.includes('read tool failed:')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected read failure tool output', toolOutput }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            content: 'failing read loop complete: ' + toolOutput
+          }
+        }]
+      }));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       choices: [{
@@ -1844,6 +1885,23 @@ try {
     !providerJsonToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('tool loop complete: tool-loop-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not emit provider-backed tool execution events');
+  }
+
+  const providerJsonToolErrorLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-tool-error-model', '-p', 'please run the failing read loop'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonToolErrorLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'read' && line.isError === true && JSON.stringify(line.result).includes('read tool failed:')) ||
+    !providerJsonToolErrorLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_failing_read_1' && result.isError === true)) ||
+    !providerJsonToolErrorLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('failing read loop complete: read tool failed:'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not mark failed provider tool execution as an error');
   }
 
   const providerToolLoop = run(

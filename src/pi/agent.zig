@@ -71,6 +71,11 @@ pub const ToolResult = struct {
     }
 };
 
+const ToolExecutionResult = struct {
+    content: []u8,
+    is_error: bool = false,
+};
+
 pub const AgentError = anyerror;
 
 const bash_parameters_json =
@@ -220,16 +225,16 @@ pub fn runPrompt(
         response.tool_calls = &.{};
 
         for (tool_calls) |call| {
-            const tool_output = try executeToolCall(io, allocator, call);
-            errdefer allocator.free(tool_output);
+            const tool_execution = try executeToolCall(io, allocator, call);
+            errdefer allocator.free(tool_execution.content);
             const tool_call_id = try allocator.dupe(u8, call.id);
             errdefer allocator.free(tool_call_id);
-            const traced_tool_result = try createToolResultTrace(allocator, call, tool_output);
+            const traced_tool_result = try createToolResultTrace(allocator, call, tool_execution.content, tool_execution.is_error);
             errdefer traced_tool_result.deinit(allocator);
             try tool_results.append(allocator, traced_tool_result);
             try messages.append(allocator, .{
                 .role = .tool,
-                .content = tool_output,
+                .content = tool_execution.content,
                 .tool_call_id = tool_call_id,
             });
             tool_results_count += 1;
@@ -279,12 +284,14 @@ fn createToolResultTrace(
     allocator: std.mem.Allocator,
     call: ai_client.ChatToolCall,
     content: []const u8,
+    is_error: bool,
 ) !ToolResult {
     var result: ToolResult = .{
         .tool_call_id = try allocator.dupe(u8, call.id),
         .tool_name = &.{},
         .arguments_json = &.{},
         .content = &.{},
+        .is_error = is_error,
     };
     errdefer result.deinit(allocator);
     result.tool_name = try allocator.dupe(u8, call.name);
@@ -297,7 +304,7 @@ fn executeToolCall(
     io: std.Io,
     allocator: std.mem.Allocator,
     call: ai_client.ChatToolCall,
-) ![]u8 {
+) !ToolExecutionResult {
     if (std.mem.eql(u8, call.name, "read")) return executeReadTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "bash")) return executeBashTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "edit")) return executeEditTool(io, allocator, call.arguments_json);
@@ -305,101 +312,110 @@ fn executeToolCall(
     if (std.mem.eql(u8, call.name, "grep")) return executeGrepTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "find")) return executeFindTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "ls")) return executeLsTool(io, allocator, call.arguments_json);
-    return std.fmt.allocPrint(allocator, "Tool {s} is not implemented in pi-zig yet.", .{call.name});
+    return toolError(try std.fmt.allocPrint(allocator, "Tool {s} is not implemented in pi-zig yet.", .{call.name}));
 }
 
-fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    var parsed = parseArguments(allocator, "read", arguments_json) catch |err| return invalidJsonMessage(allocator, "read", err);
+fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
+    var parsed = parseArguments(allocator, "read", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "read", err));
     defer parsed.deinit();
-    const path = requiredString(parsed.value, "path") orelse return allocator.dupe(u8, "read tool arguments are missing path.");
-    const offset = optionalUsize(parsed.value, "offset") catch return allocator.dupe(u8, "read tool offset must be a non-negative number.");
-    const limit = optionalUsize(parsed.value, "limit") catch return allocator.dupe(u8, "read tool limit must be a non-negative number.");
-    return tools.readFileForToolText(io, allocator, path, offset, limit) catch |err| {
-        return std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)});
+    const path = requiredString(parsed.value, "path") orelse return toolError(try allocator.dupe(u8, "read tool arguments are missing path."));
+    const offset = optionalUsize(parsed.value, "offset") catch return toolError(try allocator.dupe(u8, "read tool offset must be a non-negative number."));
+    const limit = optionalUsize(parsed.value, "limit") catch return toolError(try allocator.dupe(u8, "read tool limit must be a non-negative number."));
+    const content = tools.readFileForToolText(io, allocator, path, offset, limit) catch |err| {
+        return toolError(try std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)}));
     };
+    return toolOk(content);
 }
 
-fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    var parsed = parseArguments(allocator, "bash", arguments_json) catch |err| return invalidJsonMessage(allocator, "bash", err);
+fn executeBashTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
+    var parsed = parseArguments(allocator, "bash", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "bash", err));
     defer parsed.deinit();
 
-    if (parsed.value != .object) return allocator.dupe(u8, "bash tool arguments must be a JSON object.");
-    const command = requiredString(parsed.value, "command") orelse return allocator.dupe(u8, "bash tool arguments are missing command.");
+    if (parsed.value != .object) return toolError(try allocator.dupe(u8, "bash tool arguments must be a JSON object."));
+    const command = requiredString(parsed.value, "command") orelse return toolError(try allocator.dupe(u8, "bash tool arguments are missing command."));
 
     const shell_result = tools.runShellCapture(io, allocator, command) catch |err| {
-        return std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)});
+        return toolError(try std.fmt.allocPrint(allocator, "bash tool failed before execution: {s}", .{@errorName(err)}));
     };
     defer allocator.free(shell_result.output);
 
-    return allocator.dupe(u8, shell_result.output);
+    return .{
+        .content = try allocator.dupe(u8, shell_result.output),
+        .is_error = shell_result.exit_code == null or shell_result.exit_code.? != 0,
+    };
 }
 
-fn executeEditTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    var parsed = parseArguments(allocator, "edit", arguments_json) catch |err| return invalidJsonMessage(allocator, "edit", err);
+fn executeEditTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
+    var parsed = parseArguments(allocator, "edit", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "edit", err));
     defer parsed.deinit();
-    const path = requiredString(parsed.value, "path") orelse return allocator.dupe(u8, "edit tool arguments are missing path.");
-    const edits_value = fieldValue(parsed.value, "edits") orelse return allocator.dupe(u8, "edit tool arguments are missing edits.");
-    if (edits_value != .array) return allocator.dupe(u8, "edit tool edits must be an array.");
+    const path = requiredString(parsed.value, "path") orelse return toolError(try allocator.dupe(u8, "edit tool arguments are missing path."));
+    const edits_value = fieldValue(parsed.value, "edits") orelse return toolError(try allocator.dupe(u8, "edit tool arguments are missing edits."));
+    if (edits_value != .array) return toolError(try allocator.dupe(u8, "edit tool edits must be an array."));
 
     var edit_replacements: std.ArrayList(tools.EditReplacement) = .empty;
     defer edit_replacements.deinit(allocator);
     for (edits_value.array.items) |edit_value| {
-        if (edit_value != .object) return allocator.dupe(u8, "edit tool edits entries must be objects.");
-        const old_text = requiredString(edit_value, "oldText") orelse return allocator.dupe(u8, "edit tool edit is missing oldText.");
-        const new_text = requiredString(edit_value, "newText") orelse return allocator.dupe(u8, "edit tool edit is missing newText.");
+        if (edit_value != .object) return toolError(try allocator.dupe(u8, "edit tool edits entries must be objects."));
+        const old_text = requiredString(edit_value, "oldText") orelse return toolError(try allocator.dupe(u8, "edit tool edit is missing oldText."));
+        const new_text = requiredString(edit_value, "newText") orelse return toolError(try allocator.dupe(u8, "edit tool edit is missing newText."));
         try edit_replacements.append(allocator, .{ .old_text = old_text, .new_text = new_text });
     }
-    return tools.editFileManyText(io, allocator, path, edit_replacements.items) catch |err| {
-        return std.fmt.allocPrint(allocator, "edit tool failed: {s}", .{@errorName(err)});
+    const content = tools.editFileManyText(io, allocator, path, edit_replacements.items) catch |err| {
+        return toolError(try std.fmt.allocPrint(allocator, "edit tool failed: {s}", .{@errorName(err)}));
     };
+    return toolOk(content);
 }
 
-fn executeWriteTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    var parsed = parseArguments(allocator, "write", arguments_json) catch |err| return invalidJsonMessage(allocator, "write", err);
+fn executeWriteTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
+    var parsed = parseArguments(allocator, "write", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "write", err));
     defer parsed.deinit();
-    const path = requiredString(parsed.value, "path") orelse return allocator.dupe(u8, "write tool arguments are missing path.");
-    const content = requiredString(parsed.value, "content") orelse return allocator.dupe(u8, "write tool arguments are missing content.");
-    return tools.writeFileForToolText(io, allocator, path, content) catch |err| {
-        return std.fmt.allocPrint(allocator, "write tool failed: {s}", .{@errorName(err)});
+    const path = requiredString(parsed.value, "path") orelse return toolError(try allocator.dupe(u8, "write tool arguments are missing path."));
+    const content = requiredString(parsed.value, "content") orelse return toolError(try allocator.dupe(u8, "write tool arguments are missing content."));
+    const output = tools.writeFileForToolText(io, allocator, path, content) catch |err| {
+        return toolError(try std.fmt.allocPrint(allocator, "write tool failed: {s}", .{@errorName(err)}));
     };
+    return toolOk(output);
 }
 
-fn executeGrepTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    var parsed = parseArguments(allocator, "grep", arguments_json) catch |err| return invalidJsonMessage(allocator, "grep", err);
+fn executeGrepTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
+    var parsed = parseArguments(allocator, "grep", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "grep", err));
     defer parsed.deinit();
-    const pattern = requiredString(parsed.value, "pattern") orelse return allocator.dupe(u8, "grep tool arguments are missing pattern.");
+    const pattern = requiredString(parsed.value, "pattern") orelse return toolError(try allocator.dupe(u8, "grep tool arguments are missing pattern."));
     const path = optionalString(parsed.value, "path") orelse ".";
     const options: tools.GrepOptions = .{
         .glob = optionalString(parsed.value, "glob"),
-        .ignore_case = optionalBool(parsed.value, "ignoreCase") catch return allocator.dupe(u8, "grep tool ignoreCase must be a boolean."),
-        .literal = optionalBool(parsed.value, "literal") catch return allocator.dupe(u8, "grep tool literal must be a boolean."),
-        .context = (optionalUsize(parsed.value, "context") catch return allocator.dupe(u8, "grep tool context must be a non-negative number.")) orelse 0,
-        .limit = (optionalUsize(parsed.value, "limit") catch return allocator.dupe(u8, "grep tool limit must be a non-negative number.")) orelse 100,
+        .ignore_case = optionalBool(parsed.value, "ignoreCase") catch return toolError(try allocator.dupe(u8, "grep tool ignoreCase must be a boolean.")),
+        .literal = optionalBool(parsed.value, "literal") catch return toolError(try allocator.dupe(u8, "grep tool literal must be a boolean.")),
+        .context = (optionalUsize(parsed.value, "context") catch return toolError(try allocator.dupe(u8, "grep tool context must be a non-negative number."))) orelse 0,
+        .limit = (optionalUsize(parsed.value, "limit") catch return toolError(try allocator.dupe(u8, "grep tool limit must be a non-negative number."))) orelse 100,
     };
-    return tools.grepText(io, allocator, pattern, path, options) catch |err| {
-        return std.fmt.allocPrint(allocator, "grep tool failed: {s}", .{@errorName(err)});
+    const content = tools.grepText(io, allocator, pattern, path, options) catch |err| {
+        return toolError(try std.fmt.allocPrint(allocator, "grep tool failed: {s}", .{@errorName(err)}));
     };
+    return toolOk(content);
 }
 
-fn executeFindTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    var parsed = parseArguments(allocator, "find", arguments_json) catch |err| return invalidJsonMessage(allocator, "find", err);
+fn executeFindTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
+    var parsed = parseArguments(allocator, "find", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "find", err));
     defer parsed.deinit();
-    const pattern = requiredString(parsed.value, "pattern") orelse return allocator.dupe(u8, "find tool arguments are missing pattern.");
+    const pattern = requiredString(parsed.value, "pattern") orelse return toolError(try allocator.dupe(u8, "find tool arguments are missing pattern."));
     const path = optionalString(parsed.value, "path") orelse ".";
-    const limit = (optionalUsize(parsed.value, "limit") catch return allocator.dupe(u8, "find tool limit must be a non-negative number.")) orelse 1000;
-    return tools.findFilesText(io, allocator, pattern, path, limit) catch |err| {
-        return std.fmt.allocPrint(allocator, "find tool failed: {s}", .{@errorName(err)});
+    const limit = (optionalUsize(parsed.value, "limit") catch return toolError(try allocator.dupe(u8, "find tool limit must be a non-negative number."))) orelse 1000;
+    const content = tools.findFilesText(io, allocator, pattern, path, limit) catch |err| {
+        return toolError(try std.fmt.allocPrint(allocator, "find tool failed: {s}", .{@errorName(err)}));
     };
+    return toolOk(content);
 }
 
-fn executeLsTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    var parsed = parseArguments(allocator, "ls", arguments_json) catch |err| return invalidJsonMessage(allocator, "ls", err);
+fn executeLsTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
+    var parsed = parseArguments(allocator, "ls", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "ls", err));
     defer parsed.deinit();
     const path = optionalString(parsed.value, "path") orelse ".";
-    const limit = (optionalUsize(parsed.value, "limit") catch return allocator.dupe(u8, "ls tool limit must be a non-negative number.")) orelse 500;
-    return tools.listDirText(io, allocator, path, limit) catch |err| {
-        return std.fmt.allocPrint(allocator, "ls tool failed: {s}", .{@errorName(err)});
+    const limit = (optionalUsize(parsed.value, "limit") catch return toolError(try allocator.dupe(u8, "ls tool limit must be a non-negative number."))) orelse 500;
+    const content = tools.listDirText(io, allocator, path, limit) catch |err| {
+        return toolError(try std.fmt.allocPrint(allocator, "ls tool failed: {s}", .{@errorName(err)}));
     };
+    return toolOk(content);
 }
 
 fn parseArguments(allocator: std.mem.Allocator, tool_name: []const u8, arguments_json: []const u8) !std.json.Parsed(std.json.Value) {
@@ -409,6 +425,14 @@ fn parseArguments(allocator: std.mem.Allocator, tool_name: []const u8, arguments
 
 fn invalidJsonMessage(allocator: std.mem.Allocator, tool_name: []const u8, err: anyerror) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s} tool argument JSON is invalid: {s}", .{ tool_name, @errorName(err) });
+}
+
+fn toolOk(content: []u8) ToolExecutionResult {
+    return .{ .content = content };
+}
+
+fn toolError(content: []u8) ToolExecutionResult {
+    return .{ .content = content, .is_error = true };
 }
 
 fn fieldValue(value: std.json.Value, name: []const u8) ?std.json.Value {
@@ -458,6 +482,21 @@ test "unsupported tool call returns a tool result instead of aborting" {
     defer call.deinit(std.testing.allocator);
 
     const result = try executeToolCall(std.testing.io, std.testing.allocator, call);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("Tool unknown_tool is not implemented in pi-zig yet.", result);
+    defer std.testing.allocator.free(result.content);
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings("Tool unknown_tool is not implemented in pi-zig yet.", result.content);
+}
+
+test "failed tool calls are marked as errors" {
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_missing_read"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.testing.allocator.dupe(u8, "{\"path\":\"zig-out/does-not-exist-for-agent-test.txt\"}"),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCall(std.testing.io, std.testing.allocator, call);
+    defer std.testing.allocator.free(result.content);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.startsWith(u8, result.content, "read tool failed:"));
 }
