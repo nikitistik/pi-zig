@@ -793,7 +793,7 @@ fn isExtensionFile(path: []const u8) bool {
 }
 
 fn isRunnableExtensionFile(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".js") or std.mem.endsWith(u8, path, ".mjs");
+    return std.mem.endsWith(u8, path, ".ts") or std.mem.endsWith(u8, path, ".js") or std.mem.endsWith(u8, path, ".mjs");
 }
 
 fn pathListContains(paths: []const []const u8, needle: []const u8) bool {

@@ -275,10 +275,7 @@ pub const Runner = struct {
             .stderr_limit = .limited(128 * 1024),
             .expand_arg0 = .expand,
         });
-        errdefer {
-            self.allocator.free(result.stdout);
-            self.allocator.free(result.stderr);
-        }
+        errdefer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
         switch (result.term) {
             .exited => |code| if (code == 0) {
@@ -343,7 +340,87 @@ fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
 }
 
 const hook_runner_script =
-    \\const { pathToFileURL } = require("node:url");
+    \\const fs = require("node:fs");
+    \\const path = require("node:path");
+    \\const moduleApi = require("node:module");
+    \\const { createRequire } = moduleApi;
+    \\const { fileURLToPath, pathToFileURL } = require("node:url");
+    \\function requireFromPackage(packageJson, specifier) {
+    \\  try {
+    \\    return createRequire(pathToFileURL(packageJson).href)(specifier);
+    \\  } catch {
+    \\    return undefined;
+    \\  }
+    \\}
+    \\function loadTypeScriptCompiler() {
+    \\  const candidates = [
+    \\    path.join(process.cwd(), "package.json"),
+    \\    path.join(process.cwd(), "frontend", "package.json"),
+    \\  ];
+    \\  let cursor = process.cwd();
+    \\  for (;;) {
+    \\    candidates.push(path.join(cursor, "package.json"));
+    \\    const parent = path.dirname(cursor);
+    \\    if (parent === cursor) break;
+    \\    cursor = parent;
+    \\  }
+    \\  for (const candidate of candidates) {
+    \\    const ts = requireFromPackage(candidate, "typescript");
+    \\    if (ts) return ts;
+    \\  }
+    \\  try {
+    \\    return require("typescript");
+    \\  } catch {
+    \\    return undefined;
+    \\  }
+    \\}
+    \\function makeTypeScriptTransformer() {
+    \\  if (typeof moduleApi.stripTypeScriptTypes === "function") {
+    \\    return (source, url) => moduleApi.stripTypeScriptTypes(source, { mode: "transform", sourceUrl: url });
+    \\  }
+    \\  const ts = loadTypeScriptCompiler();
+    \\  if (!ts) return undefined;
+    \\  return (source, url) => {
+    \\    const output = ts.transpileModule(source, {
+    \\      compilerOptions: {
+    \\        module: ts.ModuleKind.ES2022,
+    \\        target: ts.ScriptTarget.ES2022,
+    \\        esModuleInterop: true,
+    \\        moduleResolution: ts.ModuleResolutionKind.Bundler ?? ts.ModuleResolutionKind.NodeNext,
+    \\        sourceMap: false,
+    \\        inlineSources: false,
+    \\      },
+    \\    }).outputText;
+    \\    return output + "\n//# sourceURL=" + url + "\n";
+    \\  };
+    \\}
+    \\const transformTypeScript = makeTypeScriptTransformer();
+    \\let typeScriptHooksRegistered = false;
+    \\if (typeof moduleApi.registerHooks === "function" && transformTypeScript) {
+    \\  moduleApi.registerHooks({
+    \\    load(url, context, nextLoad) {
+    \\      if (url.startsWith("file:")) {
+    \\        const filename = fileURLToPath(url);
+    \\        if (filename.endsWith(".ts")) {
+    \\          const source = fs.readFileSync(filename, "utf8");
+    \\          return { format: "module", shortCircuit: true, source: transformTypeScript(source, url) };
+    \\        }
+    \\      }
+    \\      return nextLoad(url, context);
+    \\    },
+    \\  });
+    \\  typeScriptHooksRegistered = true;
+    \\}
+    \\async function importExtensionModule(resolvedPath) {
+    \\  const url = pathToFileURL(resolvedPath).href;
+    \\  if (!resolvedPath.endsWith(".ts") || typeScriptHooksRegistered) return import(url);
+    \\  if (!transformTypeScript) {
+    \\    throw new Error("TypeScript extension support requires Node.js type stripping or the typescript package");
+    \\  }
+    \\  const source = fs.readFileSync(resolvedPath, "utf8");
+    \\  const encoded = Buffer.from(transformTypeScript(source, url)).toString("base64");
+    \\  return import("data:text/javascript;base64," + encoded);
+    \\}
     \\const payload = JSON.parse(process.argv[1] || "{}");
     \\const handlers = new Map();
     \\const registeredTools = [];
@@ -371,7 +448,7 @@ const hook_runner_script =
     \\  diagnostics,
     \\};
     \\async function loadExtension(extensionPath) {
-    \\  const mod = await import(pathToFileURL(require("node:path").resolve(extensionPath)).href);
+    \\  const mod = await importExtensionModule(path.resolve(extensionPath));
     \\  const factory = typeof mod.default === "function" ? mod.default : typeof mod === "function" ? mod : null;
     \\  if (factory) await factory(api);
     \\}
@@ -549,4 +626,56 @@ test "extension runner discovers and executes registered tools" {
     defer allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("hello world", result.content);
+}
+
+test "extension runner loads TypeScript registered tools" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-ts-tool-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const helper_path = fixture_dir ++ "/helper.ts";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = helper_path, .data =
+        \\export const prefix: string = "ts";
+    });
+    const extension_path = fixture_dir ++ "/tool.ts";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\import { prefix } from "./helper.ts";
+        \\
+        \\type Params = { name: string };
+        \\
+        \\export default function(pi: any): void {
+        \\  pi.registerTool({
+        \\    name: "ts_echo",
+        \\    description: "Echo through a TypeScript extension tool",
+        \\    parameters: {
+        \\      type: "object",
+        \\      properties: { name: { type: "string" } },
+        \\      required: ["name"],
+        \\      additionalProperties: false
+        \\    },
+        \\    execute: async (_toolCallId: string, params: Params) => ({
+        \\      content: [{ type: "text", text: prefix + ": " + params.name }],
+        \\      isError: false
+        \\    })
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const definitions = try runner.discoverToolDefinitions();
+    defer runner.deinitToolDefinitions(definitions);
+    try std.testing.expectEqual(@as(usize, 1), definitions.len);
+    try std.testing.expectEqualStrings("ts_echo", definitions[0].name);
+    try std.testing.expectEqualStrings("Echo through a TypeScript extension tool", definitions[0].description);
+
+    var call = ai_client.ChatToolCall{
+        .id = try allocator.dupe(u8, "call_ts_ext_1"),
+        .name = try allocator.dupe(u8, "ts_echo"),
+        .arguments_json = try allocator.dupe(u8, "{\"name\":\"world\"}"),
+    };
+    defer call.deinit(allocator);
+    const result = try runner.runRegisteredTool(call);
+    defer allocator.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("ts: world", result.content);
 }

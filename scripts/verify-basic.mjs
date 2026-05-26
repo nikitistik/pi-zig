@@ -23,7 +23,9 @@ function runFail(args, input, options = {}) {
 }
 
 function envWithoutAnthropicAuth(extra = {}) {
-  const env = { ...process.env, ...extra };
+  const cleanAgentDir = path.resolve('zig-out/pi-zig-clean-agent');
+  fs.mkdirSync(cleanAgentDir, { recursive: true });
+  const env = { ...process.env, PI_CODING_AGENT_DIR: cleanAgentDir, ...extra };
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_OAUTH_TOKEN;
   delete env.PI_ZIG_PROVIDER_BASE_URL;
@@ -763,6 +765,41 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension tool complete: ' + toolOutput } }] }));
       return;
     }
+    if (user.includes('rpc extension typescript tool')) {
+      if (!hasTool('ext_ts_echo')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing rpc extension TypeScript tool definition', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_rpc_extension_ts_tool_1',
+                type: 'function',
+                function: {
+                  name: 'ext_ts_echo',
+                  arguments: JSON.stringify({ value: 'rpc-ts-registered-ok' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_rpc_extension_ts_tool_1' || toolOutput !== 'ext-ts-echo: rpc-ts-registered-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc extension TypeScript tool did not execute', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension ts tool complete: ' + toolOutput } }] }));
+      return;
+    }
     if (user.includes('extension registered tool') && !user.includes('rpc extension registered tool')) {
       if (body.stream !== true) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -790,6 +827,64 @@ const server = http.createServer((req, res) => {
         { choices: [{ delta: { content: 'extension tool ' } }] },
         { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
       ]);
+      return;
+    }
+    if (user.includes('extension typescript tool') && !user.includes('rpc extension typescript tool')) {
+      if (!hasTool('ext_ts_echo')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing extension TypeScript tool definition', tools: body.tools }));
+        return;
+      }
+      const tsTool = body.tools?.find((tool) => tool?.function?.name === 'ext_ts_echo')?.function;
+      if (
+        !tsTool?.description?.includes('TypeScript extension tool') ||
+        tsTool?.parameters?.properties?.value?.type !== 'string' ||
+        !tsTool?.parameters?.required?.includes('value')
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'extension TypeScript tool schema mismatch', tool: tsTool }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        if (body.stream === true) {
+          writeStreamEvents([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_extension_ts_tool_1', type: 'function', function: { name: 'ext_ts_echo', arguments: JSON.stringify({ value: 'ts-registered-ok' }) } }] } }] }
+          ]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_extension_ts_tool_1',
+                type: 'function',
+                function: {
+                  name: 'ext_ts_echo',
+                  arguments: JSON.stringify({ value: 'ts-registered-ok' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_extension_ts_tool_1' || toolOutput !== 'ext-ts-echo: ts-registered-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'extension TypeScript tool did not execute', toolMessages }));
+        return;
+      }
+      if (body.stream === true) {
+        writeStreamEvents([
+          { choices: [{ delta: { content: 'extension ts tool ' } }] },
+          { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
+        ]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'extension ts tool complete: ' + toolOutput } }] }));
       return;
     }
     if (user.includes('multi tool loop')) {
@@ -2960,11 +3055,54 @@ export default function(pi) {
   });
 }
 `);
+  const extensionTsHelperPath = path.join(extensionHookFixture, 'helper.ts');
+  fs.writeFileSync(extensionTsHelperPath, `
+export const prefix: string = "ext-ts-echo";
+`);
+  const extensionTsToolPath = path.join(extensionHookFixture, 'tool.ts');
+  fs.writeFileSync(extensionTsToolPath, `
+import { prefix } from "./helper.ts";
+
+type Params = { value: string };
+
+export default function(pi: any): void {
+  pi.on("tool_call", (event: any) => {
+    if (event.toolName === "bash" && event.input.command === "printf extension-original") {
+      event.input.command = "printf extension-rewritten-ok";
+    }
+  });
+  pi.on("tool_result", (event: any) => {
+    const text = Array.isArray(event.content)
+      ? event.content.filter((part: any) => part?.type === "text").map((part: any) => part.text ?? "").join("\\n")
+      : "";
+    if (event.toolName === "bash" && text.trim() === "extension-rewritten-ok") {
+      return { content: [{ type: "text", text: "extension-result-patched" }], isError: false };
+    }
+  });
+  pi.registerTool({
+    name: "ext_ts_echo",
+    label: "Extension TS Echo",
+    description: "Echo a value through a TypeScript extension tool",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false
+    },
+    execute: async (_toolCallId: string, params: Params) => ({
+      content: [{ type: "text", text: prefix + ": " + params.value }],
+      isError: false
+    })
+  });
+}
+`);
   const discoveredExtensionProject = path.resolve('zig-out/pi-zig-discovered-extension-project');
   fs.rmSync(discoveredExtensionProject, { recursive: true, force: true });
   fs.mkdirSync(path.join(discoveredExtensionProject, '.pi/extensions'), { recursive: true });
   fs.copyFileSync(extensionHookPath, path.join(discoveredExtensionProject, '.pi/extensions/hook.mjs'));
   fs.copyFileSync(extensionToolPath, path.join(discoveredExtensionProject, '.pi/extensions/tool.mjs'));
+  fs.copyFileSync(extensionTsHelperPath, path.join(discoveredExtensionProject, '.pi/extensions/helper.ts'));
+  fs.copyFileSync(extensionTsToolPath, path.join(discoveredExtensionProject, '.pi/extensions/tool.ts'));
   const providerPrint = run(
     [
       '--provider', 'openai',
@@ -3257,6 +3395,43 @@ export default function(pi) {
     throw new Error('top-level JSON mode smoke did not expose and execute an explicit registered extension tool');
   }
 
+  const providerJsonTsExtensionHookLines = run(
+    ['--mode', 'json', '--no-session', '--extension', extensionTsToolPath, '--provider', 'openai', '--model', 'mock-json-extension-ts-hook-model', '-p', 'please run extension hook events'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonTsExtensionHookLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.args?.command === 'printf extension-rewritten-ok') ||
+    !providerJsonTsExtensionHookLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('extension-result-patched')) ||
+    !providerJsonTsExtensionHookLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_hook_1' && JSON.stringify(result).includes('extension-result-patched'))) ||
+    !providerJsonTsExtensionHookLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension hook complete: extension-result-patched'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not execute TypeScript extension hooks');
+  }
+
+  const providerJsonTsExtensionToolLines = run(
+    ['--mode', 'json', '--no-session', '--extension', extensionTsToolPath, '--provider', 'openai', '--model', 'mock-json-extension-ts-tool-model', '-p', 'please run extension typescript tool'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonTsExtensionToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'ext_ts_echo' && line.toolCallId === 'call_extension_ts_tool_1') ||
+    !providerJsonTsExtensionToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_ts_echo' && JSON.stringify(line.result).includes('ext-ts-echo: ts-registered-ok')) ||
+    !providerJsonTsExtensionToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_ts_tool_1' && JSON.stringify(result).includes('ext-ts-echo: ts-registered-ok'))) ||
+    !providerJsonTsExtensionToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'extension ts tool ') ||
+    !providerJsonTsExtensionToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension ts tool complete: ext-ts-echo: ts-registered-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not expose and execute an explicit TypeScript registered extension tool');
+  }
+
   const providerJsonDiscoveredExtensionHookLines = run(
     ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-discovered-extension-hook-model', '-p', 'please run extension hook events'],
     undefined,
@@ -3292,6 +3467,24 @@ export default function(pi) {
     throw new Error('top-level JSON mode smoke did not expose and execute a discovered registered extension tool');
   }
 
+  const providerJsonDiscoveredTsExtensionToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-discovered-extension-ts-tool-model', '-p', 'please run extension typescript tool'],
+    undefined,
+    { cwd: discoveredExtensionProject, env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonDiscoveredTsExtensionToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'ext_ts_echo' && line.toolCallId === 'call_extension_ts_tool_1') ||
+    !providerJsonDiscoveredTsExtensionToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_ts_echo' && JSON.stringify(line.result).includes('ext-ts-echo: ts-registered-ok')) ||
+    !providerJsonDiscoveredTsExtensionToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_ts_tool_1' && JSON.stringify(result).includes('ext-ts-echo: ts-registered-ok'))) ||
+    !providerJsonDiscoveredTsExtensionToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension ts tool complete: ext-ts-echo: ts-registered-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not expose and execute a discovered TypeScript registered extension tool');
+  }
+
   const providerJsonNoExtensionsExplicitToolLines = run(
     ['--mode', 'json', '--no-session', '--no-extensions', '--extension', extensionToolPath, '--provider', 'openai', '--model', 'mock-json-no-extensions-explicit-tool-model', '-p', 'please run extension registered tool'],
     undefined,
@@ -3303,6 +3496,15 @@ export default function(pi) {
     .map((line) => JSON.parse(line));
   if (!providerJsonNoExtensionsExplicitToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_echo' && JSON.stringify(line.result).includes('ext-echo: registered-ok'))) {
     throw new Error('top-level JSON mode smoke did not keep explicit extension paths under --no-extensions');
+  }
+
+  const providerTsExtensionToolLoop = run(
+    ['--no-session', '--extension', extensionTsToolPath, '--provider', 'openai', '--model', 'mock-print-extension-ts-tool-model', '-p', 'please run extension typescript tool'],
+    undefined,
+    { env: providerEnv }
+  );
+  if (!providerTsExtensionToolLoop.includes('extension ts tool complete: ext-ts-echo: ts-registered-ok')) {
+    throw new Error('top-level print mode smoke did not execute an explicit TypeScript registered extension tool');
   }
 
   const providerJsonResponsesToolLines = run(
@@ -3953,11 +4155,41 @@ export default function(pi) {
   });
 }
 `);
+  const rpcExtensionTsHelperPath = path.join(rpcExtensionHookFixture, 'helper.ts');
+  fs.writeFileSync(rpcExtensionTsHelperPath, `
+export const prefix: string = "ext-ts-echo";
+`);
+  const rpcExtensionTsToolPath = path.join(rpcExtensionHookFixture, 'tool.ts');
+  fs.writeFileSync(rpcExtensionTsToolPath, `
+import { prefix } from "./helper.ts";
+
+type Params = { value: string };
+
+export default function(pi: any): void {
+  pi.registerTool({
+    name: "ext_ts_echo",
+    label: "Extension TS Echo",
+    description: "Echo a value through a TypeScript extension tool",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false
+    },
+    execute: async (_toolCallId: string, params: Params) => ({
+      content: [{ type: "text", text: prefix + ": " + params.value }],
+      isError: false
+    })
+  });
+}
+`);
   const rpcDiscoveredExtensionProject = path.resolve('zig-out/pi-zig-rpc-discovered-extension-project');
   fs.rmSync(rpcDiscoveredExtensionProject, { recursive: true, force: true });
   fs.mkdirSync(path.join(rpcDiscoveredExtensionProject, '.pi/extensions'), { recursive: true });
   fs.copyFileSync(rpcExtensionHookPath, path.join(rpcDiscoveredExtensionProject, '.pi/extensions/hook.mjs'));
   fs.copyFileSync(rpcExtensionToolPath, path.join(rpcDiscoveredExtensionProject, '.pi/extensions/tool.mjs'));
+  fs.copyFileSync(rpcExtensionTsHelperPath, path.join(rpcDiscoveredExtensionProject, '.pi/extensions/helper.ts'));
+  fs.copyFileSync(rpcExtensionTsToolPath, path.join(rpcDiscoveredExtensionProject, '.pi/extensions/tool.ts'));
   const rpcProviderContextFixture = path.resolve('zig-out/pi-zig-rpc-provider-context-fixture');
   const rpcProviderContextCwd = path.join(rpcProviderContextFixture, 'project');
   const rpcProviderContextSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-context-smoke.jsonl');
@@ -4409,6 +4641,32 @@ export default function(pi) {
     throw new Error('rpc provider prompt smoke did not expose and execute an explicit registered extension tool');
   }
 
+  const rpcProviderExtensionTsToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-ts-tool-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionTsToolSessionFile, { force: true });
+  const rpcProviderExtensionTsToolOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionTsToolSessionFile, '--extension', rpcExtensionTsToolPath],
+    [
+      JSON.stringify({ id: 'rpc-extension-ts-tool-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-ts-tool-prompt', type: 'prompt', message: 'rpc extension typescript tool' }),
+      JSON.stringify({ id: 'rpc-extension-ts-tool-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionTsToolResponses = rpcProviderExtensionTsToolOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionTsToolPrompt = rpcProviderExtensionTsToolResponses.find((response) => response.id === 'rpc-extension-ts-tool-prompt');
+  const rpcProviderExtensionTsToolMessages = rpcProviderExtensionTsToolResponses.find((response) => response.id === 'rpc-extension-ts-tool-messages');
+  if (
+    !rpcProviderExtensionTsToolPrompt?.success ||
+    rpcProviderExtensionTsToolPrompt?.data?.text !== 'rpc extension ts tool complete: ext-ts-echo: rpc-ts-registered-ok' ||
+    rpcProviderExtensionTsToolPrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_rpc_extension_ts_tool_1' ||
+    rpcProviderExtensionTsToolPrompt?.data?.toolResults?.[0]?.toolName !== 'ext_ts_echo' ||
+    rpcProviderExtensionTsToolPrompt?.data?.toolResults?.[0]?.content !== 'ext-ts-echo: rpc-ts-registered-ok' ||
+    !rpcProviderExtensionTsToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_ts_tool_1' && message.toolName === 'ext_ts_echo' && message.content === 'ext-ts-echo: rpc-ts-registered-ok')
+  ) {
+    throw new Error('rpc provider prompt smoke did not expose and execute an explicit TypeScript registered extension tool');
+  }
+
   const rpcProviderDiscoveredExtensionHookSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-discovered-extension-hook-smoke.jsonl');
   fs.rmSync(rpcProviderDiscoveredExtensionHookSessionFile, { force: true });
   const rpcProviderDiscoveredExtensionHookOutput = run(
@@ -4453,6 +4711,29 @@ export default function(pi) {
     !rpcProviderDiscoveredExtensionToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-registered-ok')
   ) {
     throw new Error('rpc provider prompt smoke did not expose and execute a discovered registered extension tool');
+  }
+
+  const rpcProviderDiscoveredExtensionTsToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-discovered-extension-ts-tool-smoke.jsonl');
+  fs.rmSync(rpcProviderDiscoveredExtensionTsToolSessionFile, { force: true });
+  const rpcProviderDiscoveredExtensionTsToolOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderDiscoveredExtensionTsToolSessionFile],
+    [
+      JSON.stringify({ id: 'rpc-discovered-extension-ts-tool-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-discovered-extension-ts-tool-prompt', type: 'prompt', message: 'rpc extension typescript tool' }),
+      JSON.stringify({ id: 'rpc-discovered-extension-ts-tool-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { cwd: rpcDiscoveredExtensionProject, env: rpcProviderEnv }
+  );
+  const rpcProviderDiscoveredExtensionTsToolResponses = rpcProviderDiscoveredExtensionTsToolOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderDiscoveredExtensionTsToolPrompt = rpcProviderDiscoveredExtensionTsToolResponses.find((response) => response.id === 'rpc-discovered-extension-ts-tool-prompt');
+  const rpcProviderDiscoveredExtensionTsToolMessages = rpcProviderDiscoveredExtensionTsToolResponses.find((response) => response.id === 'rpc-discovered-extension-ts-tool-messages');
+  if (
+    !rpcProviderDiscoveredExtensionTsToolPrompt?.success ||
+    rpcProviderDiscoveredExtensionTsToolPrompt?.data?.text !== 'rpc extension ts tool complete: ext-ts-echo: rpc-ts-registered-ok' ||
+    !rpcProviderDiscoveredExtensionTsToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_ts_tool_1' && message.toolName === 'ext_ts_echo' && message.content === 'ext-ts-echo: rpc-ts-registered-ok')
+  ) {
+    throw new Error('rpc provider prompt smoke did not expose and execute a discovered TypeScript registered extension tool');
   }
 
   const rpcProviderCompactionHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-compaction-history-smoke.jsonl');
