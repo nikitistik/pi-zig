@@ -19,9 +19,12 @@ const SourceKind = enum {
 const ParsedSource = struct {
     kind: SourceKind,
     source: []const u8,
+    spec: []const u8 = "",
     name: []const u8 = "",
+    pinned: bool = false,
     host: []const u8 = "",
     path: []const u8 = "",
+    ref: ?[]const u8 = null,
 };
 
 const PackageOptions = struct {
@@ -97,18 +100,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
         .install => {
             const source = options.source.?;
             const parsed = parseSource(source);
-            if (parsed.kind != .local) {
-                try writeStderr(io, "pi-zig package install currently supports local package paths only; npm/git installation is not implemented yet.\n");
-                std.process.exit(1);
-            }
-            const resolved = try resolveLocalPath(allocator, cwd, parsed.path);
-            defer allocator.free(resolved);
-            if (!pathExists(io, resolved)) {
-                try writeStderr(io, "Path does not exist: ");
-                try writeStderr(io, resolved);
-                try writeStderr(io, "\n");
-                std.process.exit(1);
-            }
+            installSource(io, allocator, env, cwd, agent_dir, parsed, options.local) catch |err| return exitPackageError(io, err);
             const changed = try addSourceToSettings(io, allocator, env, cwd, agent_dir, source, options.local);
             _ = changed;
             try writeStdout(io, "Installed ");
@@ -118,6 +110,8 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
         },
         .remove => {
             const source = options.source.?;
+            const parsed = parseSource(source);
+            removeInstalledSource(io, allocator, env, cwd, agent_dir, parsed, options.local) catch |err| return exitPackageError(io, err);
             const removed = try removeSourceFromSettings(io, allocator, env, cwd, agent_dir, source, options.local);
             if (!removed) {
                 try writeStderr(io, "No matching package found for ");
@@ -135,8 +129,18 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
             return true;
         },
         .update => {
-            try writeStderr(io, "pi-zig package update is not implemented yet.\n");
-            std.process.exit(1);
+            if (options.extensions) {
+                const update_source = options.extension_source orelse if (options.self) null else options.source;
+                updateConfiguredPackages(io, allocator, env, cwd, agent_dir, update_source) catch |err| return exitPackageError(io, err);
+                try writeStdout(io, if (update_source != null) "Updated " else "Updated packages");
+                if (update_source) |source| try writeStdout(io, source);
+                try writeStdout(io, "\n");
+            }
+            if (options.self) {
+                try writeStderr(io, "pi-zig self-update is not implemented yet.\n");
+                std.process.exit(1);
+            }
+            return true;
         },
     }
 }
@@ -481,10 +485,126 @@ fn packageSourceString(value: std.json.Value) ?[]const u8 {
     }
 }
 
+fn installSource(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    parsed: ParsedSource,
+    local: bool,
+) !void {
+    switch (parsed.kind) {
+        .local => {
+            const resolved = try resolveLocalPath(allocator, cwd, parsed.path);
+            defer allocator.free(resolved);
+            if (!pathExists(io, resolved)) {
+                try writeStderr(io, "Path does not exist: ");
+                try writeStderr(io, resolved);
+                try writeStderr(io, "\n");
+                return error.PackageCommandFailed;
+            }
+        },
+        .npm => try installNpm(io, allocator, env, agent_dir, parsed, local, false),
+        .git => try installGit(io, allocator, env, cwd, agent_dir, parsed, local),
+    }
+}
+
+fn removeInstalledSource(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    parsed: ParsedSource,
+    local: bool,
+) !void {
+    switch (parsed.kind) {
+        .local => {},
+        .npm => try uninstallNpm(io, allocator, env, agent_dir, parsed, local),
+        .git => {
+            const target = try gitInstallPath(allocator, cwd, agent_dir, parsed, local);
+            defer allocator.free(target);
+            try std.Io.Dir.cwd().deleteTree(io, target);
+        },
+    }
+}
+
+fn updateConfiguredPackages(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    source: ?[]const u8,
+) !void {
+    if (isOfflineMode(env)) return;
+
+    const target_key = if (source) |target| try sourceMatchKeyForInput(allocator, env, cwd, target) else null;
+    defer if (target_key) |key| allocator.free(key);
+
+    var matched = false;
+    try updateConfiguredPackagesForScope(io, allocator, env, cwd, agent_dir, false, target_key, &matched);
+    try updateConfiguredPackagesForScope(io, allocator, env, cwd, agent_dir, true, target_key, &matched);
+
+    if (source != null and !matched) {
+        try writeStderr(io, "No matching package found for ");
+        try writeStderr(io, source.?);
+        try writeStderr(io, "\n");
+        return error.PackageCommandFailed;
+    }
+}
+
+fn updateConfiguredPackagesForScope(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    local: bool,
+    target_key: ?[]const u8,
+    matched: *bool,
+) !void {
+    const settings_path = try settingsPath(allocator, agent_dir, local);
+    defer allocator.free(settings_path);
+    const base_dir = try settingsBaseDir(allocator, cwd, agent_dir, local);
+    defer allocator.free(base_dir);
+
+    var settings = try loadSettings(io, allocator, settings_path);
+    defer settings.deinit();
+    if (settings.value != .object) return;
+    const packages_value = settings.value.object.get("packages") orelse return;
+    if (packages_value != .array) return;
+
+    for (packages_value.array.items) |item| {
+        const source = packageSourceString(item) orelse continue;
+        if (target_key) |key| {
+            const existing_key = try sourceMatchKeyForSettings(allocator, env, base_dir, source);
+            defer allocator.free(existing_key);
+            if (!std.mem.eql(u8, key, existing_key)) continue;
+        }
+        matched.* = true;
+        const parsed = parseSource(source);
+        switch (parsed.kind) {
+            .local => {},
+            .npm => {
+                if (!parsed.pinned) try installNpm(io, allocator, env, agent_dir, parsed, local, true);
+            },
+            .git => try updateGit(io, allocator, env, cwd, agent_dir, parsed, local),
+        }
+    }
+}
+
 fn parseSource(source: []const u8) ParsedSource {
     if (std.mem.startsWith(u8, source, "npm:")) {
         const spec = std.mem.trim(u8, source["npm:".len..], " \t\r\n");
-        return .{ .kind = .npm, .source = source, .name = npmPackageName(spec) };
+        return .{
+            .kind = .npm,
+            .source = source,
+            .spec = spec,
+            .name = npmPackageName(spec),
+            .pinned = npmPackageVersion(spec) != null,
+        };
     }
     if (isLocalPath(source)) return .{ .kind = .local, .source = source, .path = source };
     if (parseGitSource(source)) |git| return git;
@@ -508,26 +628,30 @@ fn parseProtocolGit(original: []const u8, raw: []const u8) ?ParsedSource {
     var host = after_scheme[0..slash];
     if (std.mem.lastIndexOfScalar(u8, host, '@')) |at| host = host[at + 1 ..];
     const path_with_ref = after_scheme[slash + 1 ..];
-    const path = stripGitSuffix(stripRef(path_with_ref));
+    const split = splitGitPathRef(path_with_ref);
+    const path = stripGitSuffix(split.path);
     if (host.len == 0 or path.len == 0) return null;
-    return .{ .kind = .git, .source = original, .host = host, .path = path };
+    return .{ .kind = .git, .source = original, .host = host, .path = path, .ref = split.ref, .pinned = split.ref != null };
 }
 
 fn parseGitAt(original: []const u8, raw: []const u8) ?ParsedSource {
     const after_user = raw["git@".len..];
     const colon = std.mem.indexOfScalar(u8, after_user, ':') orelse return null;
     const host = after_user[0..colon];
-    const path = stripGitSuffix(stripRef(after_user[colon + 1 ..]));
+    const split = splitGitPathRef(after_user[colon + 1 ..]);
+    const path = stripGitSuffix(split.path);
     if (host.len == 0 or path.len == 0) return null;
-    return .{ .kind = .git, .source = original, .host = host, .path = path };
+    return .{ .kind = .git, .source = original, .host = host, .path = path, .ref = split.ref, .pinned = split.ref != null };
 }
 
 fn parseHostPath(original: []const u8, raw: []const u8) ?ParsedSource {
     const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return null;
     const host = raw[0..slash];
-    const path = stripGitSuffix(stripRef(raw[slash + 1 ..]));
+    if (!std.mem.eql(u8, host, "localhost") and std.mem.indexOfScalar(u8, host, '.') == null) return null;
+    const split = splitGitPathRef(raw[slash + 1 ..]);
+    const path = stripGitSuffix(split.path);
     if (host.len == 0 or path.len == 0) return null;
-    return .{ .kind = .git, .source = original, .host = host, .path = path };
+    return .{ .kind = .git, .source = original, .host = host, .path = path, .ref = split.ref, .pinned = split.ref != null };
 }
 
 fn npmPackageName(spec: []const u8) []const u8 {
@@ -538,6 +662,28 @@ fn npmPackageName(spec: []const u8) []const u8 {
         return spec[0..at];
     }
     return spec;
+}
+
+fn npmPackageVersion(spec: []const u8) ?[]const u8 {
+    if (spec.len == 0) return null;
+    const search_start: usize = if (spec[0] == '@') 1 else 0;
+    if (std.mem.lastIndexOfScalar(u8, spec[search_start..], '@')) |relative_at| {
+        const at = search_start + relative_at;
+        if (at + 1 < spec.len) return spec[at + 1 ..];
+    }
+    return null;
+}
+
+const GitPathRef = struct {
+    path: []const u8,
+    ref: ?[]const u8 = null,
+};
+
+fn splitGitPathRef(value: []const u8) GitPathRef {
+    if (std.mem.lastIndexOfScalar(u8, value, '@')) |at| {
+        if (at > 0 and at + 1 < value.len) return .{ .path = value[0..at], .ref = value[at + 1 ..] };
+    }
+    return .{ .path = value };
 }
 
 fn stripRef(value: []const u8) []const u8 {
@@ -604,6 +750,306 @@ fn installedPath(io: std.Io, allocator: std.mem.Allocator, env: *const std.proce
         allocator.free(path);
         return null;
     }
+}
+
+fn installNpm(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+    parsed: ParsedSource,
+    local: bool,
+    latest: bool,
+) !void {
+    const install_root = try npmInstallRoot(allocator, agent_dir, local);
+    defer allocator.free(install_root);
+    try ensureNpmProject(io, allocator, install_root);
+
+    const spec = if (latest)
+        try std.fmt.allocPrint(allocator, "{s}@latest", .{parsed.name})
+    else
+        try allocator.dupe(u8, parsed.spec);
+    defer allocator.free(spec);
+
+    var argv = try npmInstallArgv(io, allocator, env, agent_dir, install_root, &.{spec});
+    defer argv.deinit(allocator);
+    try runCommand(io, allocator, argv.items, null);
+}
+
+fn uninstallNpm(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+    parsed: ParsedSource,
+    local: bool,
+) !void {
+    const install_root = try npmInstallRoot(allocator, agent_dir, local);
+    defer allocator.free(install_root);
+    if (!pathExists(io, install_root)) return;
+
+    var argv = try npmBaseArgv(io, allocator, env, agent_dir);
+    defer argv.deinit(allocator);
+    const manager = packageManagerName(argv.items);
+    try argv.append(allocator, "uninstall");
+    try argv.append(allocator, parsed.name);
+    if (std.mem.eql(u8, manager, "bun")) {
+        try argv.append(allocator, "--cwd");
+    } else {
+        try argv.append(allocator, "--prefix");
+    }
+    try argv.append(allocator, install_root);
+    try runCommand(io, allocator, argv.items, null);
+}
+
+fn installGit(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    parsed: ParsedSource,
+    local: bool,
+) anyerror!void {
+    const target = try gitInstallPath(allocator, cwd, agent_dir, parsed, local);
+    defer allocator.free(target);
+    if (pathExists(io, target)) {
+        try updateGit(io, allocator, env, cwd, agent_dir, parsed, local);
+        return;
+    }
+
+    const git_root = try gitInstallRoot(allocator, cwd, agent_dir, local);
+    defer allocator.free(git_root);
+    try ensureGitIgnore(io, allocator, git_root);
+    if (std.fs.path.dirname(target)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+
+    const repo = try gitRepoUrl(allocator, parsed);
+    defer allocator.free(repo);
+    const clone_argv = [_][]const u8{ "git", "clone", repo, target };
+    try runCommand(io, allocator, &clone_argv, null);
+
+    if (parsed.ref) |ref| {
+        const checkout_argv = [_][]const u8{ "git", "checkout", ref };
+        try runCommand(io, allocator, &checkout_argv, target);
+    }
+    try installGitDependenciesIfPresent(io, allocator, env, agent_dir, target);
+}
+
+fn updateGit(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    parsed: ParsedSource,
+    local: bool,
+) anyerror!void {
+    const target = try gitInstallPath(allocator, cwd, agent_dir, parsed, local);
+    defer allocator.free(target);
+    if (!pathExists(io, target)) {
+        try installGit(io, allocator, env, cwd, agent_dir, parsed, local);
+        return;
+    }
+
+    if (parsed.ref) |ref| {
+        const fetch_argv = [_][]const u8{ "git", "fetch", "origin", ref };
+        try runCommand(io, allocator, &fetch_argv, target);
+        const reset_argv = [_][]const u8{ "git", "reset", "--hard", "FETCH_HEAD" };
+        try runCommand(io, allocator, &reset_argv, target);
+    } else {
+        const fetch_argv = [_][]const u8{ "git", "fetch", "--prune", "origin" };
+        try runCommand(io, allocator, &fetch_argv, target);
+        const set_head_argv = [_][]const u8{ "git", "remote", "set-head", "origin", "-a" };
+        runCommand(io, allocator, &set_head_argv, target) catch {};
+        const reset_argv = [_][]const u8{ "git", "reset", "--hard", "origin/HEAD" };
+        try runCommand(io, allocator, &reset_argv, target);
+    }
+
+    const clean_argv = [_][]const u8{ "git", "clean", "-fdx" };
+    try runCommand(io, allocator, &clean_argv, target);
+    try installGitDependenciesIfPresent(io, allocator, env, agent_dir, target);
+}
+
+fn installGitDependenciesIfPresent(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, agent_dir: []const u8, target: []const u8) !void {
+    const package_json = try std.fs.path.join(allocator, &.{ target, "package.json" });
+    defer allocator.free(package_json);
+    if (!pathExists(io, package_json)) return;
+
+    var argv = try npmBaseArgv(io, allocator, env, agent_dir);
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "install");
+    if (argv.items.len == 2 and std.mem.eql(u8, packageManagerName(argv.items), "npm")) {
+        try argv.append(allocator, "--omit=dev");
+    }
+    try runCommand(io, allocator, argv.items, target);
+}
+
+fn npmInstallArgv(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    agent_dir: []const u8,
+    install_root: []const u8,
+    specs: []const []const u8,
+) !std.ArrayList([]const u8) {
+    var argv = try npmBaseArgv(io, allocator, env, agent_dir);
+    const manager = packageManagerName(argv.items);
+    try argv.append(allocator, "install");
+    for (specs) |spec| try argv.append(allocator, spec);
+    if (std.mem.eql(u8, manager, "bun")) {
+        try argv.append(allocator, "--cwd");
+        try argv.append(allocator, install_root);
+        try argv.append(allocator, "--omit=peer");
+    } else if (std.mem.eql(u8, manager, "pnpm")) {
+        try argv.append(allocator, "--prefix");
+        try argv.append(allocator, install_root);
+        try argv.append(allocator, "--config.auto-install-peers=false");
+        try argv.append(allocator, "--config.strict-peer-dependencies=false");
+        try argv.append(allocator, "--config.strict-dep-builds=false");
+    } else {
+        try argv.append(allocator, "--prefix");
+        try argv.append(allocator, install_root);
+        try argv.append(allocator, "--legacy-peer-deps");
+    }
+    return argv;
+}
+
+fn npmBaseArgv(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, agent_dir: []const u8) !std.ArrayList([]const u8) {
+    var argv: std.ArrayList([]const u8) = .empty;
+    if (try appendNpmCommandFromSettings(io, allocator, &argv, project_settings_file)) return argv;
+    const global_settings = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(global_settings);
+    if (try appendNpmCommandFromSettings(io, allocator, &argv, global_settings)) return argv;
+    _ = env;
+    try argv.append(allocator, "npm");
+    return argv;
+}
+
+fn appendNpmCommandFromSettings(io: std.Io, allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), path: []const u8) !bool {
+    var parsed = loadSettings(io, allocator, path) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const command = parsed.value.object.get("npmCommand") orelse return false;
+    if (command != .array or command.array.items.len == 0) return false;
+    for (command.array.items) |item| {
+        if (item != .string or item.string.len == 0) continue;
+        try argv.append(allocator, try allocator.dupe(u8, item.string));
+    }
+    return argv.items.len > 0;
+}
+
+fn packageManagerName(argv: []const []const u8) []const u8 {
+    if (argv.len == 0) return "";
+    var command = argv[0];
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        if (std.mem.eql(u8, argv[index], "--") and index + 1 < argv.len) {
+            command = argv[index + 1];
+        }
+    }
+    var name = std.fs.path.basename(command);
+    if (std.mem.endsWith(u8, name, ".cmd") or std.mem.endsWith(u8, name, ".exe")) name = name[0 .. name.len - 4];
+    return name;
+}
+
+fn npmInstallRoot(allocator: std.mem.Allocator, agent_dir: []const u8, local: bool) ![]u8 {
+    if (local) return std.fs.path.join(allocator, &.{ ".pi", "npm" });
+    return std.fs.path.join(allocator, &.{ agent_dir, "npm" });
+}
+
+fn gitInstallPath(allocator: std.mem.Allocator, cwd: []const u8, agent_dir: []const u8, parsed: ParsedSource, local: bool) ![]u8 {
+    const root = try gitInstallRoot(allocator, cwd, agent_dir, local);
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, parsed.host, parsed.path });
+}
+
+fn gitInstallRoot(allocator: std.mem.Allocator, cwd: []const u8, agent_dir: []const u8, local: bool) ![]u8 {
+    if (local) return std.fs.path.join(allocator, &.{ cwd, ".pi", "git" });
+    return std.fs.path.join(allocator, &.{ agent_dir, "git" });
+}
+
+fn ensureNpmProject(io: std.Io, allocator: std.mem.Allocator, install_root: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, install_root);
+    try ensureGitIgnore(io, allocator, install_root);
+    const package_json = try std.fs.path.join(allocator, &.{ install_root, "package.json" });
+    defer allocator.free(package_json);
+    if (pathExists(io, package_json)) return;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = package_json, .data = "{\n  \"name\": \"pi-extensions\",\n  \"private\": true\n}\n" });
+}
+
+fn ensureGitIgnore(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const ignore_path = try std.fs.path.join(allocator, &.{ dir, ".gitignore" });
+    defer allocator.free(ignore_path);
+    if (pathExists(io, ignore_path)) return;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ignore_path, .data = "*\n!.gitignore\n" });
+}
+
+fn gitRepoUrl(allocator: std.mem.Allocator, parsed: ParsedSource) ![]u8 {
+    const raw = if (std.mem.startsWith(u8, parsed.source, "git:")) parsed.source["git:".len..] else parsed.source;
+    const repo = stripGitSourceRef(raw);
+    if (std.mem.startsWith(u8, repo, "git@") or std.mem.indexOf(u8, repo, "://") != null) {
+        return allocator.dupe(u8, repo);
+    }
+    return std.fmt.allocPrint(allocator, "https://{s}", .{repo});
+}
+
+fn stripGitSourceRef(raw: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, raw, "git@")) {
+        const after_user = raw["git@".len..];
+        const colon = std.mem.indexOfScalar(u8, after_user, ':') orelse return raw;
+        const prefix_len = "git@".len + colon + 1;
+        const path = after_user[colon + 1 ..];
+        const split = splitGitPathRef(path);
+        return raw[0 .. prefix_len + split.path.len];
+    }
+    if (std.mem.indexOf(u8, raw, "://")) |_| {
+        const scheme_end = std.mem.indexOf(u8, raw, "://") orelse return raw;
+        const after_scheme = raw[scheme_end + "://".len ..];
+        const slash = std.mem.indexOfScalar(u8, after_scheme, '/') orelse return raw;
+        const path_offset = scheme_end + "://".len + slash + 1;
+        const split = splitGitPathRef(raw[path_offset..]);
+        return raw[0 .. path_offset + split.path.len];
+    }
+    const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return raw;
+    const split = splitGitPathRef(raw[slash + 1 ..]);
+    return raw[0 .. slash + 1 + split.path.len];
+}
+
+fn runCommand(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, cwd: ?[]const u8) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return;
+            if (result.stdout.len > 0) try writeStderr(io, result.stdout);
+            if (result.stderr.len > 0) try writeStderr(io, result.stderr);
+            return error.PackageCommandFailed;
+        },
+        else => return error.PackageCommandFailed,
+    }
+}
+
+fn isOfflineMode(env: *const std.process.Environ.Map) bool {
+    const value = env.get("PI_OFFLINE") orelse return false;
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes");
+}
+
+fn exitPackageError(io: std.Io, err: anyerror) noreturn {
+    if (err != error.PackageCommandFailed) {
+        writeStderr(io, "Error: ") catch {};
+        writeStderr(io, @errorName(err)) catch {};
+        writeStderr(io, "\n") catch {};
+    }
+    std.process.exit(1);
 }
 
 fn settingsPath(allocator: std.mem.Allocator, agent_dir: []const u8, local: bool) ![]u8 {

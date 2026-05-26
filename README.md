@@ -41,6 +41,9 @@ zig build run -- tools
 zig build run -- rpc-schema
 zig build run -- list
 zig build run -- install --help
+zig build run -- install npm:example-package
+zig build run -- install git:github.com/user/repo --local
+zig build run -- update --extensions
 zig build run -- settings --json
 zig build run -- settings paths
 zig build run -- settings get resolved.compaction.enabled

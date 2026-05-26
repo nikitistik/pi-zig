@@ -51,7 +51,7 @@ const packages: PackageRow[] = [
 const parity: ParityRow[] = [
   { area: 'Package map', status: 'foundation', target: '4 upstream packages represented' },
   { area: 'CLI and commands', status: 'in_progress', target: '46 flags plus top-level --list-models, -p, --mode json/rpc foundations' },
-  { area: 'Package commands', status: 'foundation', target: 'Local install/list/remove settings flow; npm/git update paths fail visibly' },
+  { area: 'Package commands', status: 'in_progress', target: 'Local/npm/git install/list/remove plus extension update; self-update missing' },
   { area: 'Settings manager', status: 'in_progress', target: 'Global/project read, migrations, merge defaults, scoped writes, invalid JSON safety' },
   { area: 'Print and JSON modes', status: 'foundation', target: 'Top-level prompt acceptance, session persistence, JSONL event skeleton' },
   { area: 'RPC protocol', status: 'in_progress', target: '29 RpcCommand inputs, bash/compact/retry/commands/session controls started' },
@@ -78,6 +78,9 @@ const commands = [
   'zig build run -- rpc-schema',
   'zig build run -- list',
   'zig build run -- install --help',
+  'zig build run -- install npm:example-package',
+  'zig build run -- install git:github.com/user/repo --local',
+  'zig build run -- update --extensions',
   'zig build run -- settings --json',
   'zig build run -- settings get resolved.compaction.enabled',
   'zig build run -- settings set-model openai gpt-4o',

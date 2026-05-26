@@ -589,10 +589,72 @@ const packageCommandHome = path.join(packageCommandRoot, 'home');
 const packageCommandProject = path.join(packageCommandRoot, 'project');
 const packageCommandGlobalPackage = path.join(packageCommandProject, 'packages/global-local');
 const packageCommandProjectPackage = path.join(packageCommandProject, 'packages/project-local');
-const packageCommandEnv = { ...process.env, HOME: packageCommandHome };
+const packageCommandFakeBin = path.join(packageCommandRoot, 'fake-bin');
+const packageCommandRecord = path.join(packageCommandRoot, 'commands.jsonl');
+const packageCommandEnv = {
+  ...process.env,
+  HOME: packageCommandHome,
+  PATH: `${packageCommandFakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
+  PI_ZIG_FAKE_COMMAND_RECORD: packageCommandRecord
+};
 fs.rmSync(packageCommandRoot, { recursive: true, force: true });
 fs.mkdirSync(packageCommandGlobalPackage, { recursive: true });
 fs.mkdirSync(packageCommandProjectPackage, { recursive: true });
+fs.mkdirSync(packageCommandFakeBin, { recursive: true });
+fs.writeFileSync(
+  path.join(packageCommandFakeBin, 'npm'),
+  `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.PI_ZIG_FAKE_COMMAND_RECORD, JSON.stringify({ command: 'npm', args, cwd: process.cwd() }) + '\\n');
+function optionValue(name) {
+  const index = args.indexOf(name);
+  return index >= 0 ? args[index + 1] : undefined;
+}
+function packageName(spec) {
+  const start = spec.startsWith('@') ? 1 : 0;
+  const at = spec.lastIndexOf('@');
+  return at > start ? spec.slice(0, at) : spec;
+}
+const root = optionValue('--prefix') || optionValue('--cwd') || process.cwd();
+if (args[0] === 'install') {
+  fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true });
+  for (const spec of args.slice(1)) {
+    if (spec.startsWith('--')) break;
+    const name = packageName(spec);
+    if (!name) continue;
+    const packageDir = path.join(root, 'node_modules', ...name.split('/'));
+    fs.mkdirSync(packageDir, { recursive: true });
+    fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({ name, version: spec.includes('@latest') ? 'latest' : '1.0.0' }));
+  }
+  process.exit(0);
+}
+if (args[0] === 'uninstall') {
+  const name = args[1];
+  if (name) fs.rmSync(path.join(root, 'node_modules', ...name.split('/')), { recursive: true, force: true });
+  process.exit(0);
+}
+process.exit(0);
+`
+);
+fs.chmodSync(path.join(packageCommandFakeBin, 'npm'), 0o755);
+fs.writeFileSync(
+  path.join(packageCommandFakeBin, 'git'),
+  `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.PI_ZIG_FAKE_COMMAND_RECORD, JSON.stringify({ command: 'git', args, cwd: process.cwd() }) + '\\n');
+if (args[0] === 'clone') {
+  const target = args[2];
+  fs.mkdirSync(path.join(target, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(target, 'extension.js'), 'fake git extension');
+}
+process.exit(0);
+`
+);
+fs.chmodSync(path.join(packageCommandFakeBin, 'git'), 0o755);
 if (!run(['list'], undefined, { cwd: packageCommandProject, env: packageCommandEnv }).includes('No packages installed.')) {
   throw new Error('package list smoke did not report an empty package set');
 }
@@ -629,13 +691,39 @@ if (
 ) {
   throw new Error('package remove smoke did not clear matching user and project packages');
 }
-const packageUpdateFailure = runFail(['update', '--extensions'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
-if (packageUpdateFailure.status === 0 || !packageUpdateFailure.stderr.includes('package update is not implemented yet')) {
-  throw new Error('package update smoke did not fail visibly for the unimplemented updater');
+
+run(['install', 'npm:fake-extension'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+run(['install', 'git:github.com/example/fake-extension', '--local'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+const npmInstallPath = path.join(packageCommandHome, '.pi/agent/npm/node_modules/fake-extension/package.json');
+const gitInstallPath = path.join(packageCommandProject, '.pi/git/github.com/example/fake-extension/extension.js');
+if (!fs.existsSync(npmInstallPath) || !fs.existsSync(gitInstallPath)) {
+  throw new Error('package npm/git install smoke did not create managed install paths');
 }
-const packageNpmFailure = runFail(['install', 'npm:example'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
-if (packageNpmFailure.status === 0 || !packageNpmFailure.stderr.includes('local package paths only')) {
-  throw new Error('package npm install smoke did not fail visibly for the unimplemented npm installer');
+const packageManagedList = run(['list'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+if (
+  !packageManagedList.includes(path.join(packageCommandHome, '.pi/agent/npm/node_modules/fake-extension')) ||
+  !packageManagedList.includes(path.join(packageCommandProject, '.pi/git/github.com/example/fake-extension'))
+) {
+  throw new Error('package list smoke did not show managed npm and git install paths');
+}
+run(['update', '--extension', 'git:github.com/example/fake-extension'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+run(['update', '--extensions'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+const packageCommandRecords = fs.readFileSync(packageCommandRecord, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+if (
+  !packageCommandRecords.some((record) => record.command === 'npm' && record.args.includes('fake-extension@latest')) ||
+  !packageCommandRecords.some((record) => record.command === 'git' && record.args[0] === 'fetch') ||
+  !packageCommandRecords.some((record) => record.command === 'git' && record.args[0] === 'reset')
+) {
+  throw new Error('package update smoke did not run managed npm latest and git reconciliation commands');
+}
+run(['remove', 'npm:fake-extension'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+run(['remove', 'git:github.com/example/fake-extension', '--local'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+if (fs.existsSync(npmInstallPath) || fs.existsSync(gitInstallPath)) {
+  throw new Error('package remove smoke did not remove managed npm and git installs');
+}
+const packageSelfUpdateFailure = runFail(['update', '--self', '--force'], undefined, { cwd: packageCommandProject, env: packageCommandEnv });
+if (packageSelfUpdateFailure.status === 0 || !packageSelfUpdateFailure.stderr.includes('self-update is not implemented yet')) {
+  throw new Error('package self-update smoke did not fail visibly for the unimplemented self updater');
 }
 
 const settingsFixtureRoot = path.resolve('zig-out/pi-zig-settings-fixture');
