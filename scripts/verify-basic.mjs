@@ -1819,6 +1819,25 @@ try {
     throw new Error('top-level JSON mode smoke did not include provider-backed assistant output');
   }
 
+  const providerJsonToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-tool-model', '-p', 'please run the tool loop'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_tool_loop_1') ||
+    !providerJsonToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('tool-loop-ok')) ||
+    !providerJsonToolLines.some((line) => line.type === 'message_end' && line.message?.role === 'toolResult' && line.message?.toolCallId === 'call_tool_loop_1') ||
+    !providerJsonToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_tool_loop_1')) ||
+    !providerJsonToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('tool loop complete: tool-loop-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not emit provider-backed tool execution events');
+  }
+
   const providerToolLoop = run(
     ['--no-session', '--provider', 'openai', '--model', 'mock-tool-model', '-p', 'please run the tool loop'],
     undefined,

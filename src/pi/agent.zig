@@ -46,10 +46,28 @@ pub const ToolSet = struct {
 
 pub const RunResult = struct {
     final_text: []u8,
+    tool_results: []ToolResult = &.{},
     tool_results_count: usize = 0,
 
     pub fn deinit(self: RunResult, allocator: std.mem.Allocator) void {
         allocator.free(self.final_text);
+        for (self.tool_results) |result| result.deinit(allocator);
+        allocator.free(self.tool_results);
+    }
+};
+
+pub const ToolResult = struct {
+    tool_call_id: []u8,
+    tool_name: []u8,
+    arguments_json: []u8,
+    content: []u8,
+    is_error: bool = false,
+
+    pub fn deinit(self: ToolResult, allocator: std.mem.Allocator) void {
+        if (self.tool_call_id.len > 0) allocator.free(self.tool_call_id);
+        if (self.tool_name.len > 0) allocator.free(self.tool_name);
+        if (self.arguments_json.len > 0) allocator.free(self.arguments_json);
+        if (self.content.len > 0) allocator.free(self.content);
     }
 };
 
@@ -165,6 +183,12 @@ pub fn runPrompt(
     });
 
     var tool_results_count: usize = 0;
+    var tool_results: std.ArrayList(ToolResult) = .empty;
+    errdefer {
+        for (tool_results.items) |result| result.deinit(allocator);
+        tool_results.deinit(allocator);
+    }
+
     var tool_definitions_buf: [all_tool_definitions.len]ai_client.ChatToolDefinition = undefined;
     const tool_definitions = enabledToolDefinitions(options.tool_set, &tool_definitions_buf);
     var turn: usize = 0;
@@ -186,6 +210,7 @@ pub fn runPrompt(
             response.text = null;
             return .{
                 .final_text = text,
+                .tool_results = try tool_results.toOwnedSlice(allocator),
                 .tool_results_count = tool_results_count,
             };
         }
@@ -199,6 +224,9 @@ pub fn runPrompt(
             errdefer allocator.free(tool_output);
             const tool_call_id = try allocator.dupe(u8, call.id);
             errdefer allocator.free(tool_call_id);
+            const traced_tool_result = try createToolResultTrace(allocator, call, tool_output);
+            errdefer traced_tool_result.deinit(allocator);
+            try tool_results.append(allocator, traced_tool_result);
             try messages.append(allocator, .{
                 .role = .tool,
                 .content = tool_output,
@@ -245,6 +273,24 @@ fn appendAssistantToolCallMessage(
         .content = content,
         .tool_calls = response.tool_calls,
     });
+}
+
+fn createToolResultTrace(
+    allocator: std.mem.Allocator,
+    call: ai_client.ChatToolCall,
+    content: []const u8,
+) !ToolResult {
+    var result: ToolResult = .{
+        .tool_call_id = try allocator.dupe(u8, call.id),
+        .tool_name = &.{},
+        .arguments_json = &.{},
+        .content = &.{},
+    };
+    errdefer result.deinit(allocator);
+    result.tool_name = try allocator.dupe(u8, call.name);
+    result.arguments_json = try allocator.dupe(u8, call.arguments_json);
+    result.content = try allocator.dupe(u8, content);
+    return result;
 }
 
 fn executeToolCall(

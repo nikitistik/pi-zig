@@ -139,13 +139,13 @@ fn runTextPrintFoundation(
     }
 
     const response = try buildPrintResponse(io, allocator, env, parsed, prompt);
-    defer allocator.free(response);
+    defer response.deinit(allocator);
 
     if (store) |*persistent| {
-        _ = try persistent.appendMessage(io, allocator, .assistant, response);
+        _ = try persistent.appendMessage(io, allocator, .assistant, response.final_text);
     }
 
-    try writeStdout(io, response);
+    try writeStdout(io, response.final_text);
     try writeStdout(io, "\n");
 }
 
@@ -162,10 +162,10 @@ fn runJsonPrintFoundation(
     }
 
     const response = try buildPrintResponse(io, allocator, env, parsed, prompt);
-    defer allocator.free(response);
+    defer response.deinit(allocator);
 
     if (store) |*persistent| {
-        _ = try persistent.appendMessage(io, allocator, .assistant, response);
+        _ = try persistent.appendMessage(io, allocator, .assistant, response.final_text);
     }
 
     var buf: [16 * 1024]u8 = undefined;
@@ -181,20 +181,37 @@ fn runJsonPrintFoundation(
     try w.writeAll(",\"timestamp\":\"local-foundation\",\"cwd\":\".\"}\n");
     try w.writeAll("{\"type\":\"agent_start\"}\n");
     try w.writeAll("{\"type\":\"turn_start\"}\n");
+    for (response.tool_results) |tool_result| {
+        try writeToolExecutionStartJson(w, tool_result);
+        try w.writeByte('\n');
+        try writeToolExecutionEndJson(w, tool_result);
+        try w.writeByte('\n');
+        try w.writeAll("{\"type\":\"message_start\",\"message\":");
+        try writeToolResultMessageJson(w, tool_result);
+        try w.writeAll("}\n");
+        try w.writeAll("{\"type\":\"message_end\",\"message\":");
+        try writeToolResultMessageJson(w, tool_result);
+        try w.writeAll("}\n");
+    }
     try w.writeAll("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
     try w.writeAll("{\"type\":\"message_update\",\"message\":");
-    try writeAssistantMessageJson(w, response);
+    try writeAssistantMessageJson(w, response.final_text);
     try w.writeAll(",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":");
-    try writeJsonString(w, response);
+    try writeJsonString(w, response.final_text);
     try w.writeAll("}}\n");
     try w.writeAll("{\"type\":\"message_end\",\"message\":");
-    try writeAssistantMessageJson(w, response);
+    try writeAssistantMessageJson(w, response.final_text);
     try w.writeAll("}\n");
     try w.writeAll("{\"type\":\"turn_end\",\"message\":");
-    try writeAssistantMessageJson(w, response);
-    try w.writeAll(",\"toolResults\":[]}\n");
+    try writeAssistantMessageJson(w, response.final_text);
+    try w.writeAll(",\"toolResults\":[");
+    for (response.tool_results, 0..) |tool_result, index| {
+        if (index != 0) try w.writeByte(',');
+        try writeToolResultMessageJson(w, tool_result);
+    }
+    try w.writeAll("]}\n");
     try w.writeAll("{\"type\":\"agent_end\",\"messages\":[");
-    try writeAssistantMessageJson(w, response);
+    try writeAssistantMessageJson(w, response.final_text);
     try w.writeAll("]}\n");
     try w.flush();
 }
@@ -379,7 +396,7 @@ fn buildPrompt(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs)
     return .{ .text = try out.toOwnedSlice(), .owned = true };
 }
 
-fn buildFoundationResponse(allocator: std.mem.Allocator, parsed: cli.ParsedArgs, prompt: []const u8) ![]const u8 {
+fn buildFoundationResponse(allocator: std.mem.Allocator, parsed: cli.ParsedArgs, prompt: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -413,9 +430,9 @@ fn buildPrintResponse(
     env: *const std.process.Environ.Map,
     parsed: cli.ParsedArgs,
     prompt: []const u8,
-) ![]const u8 {
+) !agent.RunResult {
     if (parsed.provider == null or parsed.model == null) {
-        return buildFoundationResponse(allocator, parsed, prompt);
+        return .{ .final_text = try buildFoundationResponse(allocator, parsed, prompt) };
     }
 
     const provider = parsed.provider.?;
@@ -434,7 +451,7 @@ fn buildPrintResponse(
     const system_override = try buildSystemOverride(allocator, parsed);
     defer if (system_override) |value| allocator.free(value);
 
-    const run_result = agent.runPrompt(io, allocator, env, .{
+    return agent.runPrompt(io, allocator, env, .{
         .provider = provider,
         .model = model,
         .api_key = api_key,
@@ -447,7 +464,6 @@ fn buildPrintResponse(
         try writeStderr(io, "\n");
         return err;
     };
-    return run_result.final_text;
 }
 
 fn toolSetFromParsed(parsed: cli.ParsedArgs) agent.ToolSet {
@@ -495,6 +511,55 @@ fn writeAssistantMessageJson(w: *std.Io.Writer, text: []const u8) !void {
     try w.writeAll("{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":");
     try writeJsonString(w, text);
     try w.writeAll("}],\"stopReason\":\"end\"}");
+}
+
+fn writeToolExecutionStartJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {
+    try w.writeAll("{\"type\":\"tool_execution_start\",\"toolCallId\":");
+    try writeJsonString(w, tool_result.tool_call_id);
+    try w.writeAll(",\"toolName\":");
+    try writeJsonString(w, tool_result.tool_name);
+    try w.writeAll(",\"args\":");
+    try writeRawJsonObjectOrString(w, tool_result.arguments_json);
+    try w.writeByte('}');
+}
+
+fn writeToolExecutionEndJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {
+    try w.writeAll("{\"type\":\"tool_execution_end\",\"toolCallId\":");
+    try writeJsonString(w, tool_result.tool_call_id);
+    try w.writeAll(",\"toolName\":");
+    try writeJsonString(w, tool_result.tool_name);
+    try w.writeAll(",\"result\":");
+    try writeToolResultPayloadJson(w, tool_result);
+    try w.writeAll(",\"isError\":");
+    try w.writeAll(if (tool_result.is_error) "true" else "false");
+    try w.writeByte('}');
+}
+
+fn writeToolResultMessageJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {
+    try w.writeAll("{\"role\":\"toolResult\",\"toolCallId\":");
+    try writeJsonString(w, tool_result.tool_call_id);
+    try w.writeAll(",\"toolName\":");
+    try writeJsonString(w, tool_result.tool_name);
+    try w.writeAll(",\"content\":[{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, tool_result.content);
+    try w.writeAll("}],\"isError\":");
+    try w.writeAll(if (tool_result.is_error) "true" else "false");
+    try w.writeByte('}');
+}
+
+fn writeToolResultPayloadJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {
+    try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, tool_result.content);
+    try w.writeAll("}]}");
+}
+
+fn writeRawJsonObjectOrString(w: *std.Io.Writer, value: []const u8) !void {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
+        try w.writeAll(trimmed);
+        return;
+    }
+    try writeJsonString(w, value);
 }
 
 fn writeDiagnostics(io: std.Io, parsed: cli.ParsedArgs) !void {
