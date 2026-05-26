@@ -1,5 +1,5 @@
 const std = @import("std");
-const ai_client = @import("ai_client.zig");
+const agent = @import("agent.zig");
 const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const commands = @import("commands.zig");
@@ -434,7 +434,7 @@ fn buildPrintResponse(
     const system_override = try buildSystemOverride(allocator, parsed);
     defer if (system_override) |value| allocator.free(value);
 
-    return ai_client.runChatCompletion(io, allocator, env, .{
+    const run_result = agent.runPrompt(io, allocator, env, .{
         .provider = provider,
         .model = model,
         .api_key = api_key,
@@ -446,6 +446,7 @@ fn buildPrintResponse(
         try writeStderr(io, "\n");
         return err;
     };
+    return run_result.final_text;
 }
 
 fn buildSystemOverride(allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !?[]u8 {

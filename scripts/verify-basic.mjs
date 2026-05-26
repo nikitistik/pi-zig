@@ -47,6 +47,55 @@ const server = http.createServer((req, res) => {
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     const user = [...body.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
     const system = body.messages.find((message) => message.role === 'system')?.content ?? '';
+    const toolMessages = body.messages.filter((message) => message.role === 'tool');
+    if (user.includes('tool loop')) {
+      const hasBashTool = body.tools?.some((tool) => tool?.function?.name === 'bash') ?? false;
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_tool_loop_1',
+                type: 'function',
+                function: {
+                  name: 'bash',
+                  arguments: JSON.stringify({ command: 'printf tool-loop-ok' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const assistantToolMessage = body.messages.find((message) => message.role === 'assistant' && Array.isArray(message.tool_calls));
+      if (!assistantToolMessage) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing assistant tool call transcript' }));
+        return;
+      }
+      if (toolMessages.at(-1).tool_call_id !== 'call_tool_loop_1') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'tool result did not preserve tool_call_id' }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            content: 'tool loop complete: ' + toolOutput
+          }
+        }]
+      }));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       choices: [{
@@ -1668,6 +1717,15 @@ try {
     !providerJsonLines.some((line) => line.type === 'agent_end')
   ) {
     throw new Error('top-level JSON mode smoke did not include provider-backed assistant output');
+  }
+
+  const providerToolLoop = run(
+    ['--no-session', '--provider', 'openai', '--model', 'mock-tool-model', '-p', 'please run the tool loop'],
+    undefined,
+    { env: providerEnv }
+  );
+  if (!providerToolLoop.includes('tool loop complete: tool-loop-ok')) {
+    throw new Error('provider-backed agent loop did not execute bash tool call and return the follow-up response');
   }
 } finally {
   fakeProvider.stop();
