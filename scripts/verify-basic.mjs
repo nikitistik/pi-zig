@@ -48,8 +48,28 @@ const server = http.createServer((req, res) => {
     const user = [...body.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
     const system = body.messages.find((message) => message.role === 'system')?.content ?? '';
     const toolMessages = body.messages.filter((message) => message.role === 'tool');
+    const hasBashTool = body.tools?.some((tool) => tool?.function?.name === 'bash') ?? false;
+    if (user.includes('expect no tools')) {
+      if ((body.tools?.length ?? 0) !== 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected no tool definitions' }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'no tools observed' } }] }));
+      return;
+    }
+    if (user.includes('expect bash tool')) {
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'bash tool observed' } }] }));
+      return;
+    }
     if (user.includes('tool loop')) {
-      const hasBashTool = body.tools?.some((tool) => tool?.function?.name === 'bash') ?? false;
       if (!hasBashTool) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'missing bash tool definition' }));
@@ -1726,6 +1746,35 @@ try {
   );
   if (!providerToolLoop.includes('tool loop complete: tool-loop-ok')) {
     throw new Error('provider-backed agent loop did not execute bash tool call and return the follow-up response');
+  }
+
+  const providerNoTools = run(
+    ['--no-session', '--no-tools', '--provider', 'openai', '--model', 'mock-no-tools-model', '-p', 'expect no tools'],
+    undefined,
+    { env: providerEnv }
+  );
+  const providerNoBuiltinTools = run(
+    ['--no-session', '--no-builtin-tools', '--provider', 'openai', '--model', 'mock-no-builtin-tools-model', '-p', 'expect no tools'],
+    undefined,
+    { env: providerEnv }
+  );
+  const providerFilteredTools = run(
+    ['--no-session', '--tools', 'read,grep', '--provider', 'openai', '--model', 'mock-filtered-tools-model', '-p', 'expect no tools'],
+    undefined,
+    { env: providerEnv }
+  );
+  const providerBashTool = run(
+    ['--no-session', '--tools', 'bash', '--provider', 'openai', '--model', 'mock-bash-tool-model', '-p', 'expect bash tool'],
+    undefined,
+    { env: providerEnv }
+  );
+  if (
+    !providerNoTools.includes('no tools observed') ||
+    !providerNoBuiltinTools.includes('no tools observed') ||
+    !providerFilteredTools.includes('no tools observed') ||
+    !providerBashTool.includes('bash tool observed')
+  ) {
+    throw new Error('provider-backed agent loop did not honor CLI tool selection flags');
   }
 } finally {
   fakeProvider.stop();

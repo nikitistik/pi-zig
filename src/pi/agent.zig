@@ -9,6 +9,7 @@ pub const RunOptions = struct {
     prompt: []const u8,
     system_prompt: ?[]const u8 = null,
     max_turns: usize = 8,
+    enable_bash_tool: bool = true,
 };
 
 pub const RunResult = struct {
@@ -33,6 +34,7 @@ const default_tool_definitions = [_]ai_client.ChatToolDefinition{
         .parameters_json = bash_parameters_json,
     },
 };
+const no_tool_definitions = [_]ai_client.ChatToolDefinition{};
 
 const OwnedMessage = struct {
     role: ai_client.ChatRole,
@@ -84,6 +86,7 @@ pub fn runPrompt(
     });
 
     var tool_results_count: usize = 0;
+    const tool_definitions = if (options.enable_bash_tool) &default_tool_definitions else &no_tool_definitions;
     var turn: usize = 0;
     while (turn < options.max_turns) : (turn += 1) {
         const borrowed = try borrowMessages(allocator, messages.items);
@@ -94,7 +97,7 @@ pub fn runPrompt(
             .model = options.model,
             .api_key = options.api_key,
             .messages = borrowed,
-            .tools = &default_tool_definitions,
+            .tools = tool_definitions,
         });
         defer response.deinit(allocator);
 

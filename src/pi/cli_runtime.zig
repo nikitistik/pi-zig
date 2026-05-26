@@ -440,6 +440,7 @@ fn buildPrintResponse(
         .api_key = api_key,
         .prompt = prompt,
         .system_prompt = system_override,
+        .enable_bash_tool = shouldEnableBashTool(parsed),
     }) catch |err| {
         try writeStderr(io, "Provider request failed: ");
         try writeStderr(io, @errorName(err));
@@ -447,6 +448,22 @@ fn buildPrintResponse(
         return err;
     };
     return run_result.final_text;
+}
+
+fn shouldEnableBashTool(parsed: cli.ParsedArgs) bool {
+    if (parsed.no_tools or parsed.no_builtin_tools) return false;
+    if (parsed.tools) |value| return toolListContains(value, "bash");
+    return true;
+}
+
+fn toolListContains(value: []const u8, needle: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, needle)) return true;
+        if (std.mem.eql(u8, trimmed, "*") or std.mem.eql(u8, trimmed, "all")) return true;
+    }
+    return false;
 }
 
 fn buildSystemOverride(allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !?[]u8 {
@@ -529,4 +546,13 @@ test "top-level prompt builder combines messages" {
     const prompt = try buildPrompt(std.testing.io, std.testing.allocator, parsed);
     defer prompt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("hello\n\nworld", prompt.text);
+}
+
+test "provider bash tool follows tool flags" {
+    try std.testing.expect(shouldEnableBashTool(cli.parse(&.{})));
+    try std.testing.expect(!shouldEnableBashTool(cli.parse(&.{"--no-tools"})));
+    try std.testing.expect(!shouldEnableBashTool(cli.parse(&.{"--no-builtin-tools"})));
+    try std.testing.expect(shouldEnableBashTool(cli.parse(&.{ "--tools", "read,bash" })));
+    try std.testing.expect(!shouldEnableBashTool(cli.parse(&.{ "--tools", "read,grep" })));
+    try std.testing.expect(shouldEnableBashTool(cli.parse(&.{ "--tools", "all" })));
 }
