@@ -376,6 +376,12 @@ fn parseOpenAICompatibleStreamData(
         }
         return;
     }
+    if (isAnthropicStreamEvent(parsed.value)) {
+        if (try anthropicStreamTextDelta(parsed.value)) |delta| {
+            if (delta.len > 0) try callback(callback_context, delta);
+        }
+        return;
+    }
     const delta = try firstStreamDelta(parsed.value) orelse return;
     const content = delta.object.get("content") orelse return;
     if (content == .null) return;
@@ -394,6 +400,10 @@ fn parseOpenAICompatibleStreamResultData(
     defer parsed.deinit();
     if (isResponseStreamEvent(parsed.value)) {
         try accumulator.appendResponseStreamEvent(parsed.value, text_callback_context, text_callback);
+        return;
+    }
+    if (isAnthropicStreamEvent(parsed.value)) {
+        try accumulator.appendAnthropicStreamEvent(parsed.value, text_callback_context, text_callback);
         return;
     }
     const delta = try firstStreamDelta(parsed.value) orelse return;
@@ -415,6 +425,29 @@ fn responseStreamTextDelta(value: std.json.Value) !?[]const u8 {
     const delta = value.object.get("delta") orelse return error.ProviderResponseInvalid;
     if (delta != .string) return error.ProviderResponseInvalid;
     return delta.string;
+}
+
+fn isAnthropicStreamEvent(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const event_type = value.object.get("type") orelse return false;
+    if (event_type != .string) return false;
+    return std.mem.eql(u8, event_type.string, "message_start") or
+        std.mem.eql(u8, event_type.string, "content_block_start") or
+        std.mem.eql(u8, event_type.string, "content_block_delta") or
+        std.mem.eql(u8, event_type.string, "content_block_stop") or
+        std.mem.eql(u8, event_type.string, "message_delta") or
+        std.mem.eql(u8, event_type.string, "message_stop");
+}
+
+fn anthropicStreamTextDelta(value: std.json.Value) !?[]const u8 {
+    if (value != .object) return error.ProviderResponseInvalid;
+    const event_type = try requiredObjectString(value, "type");
+    if (!std.mem.eql(u8, event_type, "content_block_delta")) return null;
+    const delta = value.object.get("delta") orelse return error.ProviderResponseInvalid;
+    if (delta != .object) return error.ProviderResponseInvalid;
+    const delta_type = try requiredObjectString(delta, "type");
+    if (!std.mem.eql(u8, delta_type, "text_delta")) return null;
+    return try requiredObjectString(delta, "text");
 }
 
 fn firstStreamDelta(value: std.json.Value) !?std.json.Value {
@@ -531,6 +564,39 @@ const StreamChatAccumulator = struct {
         }
     }
 
+    fn appendAnthropicStreamEvent(
+        self: *StreamChatAccumulator,
+        value: std.json.Value,
+        text_callback_context: ?*anyopaque,
+        text_callback: ?StreamTextCallback,
+    ) !void {
+        const event_type = try requiredObjectString(value, "type");
+        if (std.mem.eql(u8, event_type, "content_block_start")) {
+            const content_block = value.object.get("content_block") orelse return error.ProviderResponseInvalid;
+            if (try isAnthropicToolUseBlock(content_block)) {
+                const index = try anthropicEventIndex(value);
+                try self.startAnthropicToolUse(index, content_block);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, event_type, "content_block_delta")) {
+            const delta = value.object.get("delta") orelse return error.ProviderResponseInvalid;
+            if (delta != .object) return error.ProviderResponseInvalid;
+            const delta_type = try requiredObjectString(delta, "type");
+            if (std.mem.eql(u8, delta_type, "text_delta")) {
+                try self.appendTextDelta(try requiredObjectString(delta, "text"), text_callback_context, text_callback);
+                return;
+            }
+            if (std.mem.eql(u8, delta_type, "input_json_delta")) {
+                const index = try anthropicEventIndex(value);
+                if (index >= self.tool_calls.items.len or !self.tool_calls.items[index].seen) return;
+                try self.tool_calls.items[index].arguments_json.writer.writeAll(try requiredObjectString(delta, "partial_json"));
+                return;
+            }
+            return;
+        }
+    }
+
     fn appendTextDelta(
         self: *StreamChatAccumulator,
         delta: []const u8,
@@ -606,6 +672,20 @@ const StreamChatAccumulator = struct {
             try call.replaceArguments(self.allocator, arguments);
         }
         self.response_tool_index = null;
+    }
+
+    fn startAnthropicToolUse(self: *StreamChatAccumulator, index: usize, content_block: std.json.Value) !void {
+        const call = try self.ensureToolCall(index);
+        call.seen = true;
+        try call.id.writer.writeAll(try requiredObjectString(content_block, "id"));
+        try call.name.writer.writeAll(try requiredObjectString(content_block, "name"));
+        if (content_block.object.get("input")) |input| {
+            if (try shouldSerializeInitialToolInput(input)) {
+                const arguments_json = try jsonValueToOwnedString(self.allocator, input);
+                defer self.allocator.free(arguments_json);
+                try call.arguments_json.writer.writeAll(arguments_json);
+            }
+        }
     }
 
     fn ensureToolCall(self: *StreamChatAccumulator, index: usize) !*StreamToolCallAccumulator {
@@ -689,6 +769,32 @@ fn isResponseFunctionCallItem(item: std.json.Value) !bool {
     const item_type = item.object.get("type") orelse return false;
     if (item_type != .string) return error.ProviderResponseInvalid;
     return std.mem.eql(u8, item_type.string, "function_call");
+}
+
+fn anthropicEventIndex(value: std.json.Value) !usize {
+    if (value != .object) return error.ProviderResponseInvalid;
+    const index = value.object.get("index") orelse return error.ProviderResponseInvalid;
+    return streamToolCallIndex(index);
+}
+
+fn isAnthropicToolUseBlock(content_block: std.json.Value) !bool {
+    if (content_block != .object) return error.ProviderResponseInvalid;
+    const block_type = content_block.object.get("type") orelse return false;
+    if (block_type != .string) return error.ProviderResponseInvalid;
+    return std.mem.eql(u8, block_type.string, "tool_use");
+}
+
+fn shouldSerializeInitialToolInput(value: std.json.Value) !bool {
+    if (value == .null) return false;
+    if (value == .object and value.object.count() == 0) return false;
+    return true;
+}
+
+fn jsonValueToOwnedString(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
 }
 
 fn streamToolCallIndex(value: std.json.Value) !usize {
@@ -995,6 +1101,57 @@ test "assembles OpenAI Responses function call stream events" {
     try std.testing.expectEqualStrings("call_1|item_1", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"command\":\"printf response-ok\"}", result.tool_calls[0].arguments_json);
+}
+
+test "assembles Anthropic text stream events" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":0}}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"anthropic "}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"text"}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"content_block_stop","index":0}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"message_stop"}
+    , &accumulator, null, null);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("anthropic text", result.text.?);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+}
+
+test "assembles Anthropic tool use stream events" {
+    var accumulator = StreamChatAccumulator.init(std.testing.allocator);
+    errdefer accumulator.deinit();
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_anthropic","name":"bash","input":{}}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"printf "}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"anthropic-ok\"}"}}
+    , &accumulator, null, null);
+    try parseOpenAICompatibleStreamResultData(std.testing.allocator,
+        \\{"type":"content_block_stop","index":0}
+    , &accumulator, null, null);
+    const result = try accumulator.toResult();
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.text == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_anthropic", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"printf anthropic-ok\"}", result.tool_calls[0].arguments_json);
 }
 
 test "provider base URL appends chat completions endpoint" {

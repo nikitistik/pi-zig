@@ -188,6 +188,50 @@ const server = http.createServer((req, res) => {
       ]);
       return;
     }
+    if (user.includes('anthropic stream tool events')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected streaming request' }));
+        return;
+      }
+      if (!hasBashTool) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing bash tool definition' }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { type: 'message_start', message: { id: 'msg_anthropic_stream_1', usage: { input_tokens: 1, output_tokens: 0 } } },
+          { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'call_anthropic_stream_1', name: 'bash', input: {} } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"command":"printf ' } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: 'anthropic-tool-ok"}' } },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 1 } },
+          { type: 'message_stop' }
+        ]);
+        return;
+      }
+      if (toolMessages.at(-1).tool_call_id !== 'call_anthropic_stream_1') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Anthropic tool result did not preserve tool_call_id', toolMessages }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolOutput !== 'anthropic-tool-ok') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'unexpected Anthropic tool output', toolOutput }));
+        return;
+      }
+      writeStreamEvents([
+        { type: 'message_start', message: { id: 'msg_anthropic_stream_2', usage: { input_tokens: 1, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'anthropic stream ' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'tool complete: ' + toolOutput } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_stop' }
+      ]);
+      return;
+    }
     if (user.includes('streaming tool loop')) {
       if (body.stream !== true) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2592,6 +2636,27 @@ try {
     !providerJsonResponsesToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('responses stream tool complete: responses-tool-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not assemble OpenAI Responses streamed tool calls');
+  }
+
+  const providerJsonAnthropicToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'mock-json-anthropic-tool-model', '-p', 'please run anthropic stream tool events'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonAnthropicToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'bash' && line.toolCallId === 'call_anthropic_stream_1') ||
+    !providerJsonAnthropicToolLines.some((line) => line.type === 'tool_execution_update' && line.toolName === 'bash' && line.toolCallId === 'call_anthropic_stream_1' && JSON.stringify(line.partialResult).includes('anthropic-tool-ok')) ||
+    !providerJsonAnthropicToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'bash' && JSON.stringify(line.result).includes('anthropic-tool-ok')) ||
+    !providerJsonAnthropicToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_anthropic_stream_1')) ||
+    !providerJsonAnthropicToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'anthropic stream ') ||
+    !providerJsonAnthropicToolLines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === 'tool complete: anthropic-tool-ok') ||
+    !providerJsonAnthropicToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('anthropic stream tool complete: anthropic-tool-ok'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not assemble Anthropic streamed tool calls');
   }
 
   const providerJsonToolErrorLines = run(
