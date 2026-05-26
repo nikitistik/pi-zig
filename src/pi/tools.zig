@@ -114,6 +114,16 @@ const FindEntry = struct {
     is_dir: bool,
 };
 
+const FindIgnoreRule = struct {
+    base: []u8,
+    pattern: []u8,
+    negated: bool,
+    dir_only: bool,
+    anchored: bool,
+    has_slash: bool,
+    sequence: usize,
+};
+
 pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit: usize) !void {
     const effective_limit = if (limit == 0) default_ls_limit else limit;
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
@@ -165,6 +175,9 @@ pub fn findFiles(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, 
     var walker = try dir.walk(allocator);
     defer walker.deinit();
 
+    var ignore_rules = try loadFindIgnoreRules(io, allocator, path);
+    defer deinitFindIgnoreRules(allocator, &ignore_rules);
+
     var entries: std.ArrayList(FindEntry) = .empty;
     defer {
         for (entries.items) |entry| allocator.free(entry.path);
@@ -175,6 +188,11 @@ pub fn findFiles(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, 
     while (try walker.next(io)) |entry| {
         if (entry.kind == .directory and shouldSkipFindDir(entry.basename)) {
             walker.leave(io);
+            continue;
+        }
+        const is_dir = entry.kind == .directory;
+        if (isFindIgnored(ignore_rules.items, entry.path, is_dir)) {
+            if (is_dir) walker.leave(io);
             continue;
         }
         if (entry.kind != .file and entry.kind != .directory) continue;
@@ -894,6 +912,145 @@ fn writeSize(w: *std.Io.Writer, bytes: usize) !void {
 fn stripTrailingCarriageReturn(value: []const u8) []const u8 {
     if (value.len > 0 and value[value.len - 1] == '\r') return value[0 .. value.len - 1];
     return value;
+}
+
+fn loadFindIgnoreRules(io: std.Io, allocator: std.mem.Allocator, root_path: []const u8) !std.ArrayList(FindIgnoreRule) {
+    var rules: std.ArrayList(FindIgnoreRule) = .empty;
+    errdefer deinitFindIgnoreRules(allocator, &rules);
+
+    var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+
+    var sequence: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .directory and shouldSkipFindDir(entry.basename)) {
+            walker.leave(io);
+            continue;
+        }
+        if (entry.kind != .file or !std.mem.eql(u8, entry.basename, ".gitignore")) continue;
+        const full_path = try std.fs.path.join(allocator, &.{ root_path, entry.path });
+        defer allocator.free(full_path);
+        const base = std.fs.path.dirname(entry.path) orelse "";
+        try appendFindIgnoreFile(io, allocator, &rules, full_path, base, &sequence);
+    }
+    std.mem.sort(FindIgnoreRule, rules.items, {}, lessThanFindIgnoreRule);
+    return rules;
+}
+
+fn appendFindIgnoreFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    rules: *std.ArrayList(FindIgnoreRule),
+    file_path: []const u8,
+    base: []const u8,
+    sequence: *usize,
+) !void {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(128 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        var line = std.mem.trim(u8, stripTrailingCarriageReturn(raw_line), " \t");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var negated = false;
+        if (line[0] == '!') {
+            negated = true;
+            line = line[1..];
+        }
+        if (line.len == 0) continue;
+
+        var anchored = false;
+        if (line[0] == '/') {
+            anchored = true;
+            line = line[1..];
+        }
+
+        var dir_only = false;
+        while (line.len > 0 and line[line.len - 1] == '/') {
+            dir_only = true;
+            line = line[0 .. line.len - 1];
+        }
+        if (line.len == 0) continue;
+
+        const owned_base = try allocator.dupe(u8, base);
+        errdefer allocator.free(owned_base);
+        const owned_pattern = try allocator.dupe(u8, line);
+        errdefer allocator.free(owned_pattern);
+
+        try rules.append(allocator, .{
+            .base = owned_base,
+            .pattern = owned_pattern,
+            .negated = negated,
+            .dir_only = dir_only,
+            .anchored = anchored,
+            .has_slash = hasSlash(line),
+            .sequence = sequence.*,
+        });
+        sequence.* += 1;
+    }
+}
+
+fn deinitFindIgnoreRules(allocator: std.mem.Allocator, rules: *std.ArrayList(FindIgnoreRule)) void {
+    for (rules.items) |rule| {
+        allocator.free(rule.base);
+        allocator.free(rule.pattern);
+    }
+    rules.deinit(allocator);
+}
+
+fn lessThanFindIgnoreRule(_: void, left: FindIgnoreRule, right: FindIgnoreRule) bool {
+    const left_depth = pathDepth(left.base);
+    const right_depth = pathDepth(right.base);
+    if (left_depth != right_depth) return left_depth < right_depth;
+    return left.sequence < right.sequence;
+}
+
+fn pathDepth(path: []const u8) usize {
+    if (path.len == 0) return 0;
+    return std.mem.count(u8, path, "/") + 1;
+}
+
+fn isFindIgnored(rules: []const FindIgnoreRule, path: []const u8, is_dir: bool) bool {
+    var ignored = false;
+    for (rules) |rule| {
+        const scoped = scopedIgnorePath(rule.base, path) orelse continue;
+        if (!matchesIgnoreRule(rule, scoped, is_dir)) continue;
+        ignored = !rule.negated;
+    }
+    return ignored;
+}
+
+fn scopedIgnorePath(base: []const u8, path: []const u8) ?[]const u8 {
+    if (base.len == 0) return path;
+    if (std.mem.eql(u8, path, base)) return "";
+    if (std.mem.startsWith(u8, path, base) and path.len > base.len and path[base.len] == '/') {
+        return path[base.len + 1 ..];
+    }
+    return null;
+}
+
+fn matchesIgnoreRule(rule: FindIgnoreRule, scoped_path: []const u8, is_dir: bool) bool {
+    if (scoped_path.len == 0) return false;
+    if (!rule.dir_only) return matchesIgnorePattern(rule, scoped_path);
+
+    if (is_dir and matchesIgnorePattern(rule, scoped_path)) return true;
+    var end: usize = 0;
+    while (end < scoped_path.len) : (end += 1) {
+        if (scoped_path[end] != '/') continue;
+        if (matchesIgnorePattern(rule, scoped_path[0..end])) return true;
+    }
+    return false;
+}
+
+fn matchesIgnorePattern(rule: FindIgnoreRule, candidate: []const u8) bool {
+    if (rule.anchored or rule.has_slash) return wildcardMatch(rule.pattern, candidate);
+    return wildcardMatch(rule.pattern, basename(candidate));
 }
 
 fn shouldSkipFindDir(name: []const u8) bool {

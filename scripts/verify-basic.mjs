@@ -1592,6 +1592,46 @@ const findLarge = run(['tool-find', '*.log', findLargeFixture, '1000']);
 if (!findLarge.includes('50.0KB limit reached')) {
   throw new Error('tool-find smoke did not report byte truncation notice');
 }
+const findIgnoreFixture = 'zig-out/pi-zig-find-ignore-fixture';
+fs.rmSync(findIgnoreFixture, { recursive: true, force: true });
+fs.mkdirSync(path.join(findIgnoreFixture, 'src/generated'), { recursive: true });
+fs.mkdirSync(path.join(findIgnoreFixture, 'build'), { recursive: true });
+fs.mkdirSync(path.join(findIgnoreFixture, 'nested'), { recursive: true });
+fs.writeFileSync(
+  path.join(findIgnoreFixture, '.gitignore'),
+  ['# root ignore rules', '*.log', '!keep.log', '/root-only.txt', 'build/'].join('\n')
+);
+fs.writeFileSync(path.join(findIgnoreFixture, 'src/.gitignore'), ['*.tmp', '!keep.tmp', 'generated/'].join('\n'));
+fs.writeFileSync(path.join(findIgnoreFixture, 'error.log'), '');
+fs.writeFileSync(path.join(findIgnoreFixture, 'keep.log'), '');
+fs.writeFileSync(path.join(findIgnoreFixture, 'root-only.txt'), '');
+fs.writeFileSync(path.join(findIgnoreFixture, 'nested/root-only.txt'), '');
+fs.writeFileSync(path.join(findIgnoreFixture, 'build/out.txt'), '');
+fs.writeFileSync(path.join(findIgnoreFixture, 'src/local.tmp'), '');
+fs.writeFileSync(path.join(findIgnoreFixture, 'src/keep.tmp'), '');
+fs.writeFileSync(path.join(findIgnoreFixture, 'src/generated/drop.ts'), '');
+fs.writeFileSync(path.join(findIgnoreFixture, 'src/visible.ts'), '');
+const findIgnoreLogs = run(['tool-find', '*.log', findIgnoreFixture, '20']);
+if (findIgnoreLogs.includes('error.log') || !findIgnoreLogs.split('\n').includes('keep.log')) {
+  throw new Error('tool-find .gitignore smoke did not apply basename ignore and negation rules');
+}
+const findIgnoreTemps = run(['tool-find', '*.tmp', findIgnoreFixture, '20']);
+if (findIgnoreTemps.includes('src/local.tmp') || !findIgnoreTemps.split('\n').includes('src/keep.tmp')) {
+  throw new Error('tool-find .gitignore smoke did not apply nested ignore and negation rules');
+}
+const findIgnoreTexts = run(['tool-find', '*.txt', findIgnoreFixture, '20']);
+const findIgnoreTextLines = findIgnoreTexts.split('\n');
+if (
+  findIgnoreTextLines.includes('root-only.txt') ||
+  findIgnoreTextLines.includes('build/out.txt') ||
+  !findIgnoreTextLines.includes('nested/root-only.txt')
+) {
+  throw new Error('tool-find .gitignore smoke did not apply rooted and directory ignore rules');
+}
+const findIgnoreTs = run(['tool-find', '*.ts', findIgnoreFixture, '20']);
+if (findIgnoreTs.includes('src/generated/drop.ts') || !findIgnoreTs.split('\n').includes('src/visible.ts')) {
+  throw new Error('tool-find .gitignore smoke did not skip ignored nested directories');
+}
 
 const writeOutput = run(['tool-write', 'zig-out/pi-zig-tool-write-smoke/nested/write.txt', 'pi-zig write smoke']);
 if (!writeOutput.includes('Successfully wrote 18 bytes to zig-out/pi-zig-tool-write-smoke/nested/write.txt')) {
