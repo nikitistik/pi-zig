@@ -125,7 +125,7 @@ const commands = [
   'zig build run -- parse-args --provider openai -p ok',
   'zig build run -- tool-read README.md 1 2000',
   'zig build run -- tool-ls . 500',
-  'zig build run -- tool-grep pi-zig README.md',
+  'zig build run -- tool-grep "Zig + Preact" README.md --literal --limit 20',
   'zig build run -- tool-find README.md . 20',
   'zig build run -- tool-write zig-out/pi-zig-tool-edit-smoke.txt "alpha beta"',
   'zig build run -- tool-edit zig-out/pi-zig-tool-edit-smoke.txt beta gamma',

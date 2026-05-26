@@ -2,8 +2,10 @@ const std = @import("std");
 
 const default_find_limit = 1000;
 const default_ls_limit = 500;
+const default_grep_limit = 100;
 const default_read_max_lines = 2000;
 const default_read_max_bytes = 50 * 1024;
+const grep_max_line_chars = 500;
 const max_read_file_bytes = 16 * 1024 * 1024;
 const max_edit_file_bytes = 4 * 1024 * 1024;
 
@@ -13,6 +15,14 @@ pub const ShellResult = struct {
     cancelled: bool = false,
     truncated: bool = false,
     full_output_path: ?[]const u8 = null,
+};
+
+pub const GrepOptions = struct {
+    glob: ?[]const u8 = null,
+    ignore_case: bool = false,
+    literal: bool = false,
+    context: usize = 0,
+    limit: usize = default_grep_limit,
 };
 
 pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -179,6 +189,133 @@ pub fn grepFile(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, p
     try w.flush();
 }
 
+pub fn grep(io: std.Io, allocator: std.mem.Allocator, pattern: []const u8, path: []const u8, options: GrepOptions) !void {
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    const is_dir = stat.kind == .directory;
+    const run_cwd = if (is_dir) path else std.fs.path.dirname(path) orelse ".";
+    const target = if (is_dir) "." else std.fs.path.basename(path);
+    const effective_limit = if (options.limit == 0) default_grep_limit else options.limit;
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
+        "rg",
+        "--line-number",
+        "--color=never",
+        "--hidden",
+        "--with-filename",
+        "--no-heading",
+    });
+    var context_buf: [32]u8 = undefined;
+    if (options.context > 0) {
+        var fixed = std.Io.Writer.fixed(&context_buf);
+        try fixed.print("{d}", .{options.context});
+        try argv.appendSlice(allocator, &.{ "--context", fixed.buffered() });
+    }
+    if (options.ignore_case) try argv.append(allocator, "--ignore-case");
+    if (options.literal) try argv.append(allocator, "--fixed-strings");
+    if (options.glob) |glob| try argv.appendSlice(allocator, &.{ "--glob", glob });
+    try argv.appendSlice(allocator, &.{ "--", pattern, target });
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = run_cwd },
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+        .expand_arg0 = .expand,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const code = switch (result.term) {
+        .exited => |value| value,
+        else => return error.CommandFailed,
+    };
+    if (code != 0 and code != 1) {
+        if (result.stderr.len > 0) try std.Io.File.stderr().writeStreamingAll(io, result.stderr);
+        return error.CommandFailed;
+    }
+    if (result.stdout.len == 0) {
+        try std.Io.File.stdout().writeStreamingAll(io, "No matches found\n");
+        return;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var match_count: usize = 0;
+    var limit_reached = false;
+    var lines_truncated = false;
+    var emitted_lines: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |raw_line| {
+        var line = stripTrailingCarriageReturn(raw_line);
+        if (line.len == 0 or std.mem.eql(u8, line, "--")) continue;
+        if (std.mem.startsWith(u8, line, "./")) line = line[2..];
+
+        const info = grepLineInfo(line);
+        if (info) |line_info| {
+            if (line_info.is_match) {
+                if (match_count >= effective_limit) {
+                    limit_reached = true;
+                    break;
+                }
+                match_count += 1;
+            }
+        }
+
+        if (emitted_lines != 0) try out.writer.writeByte('\n');
+        if (info) |line_info| {
+            try out.writer.writeAll(line[0..line_info.text_start]);
+            const text = line[line_info.text_start..];
+            if (text.len > grep_max_line_chars) {
+                try out.writer.writeAll(text[0..grep_max_line_chars]);
+                try out.writer.writeAll("... [truncated]");
+                lines_truncated = true;
+            } else {
+                try out.writer.writeAll(text);
+            }
+        } else {
+            try out.writer.writeAll(line);
+        }
+        emitted_lines += 1;
+    }
+
+    if (match_count == 0) {
+        try std.Io.File.stdout().writeStreamingAll(io, "No matches found\n");
+        return;
+    }
+
+    const truncation = try truncateHead(allocator, out.written(), std.math.maxInt(usize), default_read_max_bytes);
+    defer allocator.free(truncation.content);
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buf);
+    const w = &writer.interface;
+    try w.writeAll(truncation.content);
+
+    var notice_count: usize = 0;
+    if (limit_reached or truncation.truncated or lines_truncated) {
+        try w.writeAll("\n\n[");
+        if (limit_reached) {
+            try w.print("{d} matches limit reached. Use limit={d} for more, or refine pattern", .{ effective_limit, effective_limit * 2 });
+            notice_count += 1;
+        }
+        if (truncation.truncated) {
+            if (notice_count != 0) try w.writeAll(". ");
+            try writeSize(w, default_read_max_bytes);
+            try w.writeAll(" limit reached");
+            notice_count += 1;
+        }
+        if (lines_truncated) {
+            if (notice_count != 0) try w.writeAll(". ");
+            try w.print("Some lines truncated to {d} chars. Use read tool to see full lines", .{grep_max_line_chars});
+        }
+        try w.writeAll("]");
+    }
+    try w.flush();
+}
+
 pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_text: []const u8, new_text: []const u8) !void {
     if (old_text.len == 0) return error.EmptyEditTarget;
 
@@ -264,6 +401,29 @@ const Truncation = struct {
     output_lines: usize,
     first_line_exceeds_limit: bool = false,
 };
+
+const GrepLineInfo = struct {
+    text_start: usize,
+    is_match: bool,
+};
+
+fn grepLineInfo(line: []const u8) ?GrepLineInfo {
+    var index: usize = 0;
+    while (index < line.len) : (index += 1) {
+        const separator = line[index];
+        if (separator != ':' and separator != '-') continue;
+        var digit_index = index + 1;
+        if (digit_index >= line.len or !std.ascii.isDigit(line[digit_index])) continue;
+        while (digit_index < line.len and std.ascii.isDigit(line[digit_index])) : (digit_index += 1) {}
+        if (digit_index < line.len and line[digit_index] == separator) {
+            return .{
+                .text_start = digit_index + 1,
+                .is_match = separator == ':',
+            };
+        }
+    }
+    return null;
+}
 
 fn truncateHead(allocator: std.mem.Allocator, content: []const u8, max_lines: usize, max_bytes: usize) !Truncation {
     const total_lines = countOutputLines(content);
@@ -356,6 +516,11 @@ fn writeSize(w: *std.Io.Writer, bytes: usize) !void {
         const tenths = (bytes * 10) / (1024 * 1024);
         try w.print("{d}.{d}MB", .{ tenths / 10, tenths % 10 });
     }
+}
+
+fn stripTrailingCarriageReturn(value: []const u8) []const u8 {
+    if (value.len > 0 and value[value.len - 1] == '\r') return value[0 .. value.len - 1];
+    return value;
 }
 
 fn shouldSkipFindDir(name: []const u8) bool {

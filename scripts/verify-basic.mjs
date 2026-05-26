@@ -1498,9 +1498,29 @@ if (
   throw new Error('tool-ls smoke did not sort entries, mark directories, and report entry limits');
 }
 
-const grep = run(['tool-grep', 'Zig + Preact', 'README.md']);
+const grep = run(['tool-grep', 'Zig + Preact', 'README.md', '--literal']);
 if (!grep.includes('Zig + Preact porting workspace')) {
   throw new Error('tool-grep smoke did not find README line');
+}
+const grepFixture = 'zig-out/pi-zig-grep-fixture';
+fs.rmSync(grepFixture, { recursive: true, force: true });
+fs.mkdirSync(path.join(grepFixture, 'src'), { recursive: true });
+fs.writeFileSync(path.join(grepFixture, 'src/a.txt'), ['before', 'Needle alpha', 'after'].join('\n'));
+fs.writeFileSync(path.join(grepFixture, 'src/b.md'), ['needle beta', 'skip'].join('\n'));
+fs.writeFileSync(path.join(grepFixture, 'src/c.txt'), ['x'.repeat(505) + ' needle gamma'].join('\n'));
+const grepDirectory = run(['tool-grep', 'needle', grepFixture, '--glob', '*.txt', '--ignore-case', '--literal', '--context', '1', '--limit', '1']);
+if (
+  !grepDirectory.includes('src/a.txt-1-before') ||
+  !grepDirectory.includes('src/a.txt:2:Needle alpha') ||
+  !grepDirectory.includes('src/a.txt-3-after') ||
+  grepDirectory.includes('src/b.md') ||
+  !grepDirectory.includes('[1 matches limit reached. Use limit=2 for more, or refine pattern]')
+) {
+  throw new Error('tool-grep directory smoke did not honor glob, ignore-case, literal, context, and match limit');
+}
+const grepLongLine = run(['tool-grep', 'needle', grepFixture, '--glob', '*.txt', '--ignore-case', '--literal', '--limit', '10']);
+if (!grepLongLine.includes('... [truncated]') || !grepLongLine.includes('Some lines truncated to 500 chars')) {
+  throw new Error('tool-grep long-line smoke did not truncate long matches with notice');
 }
 
 const find = run(['tool-find', 'README.md', '.', '20']);

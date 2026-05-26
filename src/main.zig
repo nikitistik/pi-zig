@@ -125,8 +125,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "tool-grep")) {
-        if (args.len < 4) return usage(init.io);
-        return pi.tools.grepFile(init.io, init.gpa, args[2], args[3], 512 * 1024);
+        if (args.len < 3) return usage(init.io);
+        const parsed = parseGrepArgs(args[3..]) catch return usage(init.io);
+        return pi.tools.grep(init.io, init.gpa, args[2], parsed.path, parsed.options);
     }
 
     if (std.mem.eql(u8, command, "tool-find")) {
@@ -184,7 +185,7 @@ fn usage(io: std.Io) !void {
         \\  tool-read <path> [offset] [limit]
         \\  tool-bash <command>
         \\  tool-ls [path] [limit]
-        \\  tool-grep <pattern> <path>
+        \\  tool-grep <pattern> [path] [--glob <glob>] [--ignore-case] [--literal] [--context <n>] [--limit <n>]
         \\  tool-find <pattern> [path] [limit]
         \\  tool-write <path> <content>
         \\  tool-edit <path> <oldText> <newText>
@@ -199,6 +200,45 @@ fn usage(io: std.Io) !void {
 
 fn writeAll(io: std.Io, bytes: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io, bytes);
+}
+
+const ParsedGrepArgs = struct {
+    path: []const u8 = ".",
+    options: pi.tools.GrepOptions = .{},
+};
+
+fn parseGrepArgs(args: []const []const u8) !ParsedGrepArgs {
+    var parsed = ParsedGrepArgs{};
+    var saw_path = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--glob")) {
+            if (index + 1 >= args.len) return error.InvalidArgs;
+            index += 1;
+            parsed.options.glob = args[index];
+        } else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) {
+            parsed.options.ignore_case = true;
+        } else if (std.mem.eql(u8, arg, "--literal") or std.mem.eql(u8, arg, "-F")) {
+            parsed.options.literal = true;
+        } else if (std.mem.eql(u8, arg, "--context") or std.mem.eql(u8, arg, "-C")) {
+            if (index + 1 >= args.len) return error.InvalidArgs;
+            index += 1;
+            parsed.options.context = try std.fmt.parseInt(usize, args[index], 10);
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            if (index + 1 >= args.len) return error.InvalidArgs;
+            index += 1;
+            parsed.options.limit = try std.fmt.parseInt(usize, args[index], 10);
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.InvalidArgs;
+        } else if (!saw_path) {
+            parsed.path = arg;
+            saw_path = true;
+        } else {
+            return error.InvalidArgs;
+        }
+    }
+    return parsed;
 }
 
 fn commandOptionsFromInit(init: std.process.Init) pi.commands.Options {
