@@ -781,6 +781,71 @@ if (postRemoveAuthStatus.source !== 'environment' || postRemoveAuthStatus.config
   throw new Error('auth remove smoke did not remove stored credential and reveal env fallback');
 }
 
+const extensionsFixtureRoot = path.resolve('zig-out/pi-zig-extensions-fixture');
+const extensionsFixtureHome = path.join(extensionsFixtureRoot, 'home');
+const extensionsFixtureProject = path.join(extensionsFixtureRoot, 'project');
+const extensionsFixtureEnv = { ...process.env, HOME: extensionsFixtureHome };
+fs.rmSync(extensionsFixtureRoot, { recursive: true, force: true });
+fs.mkdirSync(path.join(extensionsFixtureProject, '.pi/extensions/prefer-index'), { recursive: true });
+fs.mkdirSync(path.join(extensionsFixtureProject, '.pi/extensions/manifest/src'), { recursive: true });
+fs.mkdirSync(path.join(extensionsFixtureProject, 'packages/ext-package'), { recursive: true });
+fs.mkdirSync(path.join(extensionsFixtureProject, 'packages/disabled-package/extensions'), { recursive: true });
+fs.mkdirSync(path.join(extensionsFixtureProject, 'explicit-package'), { recursive: true });
+fs.mkdirSync(path.join(extensionsFixtureHome, '.pi/agent/extensions'), { recursive: true });
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/direct.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/drop.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/prefer-index/index.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/prefer-index/index.js'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/manifest/src/main.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/extensions/manifest/package.json'), JSON.stringify({ pi: { extensions: ['./src/main.ts', './missing.ts'] } }));
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/settings-ext.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, '.pi/settings.json'), JSON.stringify({
+  extensions: ['./settings-ext.ts', '!drop.ts'],
+  packages: [
+    { source: '../packages/ext-package', extensions: ['entry.ts'] },
+    { source: '../packages/disabled-package', extensions: [] }
+  ]
+}, null, 2));
+fs.writeFileSync(path.join(extensionsFixtureProject, 'packages/ext-package/package.json'), JSON.stringify({ pi: { extensions: ['./entry.ts'] } }));
+fs.writeFileSync(path.join(extensionsFixtureProject, 'packages/ext-package/entry.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, 'packages/disabled-package/extensions/disabled.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureProject, 'explicit-package/package.json'), JSON.stringify({ pi: { extensions: ['./custom.ts'] } }));
+fs.writeFileSync(path.join(extensionsFixtureProject, 'explicit-package/custom.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureHome, '.pi/agent/global-settings.ts'), 'export default function(){}');
+fs.writeFileSync(path.join(extensionsFixtureHome, '.pi/agent/settings.json'), JSON.stringify({ extensions: ['./global-settings.ts'] }, null, 2));
+fs.writeFileSync(path.join(extensionsFixtureHome, '.pi/agent/extensions/global.ts'), 'export default function(){}');
+const extensions = JSON.parse(run(
+  ['extensions', '--json', '--extension', './explicit-package'],
+  undefined,
+  { cwd: extensionsFixtureProject, env: extensionsFixtureEnv }
+)).extensions;
+function extensionEntry(suffix, predicate = () => true) {
+  return extensions.find((entry) => entry.path.endsWith(suffix) && predicate(entry));
+}
+if (
+  !extensionEntry('/.pi/settings-ext.ts', (entry) => entry.sourceInfo.source === 'local' && entry.sourceInfo.scope === 'project') ||
+  !extensionEntry('/.pi/extensions/direct.ts', (entry) => entry.enabled === true && entry.sourceInfo.source === 'auto') ||
+  !extensionEntry('/.pi/extensions/drop.ts', (entry) => entry.enabled === false) ||
+  !extensionEntry('/.pi/extensions/prefer-index/index.ts') ||
+  extensionEntry('/.pi/extensions/prefer-index/index.js') ||
+  !extensionEntry('/.pi/extensions/manifest/src/main.ts') ||
+  !extensionEntry('/.pi/agent/global-settings.ts', (entry) => entry.sourceInfo.source === 'local' && entry.sourceInfo.scope === 'user') ||
+  !extensionEntry('/.pi/agent/extensions/global.ts', (entry) => entry.sourceInfo.source === 'auto' && entry.sourceInfo.scope === 'user') ||
+  !extensionEntry('/packages/ext-package/entry.ts', (entry) => entry.sourceInfo.origin === 'package') ||
+  !extensionEntry('/packages/disabled-package/extensions/disabled.ts', (entry) => entry.enabled === false) ||
+  !extensionEntry('/explicit-package/custom.ts', (entry) => entry.sourceInfo.source === 'cli' && entry.sourceInfo.scope === 'temporary')
+) {
+  throw new Error('extensions smoke did not match upstream discovery order, manifests, settings, package filters, and explicit paths');
+}
+const explicitOnlyExtensions = JSON.parse(run(
+  ['extensions', '--json', '--no-extensions', '--extension', './explicit-package'],
+  undefined,
+  { cwd: extensionsFixtureProject, env: extensionsFixtureEnv }
+)).extensions;
+if (explicitOnlyExtensions.length !== 1 || !explicitOnlyExtensions[0].path.endsWith('/explicit-package/custom.ts')) {
+  throw new Error('extensions --no-extensions smoke did not keep explicit extension paths only');
+}
+
 const settingsFixtureRoot = path.resolve('zig-out/pi-zig-settings-fixture');
 const settingsFixtureHome = path.join(settingsFixtureRoot, 'home');
 const settingsFixtureProject = path.join(settingsFixtureRoot, 'project');

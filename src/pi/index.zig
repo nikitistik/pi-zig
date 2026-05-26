@@ -4,6 +4,7 @@ pub const cli_runtime = @import("cli_runtime.zig");
 pub const commands = @import("commands.zig");
 pub const config = @import("config.zig");
 pub const context_files = @import("context_files.zig");
+pub const extensions = @import("extensions.zig");
 pub const models = @import("models.zig");
 pub const package_manager = @import("package_manager.zig");
 pub const providers = @import("providers.zig");
@@ -23,6 +24,7 @@ test {
     _ = commands;
     _ = config;
     _ = context_files;
+    _ = extensions;
     _ = models;
     _ = package_manager;
     _ = providers;
