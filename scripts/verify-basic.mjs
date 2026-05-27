@@ -3721,11 +3721,14 @@ export default function(pi: any): void {
 
   const assertJsonProviderErrorLifecycle = (lines, label) => {
     const assistantStartCount = lines.filter((line) => line.type === 'message_start' && line.message?.role === 'assistant').length;
+    const messageStart = lines.find((line) => line.type === 'message_start' && line.message?.role === 'assistant');
     const messageEnd = lines.find((line) => line.type === 'message_end' && line.message?.role === 'assistant');
     const turnEnd = lines.find((line) => line.type === 'turn_end' && line.message?.role === 'assistant');
     const agentEnd = lines.find((line) => line.type === 'agent_end');
     if (
       assistantStartCount !== 1 ||
+      messageStart?.message?.stopReason !== 'error' ||
+      messageStart?.message?.errorMessage !== 'ProviderClientError' ||
       messageEnd?.message?.stopReason !== 'error' ||
       messageEnd?.message?.errorMessage !== 'ProviderClientError' ||
       turnEnd?.message?.stopReason !== 'error' ||

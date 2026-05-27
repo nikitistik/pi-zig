@@ -56,6 +56,7 @@ const JsonStreamContext = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     final_text: *std.Io.Writer.Allocating,
+    assistant_started: bool = false,
 };
 
 const JsonToolEventContext = struct {
@@ -350,7 +351,6 @@ fn runJsonProviderTextStream(
     messages_len += 1;
 
     try emitJsonPrelude(io, allocator, if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral");
-    try writeStreamingJsonLine(io, allocator, "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
 
     var final_text: std.Io.Writer.Allocating = .init(allocator);
     defer final_text.deinit();
@@ -385,7 +385,7 @@ fn runJsonProviderTextStream(
             final_text.written(),
             status.stop_reason,
             status.error_message,
-            false,
+            !stream_context.assistant_started,
         );
         return err;
     };
@@ -408,7 +408,7 @@ fn runJsonProviderTextStream(
             final_text.written(),
             "error",
             "ProviderResponseInvalid",
-            false,
+            !stream_context.assistant_started,
         );
         return error.ProviderResponseInvalid;
     }
@@ -490,7 +490,9 @@ fn emitJsonAssistantStatusLifecycle(
     defer line.deinit();
     const w = &line.writer;
     if (emit_start) {
-        try w.writeAll("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
+        try w.writeAll("{\"type\":\"message_start\",\"message\":");
+        try writeAssistantStatusMessageJson(w, text, stop_reason, error_message);
+        try w.writeAll("}\n");
     }
     try w.writeAll("{\"type\":\"message_end\",\"message\":");
     try writeAssistantStatusMessageJson(w, text, stop_reason, error_message);
@@ -511,6 +513,10 @@ fn handleJsonStreamTextDelta(ctx_ptr: *anyopaque, delta: []const u8) anyerror!vo
     var line: std.Io.Writer.Allocating = .init(ctx.allocator);
     defer line.deinit();
     const w = &line.writer;
+    if (!ctx.assistant_started) {
+        ctx.assistant_started = true;
+        try w.writeAll("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
+    }
     try w.writeAll("{\"type\":\"message_update\",\"message\":");
     try writeAssistantMessageJson(w, ctx.final_text.written());
     try w.writeAll(",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":");
