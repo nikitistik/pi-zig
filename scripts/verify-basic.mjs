@@ -8636,5 +8636,165 @@ if (!cloneJsonl.includes(`"parentSession":"${cloneSessionFile}"`) || !cloneJsonl
   }
 }
 console.log('flow 01 upstream inventory smoke passed');
+// ===== FLOW 05: models =====
+// Parity with upstream model registry/resolver:
+//   upstream/pi/packages/ai/src/models.ts (getSupportedThinkingLevels)
+//   upstream/pi/packages/coding-agent/src/core/model-resolver.ts (defaultModelPerProvider,
+//     parseModelPattern, resolveCliModel, tryMatchModel alias preference)
+// Proven against the live generated catalog, not mocks.
+
+// Every provider default in upstream defaultModelPerProvider must resolve to a real
+// catalog entry (DoD: provider-specific defaults are not stale hardcodes).
+const flow05DefaultModelPerProvider = {
+  'amazon-bedrock': 'us.anthropic.claude-opus-4-6-v1',
+  anthropic: 'claude-opus-4-7',
+  openai: 'gpt-5.4',
+  'azure-openai-responses': 'gpt-5.4',
+  'openai-codex': 'gpt-5.5',
+  deepseek: 'deepseek-v4-pro',
+  google: 'gemini-3.1-pro-preview',
+  'google-vertex': 'gemini-3.1-pro-preview',
+  'github-copilot': 'gpt-5.4',
+  openrouter: 'moonshotai/kimi-k2.6',
+  'vercel-ai-gateway': 'zai/glm-5.1',
+  xai: 'grok-4.20-0309-reasoning',
+  groq: 'openai/gpt-oss-120b',
+  cerebras: 'zai-glm-4.7',
+  zai: 'glm-5.1',
+  mistral: 'devstral-medium-latest',
+  minimax: 'MiniMax-M2.7',
+  'minimax-cn': 'MiniMax-M2.7',
+  moonshotai: 'kimi-k2.6',
+  'moonshotai-cn': 'kimi-k2.6',
+  huggingface: 'moonshotai/Kimi-K2.6',
+  fireworks: 'accounts/fireworks/models/kimi-k2p6',
+  together: 'moonshotai/Kimi-K2.6',
+  opencode: 'kimi-k2.6',
+  'opencode-go': 'kimi-k2.6',
+  'kimi-coding': 'kimi-for-coding',
+  'cloudflare-workers-ai': '@cf/moonshotai/kimi-k2.6',
+  'cloudflare-ai-gateway': 'workers-ai/@cf/moonshotai/kimi-k2.6',
+  xiaomi: 'mimo-v2.5-pro',
+  'xiaomi-token-plan-cn': 'mimo-v2.5-pro',
+  'xiaomi-token-plan-ams': 'mimo-v2.5-pro',
+  'xiaomi-token-plan-sgp': 'mimo-v2.5-pro',
+};
+const flow05FullCatalog = JSON.parse(run(['models']));
+// Providers that only exist as auth/OAuth overlays upstream and have no built-in catalog
+// entries (no MODELS.<provider> block). Their defaults cannot resolve from the generated
+// catalog alone; documented as platform gap rather than hidden.
+const flow05CatalogProviders = new Set(flow05FullCatalog.models.map((model) => model.provider));
+for (const [provider, modelId] of Object.entries(flow05DefaultModelPerProvider)) {
+  if (!flow05CatalogProviders.has(provider)) {
+    throw new Error(`models default-provider parity: provider "${provider}" missing from generated catalog`);
+  }
+  const resolved = JSON.parse(run(['model', provider, modelId]));
+  if (resolved.error || resolved.provider !== provider || resolved.id !== modelId) {
+    throw new Error(`models stale default: ${provider}/${modelId} does not exist in generated catalog`);
+  }
+}
+
+// Default model count must match the upstream provider lineup exactly.
+if (Object.keys(flow05DefaultModelPerProvider).length !== flow05FullCatalog.providers.length) {
+  throw new Error('models default-provider map size drifted from generated provider count');
+}
+
+// Alias preference: fuzzy matches prefer an alias (no date/-latest suffix) over dated versions.
+const flow05Alias = JSON.parse(run(['resolve-model', '--provider', 'anthropic', 'sonnet']));
+if (flow05Alias.error !== null || !flow05Alias.model || !/sonnet/.test(flow05Alias.model.id) || /-\d{8}$/.test(flow05Alias.model.id)) {
+  throw new Error('models alias preference: fuzzy sonnet did not resolve to an alias id');
+}
+
+// Provider/model split is preferred over a gateway model whose id literally contains a slash:
+// "zai/glm-5.1" must resolve to provider=zai id=glm-5.1, not vercel-ai-gateway id=zai/glm-5.1.
+const flow05Split = JSON.parse(run(['resolve-model', 'zai/glm-5.1']));
+if (flow05Split.error !== null || flow05Split.model?.provider !== 'zai' || flow05Split.model?.id !== 'glm-5.1') {
+  throw new Error('models provider-split: zai/glm-5.1 did not prefer the zai provider model');
+}
+
+// OpenRouter-style colon-in-id models: exact match must keep the full id, and a trailing
+// valid thinking suffix must be stripped recursively while preserving the colon-bearing id.
+const flow05ColonModel = flow05FullCatalog.models.find((model) => model.provider === 'openrouter' && model.id.endsWith(':free'));
+if (!flow05ColonModel) {
+  throw new Error('models colon-id parity: expected an openrouter :free model in the generated catalog');
+}
+const flow05ColonExact = JSON.parse(run(['resolve-model', `openrouter/${flow05ColonModel.id}`]));
+if (flow05ColonExact.error !== null || flow05ColonExact.model?.id !== flow05ColonModel.id || flow05ColonExact.thinkingLevel !== null) {
+  throw new Error('models colon-id parity: exact openrouter colon id did not match cleanly');
+}
+const flow05ColonThinking = JSON.parse(run(['resolve-model', `openrouter/${flow05ColonModel.id}:high`]));
+if (flow05ColonThinking.error !== null || flow05ColonThinking.model?.id !== flow05ColonModel.id || flow05ColonThinking.thinkingLevel !== 'high') {
+  throw new Error('models colon-id parity: colon id with :high suffix did not strip the thinking level');
+}
+
+// Thinking-variant metadata: deepseek-v4-flash disables minimal/low/medium but keeps off/high/xhigh,
+// matching upstream getSupportedThinkingLevels over thinkingLevelMap.
+const flow05DeepseekFlash = JSON.parse(run(['model', 'deepseek', 'deepseek-v4-flash']));
+if (
+  flow05DeepseekFlash.reasoning !== true ||
+  JSON.stringify(flow05DeepseekFlash.supportedThinkingLevels) !== JSON.stringify(['off', 'high', 'xhigh'])
+) {
+  throw new Error('models thinking-variant parity: deepseek-v4-flash supported levels drifted');
+}
+
+// A reasoning model that maps off to null exposes no "off" level (azure gpt-5).
+const flow05GptOffNull = JSON.parse(run(['model', 'azure-openai-responses', 'gpt-5']));
+if (
+  flow05GptOffNull.reasoning !== true ||
+  flow05GptOffNull.supportedThinkingLevels.includes('off') ||
+  !flow05GptOffNull.supportedThinkingLevels.includes('high')
+) {
+  throw new Error('models thinking-variant parity: off=null reasoning model still advertised off');
+}
+
+// Non-reasoning models only support the "off" thinking level.
+const flow05NonReasoning = JSON.parse(run(['model', 'amazon-bedrock', 'amazon.nova-2-lite-v1:0']));
+if (
+  flow05NonReasoning.reasoning !== false ||
+  JSON.stringify(flow05NonReasoning.supportedThinkingLevels) !== JSON.stringify(['off'])
+) {
+  throw new Error('models thinking-variant parity: non-reasoning model did not collapse to [off]');
+}
+
+// Image capability flag comes from generated metadata: claude has image input, deepseek-v4-flash does not.
+const flow05Vision = JSON.parse(run(['model', 'anthropic', 'claude-haiku-4-5']));
+if (!flow05Vision.input.includes('image') || !flow05Vision.input.includes('text')) {
+  throw new Error('models image-capability parity: anthropic haiku missing image input flag');
+}
+if (flow05DeepseekFlash.input.includes('image')) {
+  throw new Error('models image-capability parity: deepseek-v4-flash should be text-only');
+}
+
+// xhigh capability: a model whose thinkingLevelMap maps xhigh exposes it; otherwise it must not.
+const flow05Xhigh = JSON.parse(run(['model', 'amazon-bedrock', 'anthropic.claude-opus-4-6-v1']));
+if (!flow05Xhigh.supportedThinkingLevels.includes('xhigh')) {
+  throw new Error('models thinking-variant parity: opus-4-6 should advertise xhigh');
+}
+
+// Strict CLI parsing: an invalid colon suffix on an explicit provider is treated as part of a
+// custom model id (upstream allowInvalidThinkingLevelFallback=false + buildFallbackModel), not a
+// thinking level, and is flagged customModel without erroring.
+const flow05StrictCustom = JSON.parse(run(['resolve-model', '--provider', 'anthropic', 'claude-haiku-4-5:bogus']));
+if (
+  flow05StrictCustom.error !== null ||
+  flow05StrictCustom.customModel !== true ||
+  flow05StrictCustom.thinkingLevel !== null ||
+  flow05StrictCustom.model?.provider !== 'anthropic' ||
+  flow05StrictCustom.model?.id !== 'claude-haiku-4-5:bogus'
+) {
+  throw new Error('models strict parsing: invalid :suffix should become a custom model id, not a thinking level');
+}
+
+// Unknown provider yields a clear error and no model.
+const flow05UnknownProvider = JSON.parse(run(['resolve-model', '--provider', 'not-a-provider', 'whatever']));
+if (flow05UnknownProvider.model !== null || !/Unknown provider/.test(flow05UnknownProvider.error ?? '')) {
+  throw new Error('models error parity: unknown provider did not produce an Unknown provider error');
+}
+
+// Unresolvable bare model (no provider, no match) yields a not-found error and no model.
+const flow05NotFound = JSON.parse(run(['resolve-model', 'definitely-not-a-real-model-xyz']));
+if (flow05NotFound.model !== null || !/not found/.test(flow05NotFound.error ?? '')) {
+  throw new Error('models error parity: unresolvable bare model did not produce a not-found error');
+}
 
 console.log('basic pi-zig smokes passed');
