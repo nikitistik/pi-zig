@@ -5,6 +5,7 @@ const auth = @import("auth.zig");
 const commands = @import("commands.zig");
 const context_files = @import("context_files.zig");
 const extension_runner = @import("extension_runner.zig");
+const html_export = @import("html_export.zig");
 const models = @import("models.zig");
 const session = @import("session.zig");
 const settings = @import("settings.zig");
@@ -2842,24 +2843,13 @@ const Runtime = struct {
     }
 
     fn exportHtml(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, output_path: []const u8) !void {
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        defer out.deinit();
-        const w = &out.writer;
-        try w.writeAll("<!doctype html><html><head><meta charset=\"utf-8\"><title>pi-zig session</title>");
-        try w.writeAll("<style>body{font-family:system-ui,sans-serif;margin:32px;color:#1f2328}article{border-top:1px solid #d0d7de;padding:12px 0}b{display:block;margin-bottom:6px}</style>");
-        try w.writeAll("</head><body><h1>pi-zig session</h1><p>Session file: ");
-        try writeHtmlEscaped(w, self.store.path());
-        try w.writeAll("</p>");
-        for (self.messages[0..self.message_count]) |*message| {
-            try w.writeAll("<article><b>");
-            try writeHtmlEscaped(w, message.role.label());
-            try w.writeAll("</b><pre>");
-            try writeHtmlEscaped(w, message.text());
-            try w.writeAll("</pre></article>");
-        }
-        try w.writeAll("</body></html>\n");
-        try ensureParentDir(io, output_path);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = out.written() });
+        // Render from the durable session file via the shared exporter so the RPC
+        // export covers every message/entry type (images, tool calls/results,
+        // compaction, branch summaries, custom messages) identically to the CLI
+        // --export path. RPC appends write to disk immediately, so the file is the
+        // source of truth.
+        const written = try html_export.exportHtmlFromFile(io, allocator, self.store.path(), output_path);
+        allocator.free(written);
     }
 };
 
@@ -3654,25 +3644,6 @@ fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
         }
     }
     try w.writeByte('"');
-}
-
-fn writeHtmlEscaped(w: *std.Io.Writer, value: []const u8) !void {
-    for (value) |byte| {
-        switch (byte) {
-            '&' => try w.writeAll("&amp;"),
-            '<' => try w.writeAll("&lt;"),
-            '>' => try w.writeAll("&gt;"),
-            '"' => try w.writeAll("&quot;"),
-            '\'' => try w.writeAll("&#39;"),
-            else => try w.writeByte(byte),
-        }
-    }
-}
-
-fn ensureParentDir(io: std.Io, path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
-    try std.Io.Dir.cwd().createDirPath(io, parent);
 }
 
 fn parseStoredRole(role: []const u8) ?StoredRole {

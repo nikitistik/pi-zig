@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_client = @import("ai_client.zig");
+const html_export = @import("html_export.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 
@@ -726,66 +727,16 @@ pub const PersistentStore = struct {
     }
 };
 
+/// Export a session JSONL file to a self-contained HTML document.
+/// Delegates to html_export, which renders every supported entry/message type with
+/// upstream content semantics (upstream/pi/packages/coding-agent/src/core/export-html).
 pub fn exportHtmlFromFile(
     io: std.Io,
     allocator: std.mem.Allocator,
     input_path: []const u8,
     requested_output_path: ?[]const u8,
 ) ![]u8 {
-    const output_path = if (requested_output_path) |path|
-        try allocator.dupe(u8, path)
-    else
-        try defaultExportPath(allocator, input_path);
-    errdefer allocator.free(output_path);
-
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, input_path, allocator, .limited(16 * 1024 * 1024));
-    defer allocator.free(bytes);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const w = &out.writer;
-
-    try w.writeAll("<!doctype html><html><head><meta charset=\"utf-8\"><title>pi-zig session</title>");
-    try w.writeAll("<style>body{font-family:system-ui,sans-serif;margin:32px;color:#1f2328}article{border-top:1px solid #d0d7de;padding:12px 0}b{display:block;margin-bottom:6px}pre{white-space:pre-wrap}</style>");
-    try w.writeAll("</head><body><h1>pi-zig session</h1><p>Session file: ");
-    try writeHtmlEscaped(w, input_path);
-    try w.writeAll("</p>");
-
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw_line| {
-        const line = stripTrailingCarriageReturn(raw_line);
-        if (std.mem.trim(u8, line, " \t").len == 0) continue;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return error.InvalidSessionJson;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidSessionJson;
-        const entry_type = getStringFieldObject(parsed.value.object, "type") orelse return error.InvalidSessionEntry;
-        if (!std.mem.eql(u8, entry_type, "message")) continue;
-
-        const message = parsed.value.object.get("message") orelse return error.InvalidSessionEntry;
-        if (message != .object) return error.InvalidSessionEntry;
-        const role = getStringFieldObject(message.object, "role") orelse return error.InvalidSessionEntry;
-
-        try w.writeAll("<article><b>");
-        try writeHtmlEscaped(w, role);
-        try w.writeAll("</b><pre>");
-        if (std.mem.eql(u8, role, "bashExecution")) {
-            if (getStringFieldObject(message.object, "command")) |command| {
-                try writeHtmlEscaped(w, "$ ");
-                try writeHtmlEscaped(w, command);
-                try w.writeByte('\n');
-            }
-            try writeHtmlEscaped(w, getStringFieldObject(message.object, "output") orelse "");
-        } else {
-            try writeMessageContentText(w, message.object);
-        }
-        try w.writeAll("</pre></article>");
-    }
-
-    try w.writeAll("</body></html>\n");
-    try ensureParentDir(io, output_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = out.written() });
-    return output_path;
+    return html_export.exportHtmlFromFile(io, allocator, input_path, requested_output_path);
 }
 
 pub fn defaultSessionDir(
@@ -960,14 +911,6 @@ fn timestampString(io: std.Io) []const u8 {
     return "local-foundation";
 }
 
-fn defaultExportPath(allocator: std.mem.Allocator, input_path: []const u8) ![]u8 {
-    var base = std.fs.path.basename(input_path);
-    if (std.mem.endsWith(u8, base, ".jsonl")) {
-        base = base[0 .. base.len - ".jsonl".len];
-    }
-    return std.fmt.allocPrint(allocator, "pi-zig-session-{s}.html", .{base});
-}
-
 fn agentDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
     if (env.get("PI_CODING_AGENT_DIR")) |value| return expandMaybeTilde(allocator, env, value);
     return std.fs.path.join(allocator, &.{ env.get("HOME") orelse ".", ".pi", "agent" });
@@ -1030,55 +973,6 @@ fn getStringFieldObject(object: std.json.ObjectMap, name: []const u8) ?[]const u
     const field = object.get(name) orelse return null;
     if (field != .string) return null;
     return field.string;
-}
-
-fn writeMessageContentText(w: *std.Io.Writer, object: std.json.ObjectMap) !void {
-    const content = object.get("content") orelse return;
-    switch (content) {
-        .string => |text| try writeHtmlEscaped(w, text),
-        .array => |array| {
-            var emitted = false;
-            for (array.items) |item| {
-                if (item != .object) continue;
-                const block_type = getStringFieldObject(item.object, "type") orelse continue;
-                if (std.mem.eql(u8, block_type, "text")) {
-                    if (getStringFieldObject(item.object, "text")) |text| {
-                        if (emitted) try w.writeByte('\n');
-                        try writeHtmlEscaped(w, text);
-                        emitted = true;
-                    }
-                } else if (std.mem.eql(u8, block_type, "thinking")) {
-                    if (getStringFieldObject(item.object, "thinking")) |thinking| {
-                        if (emitted) try w.writeByte('\n');
-                        try writeHtmlEscaped(w, thinking);
-                        emitted = true;
-                    }
-                } else if (std.mem.eql(u8, block_type, "toolCall")) {
-                    if (emitted) try w.writeByte('\n');
-                    try w.writeAll("tool call");
-                    if (getStringFieldObject(item.object, "name")) |name| {
-                        try w.writeAll(": ");
-                        try writeHtmlEscaped(w, name);
-                    }
-                    emitted = true;
-                }
-            }
-        },
-        else => {},
-    }
-}
-
-fn writeHtmlEscaped(w: *std.Io.Writer, value: []const u8) !void {
-    for (value) |byte| {
-        switch (byte) {
-            '&' => try w.writeAll("&amp;"),
-            '<' => try w.writeAll("&lt;"),
-            '>' => try w.writeAll("&gt;"),
-            '"' => try w.writeAll("&quot;"),
-            '\'' => try w.writeAll("&#39;"),
-            else => try w.writeByte(byte),
-        }
-    }
 }
 
 fn numericEntryCounter(id: []const u8) ?usize {

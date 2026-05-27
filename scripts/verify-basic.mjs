@@ -8572,4 +8572,173 @@ if (!cloneJsonl.includes(`"parentSession":"${cloneSessionFile}"`) || !cloneJsonl
   throw new Error('rpc clone JSONL did not record parent session and copied prompt');
 }
 
+// ===== FLOW 09: sessions =====
+// Durable session JSONL, compaction-with-kept-messages context rebuild, fork/clone across
+// reload, custom-entry reload, and HTML export rendering of every supported message type.
+// Upstream parity: packages/coding-agent/src/core/{session-manager.ts,messages.ts,compaction,
+// export-html}. HTML rendering mirrors template.js renderEntry()/renderToolCall() content.
+{
+  // --- HTML export: render every supported message/entry type with escaping ---
+  // A multi-branch tree (m-2a / m-2b both children of m-1) plus image, tool call+result,
+  // thinking, compaction, model_change, custom_message(display true/false), custom(state),
+  // and a failing bashExecution. Proves reload + render after each entry type.
+  const flow09SessionFile = 'zig-out/pi-zig-flow09-session.jsonl';
+  const flow09Lines = [
+    { type: 'session', version: 3, id: 'flow09-html', timestamp: '2024-12-03T14:00:00.000Z', cwd: '/proj' },
+    { type: 'message', id: 'm-1', parentId: null, timestamp: 't', message: { role: 'user', content: 'render <this> & "that"' } },
+    // Branch A off m-1
+    { type: 'message', id: 'm-2a', parentId: 'm-1', timestamp: 't', message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'plan A' }, { type: 'text', text: 'branch A reply' }, { type: 'toolCall', id: 'call_a', name: 'bash', arguments: { command: 'echo a<b' } }] } },
+    { type: 'message', id: 'm-3a', parentId: 'm-2a', timestamp: 't', message: { role: 'toolResult', toolCallId: 'call_a', toolName: 'bash', content: [{ type: 'text', text: 'a-output' }], isError: false } },
+    // Branch B off m-1 (multi-branch tree: two children of m-1)
+    { type: 'message', id: 'm-2b', parentId: 'm-1', timestamp: 't', message: { role: 'assistant', content: [{ type: 'text', text: 'branch B reply' }, { type: 'toolCall', id: 'call_b', name: 'read', arguments: { file_path: '/etc/hosts' } }] } },
+    { type: 'message', id: 'm-3b', parentId: 'm-2b', timestamp: 't', message: { role: 'toolResult', toolCallId: 'call_b', toolName: 'read', content: [{ type: 'image', data: tinyPngBase64, mimeType: 'image/png' }, { type: 'text', text: '127.0.0.1 localhost' }], isError: false } },
+    { type: 'message', id: 'm-4', parentId: 'm-3b', timestamp: 't', message: { role: 'user', content: [{ type: 'image', data: tinyPngBase64, mimeType: 'image/png' }, { type: 'text', text: 'inline user image' }] } },
+    { type: 'compaction', id: 'm-5', parentId: 'm-4', timestamp: 't', summary: 'kept summary text', firstKeptEntryId: 'm-4', tokensBefore: 98765 },
+    { type: 'branch_summary', id: 'm-6', parentId: 'm-5', timestamp: 't', fromId: 'm-2a', summary: 'abandoned branch A context' },
+    { type: 'model_change', id: 'm-7', parentId: 'm-6', timestamp: 't', provider: 'anthropic', modelId: 'claude-haiku-4-5' },
+    { type: 'thinking_level_change', id: 'm-8', parentId: 'm-7', timestamp: 't', thinkingLevel: 'high' },
+    { type: 'custom_message', id: 'm-9', parentId: 'm-8', timestamp: 't', customType: 'memory', content: 'shown hook content', display: true },
+    { type: 'custom_message', id: 'm-10', parentId: 'm-9', timestamp: 't', customType: 'memory', content: 'hidden-hook-content', display: false },
+    { type: 'custom', id: 'm-11', parentId: 'm-10', timestamp: 't', customType: 'state', data: { count: 7 } },
+    { type: 'session_info', id: 'm-12', parentId: 'm-11', timestamp: 't', name: 'flow09 session' },
+    { type: 'message', id: 'm-13', parentId: 'm-12', timestamp: 't', message: { role: 'bashExecution', command: 'false', output: 'kaboom', exitCode: 3, cancelled: false, truncated: false, timestamp: 1 } }
+  ];
+  fs.writeFileSync(flow09SessionFile, flow09Lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+
+  const flow09ExportFile = 'zig-out/pi-zig-flow09-export.html';
+  fs.rmSync(flow09ExportFile, { force: true });
+  const flow09ExportOut = run(['--export', flow09SessionFile, flow09ExportFile]);
+  if (!flow09ExportOut.includes(`Exported to: ${flow09ExportFile}`)) {
+    throw new Error('flow09 --export did not report the requested output path');
+  }
+  const flow09Html = fs.readFileSync(flow09ExportFile, 'utf8');
+  const flow09Requirements = [
+    'pi-zig session: flow09-html',          // header carries session id
+    'render &lt;this&gt; &amp; &quot;that&quot;', // escaping of < > & " in user text
+    'branch A reply',                        // both branches of the tree render
+    'branch B reply',
+    '$ echo a&lt;b',                         // bash tool call command escaped
+    'a-output',                              // tool result attached to its call
+    `data:image/png;base64,${tinyPngBase64}`, // image rendered as data URI (tool + user)
+    'inline user image',
+    'Compacted from 98765 tokens',           // compaction summary
+    'kept summary text',
+    'Branch Summary',                        // branch_summary entry
+    'abandoned branch A context',
+    'anthropic/claude-haiku-4-5',            // model_change
+    '[memory]',                              // custom_message display:true
+    'shown hook content',
+    '(exit 3)'                               // failing bashExecution note
+  ];
+  for (const needle of flow09Requirements) {
+    if (!flow09Html.includes(needle)) {
+      throw new Error(`flow09 HTML export missing expected content: ${needle}`);
+    }
+  }
+  // display:false custom_message, custom(state) entry, and standalone tool-result articles must not render.
+  if (flow09Html.includes('hidden-hook-content')) {
+    throw new Error('flow09 HTML export rendered a display:false custom_message');
+  }
+  if (flow09Html.includes('"count":7') || flow09Html.includes('entry-m-11')) {
+    throw new Error('flow09 HTML export rendered a custom (state) entry into the message pane');
+  }
+  if (flow09Html.includes('id="entry-m-3a"') || flow09Html.includes('id="entry-m-3b"')) {
+    throw new Error('flow09 HTML export rendered tool results as standalone entries');
+  }
+
+  // --- HTML export escaping: a script tag in content must be neutralized ---
+  const flow09XssFile = 'zig-out/pi-zig-flow09-xss.jsonl';
+  fs.writeFileSync(flow09XssFile, [
+    JSON.stringify({ type: 'session', version: 3, id: 'flow09-xss', timestamp: 't', cwd: '.' }),
+    JSON.stringify({ type: 'message', id: 'm-1', parentId: null, timestamp: 't', message: { role: 'user', content: "<script>alert('x')</script>" } })
+  ].join('\n') + '\n');
+  const flow09XssOut = 'zig-out/pi-zig-flow09-xss.html';
+  fs.rmSync(flow09XssOut, { force: true });
+  run(['--export', flow09XssFile, flow09XssOut]);
+  const flow09XssHtml = fs.readFileSync(flow09XssOut, 'utf8');
+  if (flow09XssHtml.includes("<script>alert('x')</script>")) {
+    throw new Error('flow09 HTML export did not escape a raw script tag from message content');
+  }
+  if (!flow09XssHtml.includes('&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;')) {
+    throw new Error('flow09 HTML export escaped script tag incorrectly');
+  }
+
+  // --- Export rejects a JSONL file without a session header ---
+  const flow09NoHeader = 'zig-out/pi-zig-flow09-noheader.jsonl';
+  fs.writeFileSync(flow09NoHeader, JSON.stringify({ type: 'message', id: 'm-1', parentId: null, timestamp: 't', message: { role: 'user', content: 'orphan' } }) + '\n');
+  const flow09NoHeaderFail = runFail(['--export', flow09NoHeader, 'zig-out/pi-zig-flow09-noheader.html']);
+  if (!flow09NoHeaderFail.stderr.includes('InvalidSessionHeader')) {
+    throw new Error('flow09 --export did not reject a headerless session file');
+  }
+
+  // --- Durable reload + compaction-with-kept-messages view via RPC ---
+  // After reload, get_messages must apply the compaction view (mirrors buildSessionContext):
+  // emit the compaction summary, then the kept message (firstKeptEntryId onward), and must
+  // NOT replay the pre-compaction (summarized-away) message.
+  const flow09RpcFile = 'zig-out/pi-zig-flow09-rpc.jsonl';
+  fs.rmSync(flow09RpcFile, { force: true });
+  fs.writeFileSync(flow09RpcFile, [
+    { type: 'session', version: 3, id: 'flow09-rpc', timestamp: 't', cwd: '.' },
+    { type: 'message', id: 'm-1', parentId: null, timestamp: 't', message: { role: 'user', content: 'flow09 summarized-away marker' } },
+    { type: 'message', id: 'm-2', parentId: 'm-1', timestamp: 't', message: { role: 'user', content: 'flow09 kept user marker' } },
+    { type: 'compaction', id: 'm-3', parentId: 'm-2', timestamp: 't', summary: 'flow09 kept summary marker', firstKeptEntryId: 'm-2', tokensBefore: 4242 }
+  ].map((l) => JSON.stringify(l)).join('\n') + '\n');
+
+  const flow09RpcOut = run(
+    ['rpc', flow09RpcFile],
+    [
+      JSON.stringify({ id: 'msgs', type: 'get_messages' }),
+      JSON.stringify({ id: 'state', type: 'get_state' }),
+      ''
+    ].join('\n')
+  );
+  const flow09RpcResponses = flow09RpcOut.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const flow09Msgs = flow09RpcResponses.find((r) => r.id === 'msgs');
+  const flow09MsgList = flow09Msgs?.data?.messages ?? [];
+  // get_messages applies the compaction view: [compactionSummary, ...kept]. The summary
+  // message carries `summary`; the kept user message carries `content`.
+  if (flow09MsgList[0]?.role !== 'compactionSummary' || flow09MsgList[0]?.summary !== 'flow09 kept summary marker') {
+    throw new Error('flow09 get_messages did not emit the compaction summary first after reload');
+  }
+  const flow09MsgBlob = JSON.stringify(flow09MsgList);
+  if (!flow09MsgBlob.includes('flow09 kept user marker')) {
+    throw new Error('flow09 get_messages did not return the kept message after reload');
+  }
+  if (flow09MsgBlob.includes('flow09 summarized-away marker')) {
+    throw new Error('flow09 get_messages replayed a pre-compaction (summarized-away) message');
+  }
+  const flow09State = flow09RpcResponses.find((r) => r.id === 'state');
+  if (flow09State?.data?.sessionFile !== flow09RpcFile) {
+    throw new Error('flow09 get_state did not bind to the reloaded session file');
+  }
+
+  // --- Fork preserves full history (incl. custom + compaction entries) and parentSession ---
+  const flow09ForkDir = 'zig-out/flow09-fork-dir';
+  fs.rmSync(flow09ForkDir, { recursive: true, force: true });
+  run(['--session-dir', flow09ForkDir, '--fork', flow09SessionFile, '-p', 'flow09 fork prompt']);
+  const flow09ForkFiles = fs.readdirSync(flow09ForkDir).filter((f) => f.endsWith('.jsonl'));
+  if (flow09ForkFiles.length !== 1) {
+    throw new Error('flow09 --fork did not create exactly one forked session file');
+  }
+  const flow09ForkJsonl = fs.readFileSync(path.join(flow09ForkDir, flow09ForkFiles[0]), 'utf8');
+  // forkFromFile records the resolved (absolute) source path as parentSession.
+  const flow09ForkHeader = JSON.parse(flow09ForkJsonl.split('\n')[0]);
+  if (flow09ForkHeader.type !== 'session' || !flow09ForkHeader.parentSession || !flow09ForkHeader.parentSession.endsWith('pi-zig-flow09-session.jsonl')) {
+    throw new Error('flow09 fork did not record parentSession pointing at the source file');
+  }
+  for (const marker of ['"customType":"state"', '"type":"compaction"', '"type":"branch_summary"', '"type":"custom_message"', 'shown hook content']) {
+    if (!flow09ForkJsonl.includes(marker)) {
+      throw new Error(`flow09 fork dropped a session entry on copy: ${marker}`);
+    }
+  }
+  // The forked session must itself be exportable across reload (fork + reload + render).
+  const flow09ForkExport = 'zig-out/pi-zig-flow09-fork-export.html';
+  fs.rmSync(flow09ForkExport, { force: true });
+  run(['--export', path.join(flow09ForkDir, flow09ForkFiles[0]), flow09ForkExport]);
+  const flow09ForkHtml = fs.readFileSync(flow09ForkExport, 'utf8');
+  if (!flow09ForkHtml.includes('Compacted from 98765 tokens') || !flow09ForkHtml.includes('branch B reply')) {
+    throw new Error('flow09 forked session did not render compaction/branch content after reload');
+  }
+}
+
 console.log('basic pi-zig smokes passed');
