@@ -5176,9 +5176,9 @@ export default function(pi: any): void {
   if (!providerNonVisionAgentImage.includes('non vision image agent observed')) {
     throw new Error('provider-backed agent loop did not downgrade direct image content parts for non-vision models');
   }
-  // The read tool detects images by magic bytes (parity with upstream mime.ts),
-  // so the read-tool fixture must contain a real PNG, unlike the @-attachment
-  // fixture above which is matched by extension.
+  // The read tool detects images by magic bytes (mime.ts parity), unlike @-attachments
+  // which key off file extension; overwrite the shared fixture with a real PNG so the
+  // read-tool downgrade smoke exercises a genuine image (matches Flow 08 detection).
   fs.writeFileSync(providerImagePath, Buffer.from(tinyPngBase64, 'base64'));
   const providerNonVisionReadImage = run(
     ['--no-session', '--provider', 'openai', '--model', 'gpt-4', '-p', 'non vision read image result'],
@@ -8336,7 +8336,11 @@ export default function(pi) {
   const flow06OversizedImageFixture = path.resolve('zig-out/pi-zig-agent-oversized-image-fixture');
   fs.rmSync(flow06OversizedImageFixture, { recursive: true, force: true });
   fs.mkdirSync(flow06OversizedImageFixture, { recursive: true });
-  fs.writeFileSync(path.join(flow06OversizedImageFixture, 'input.png'), Buffer.alloc(6 * 1024 * 1024, 0x41));
+  // Oversized but VALID PNG: real signature+IHDR header (so Flow 08 magic-byte detection
+  // recognizes it as image/png) padded past the 4.5MB resize gate (so it is omitted).
+  const flow06OversizedBuf = Buffer.alloc(6 * 1024 * 1024, 0x41);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52]).copy(flow06OversizedBuf);
+  fs.writeFileSync(path.join(flow06OversizedImageFixture, 'input.png'), flow06OversizedBuf);
   const flow06OversizedImageOutput = run(
     ['--no-session', '--provider', 'openai', '--model', 'mock-read-image-tool-model', '-p', 'please run read oversized image result'],
     undefined,
@@ -8888,6 +8892,7 @@ if (!cloneJsonl.includes(`"parentSession":"${cloneSessionFile}"`) || !cloneJsonl
   }
 }
 console.log('flow 01 upstream inventory smoke passed');
+
 // ===== FLOW 05: models =====
 // Parity with upstream model registry/resolver:
 //   upstream/pi/packages/ai/src/models.ts (getSupportedThinkingLevels)
@@ -9047,6 +9052,8 @@ if (flow05UnknownProvider.model !== null || !/Unknown provider/.test(flow05Unkno
 const flow05NotFound = JSON.parse(run(['resolve-model', 'definitely-not-a-real-model-xyz']));
 if (flow05NotFound.model !== null || !/not found/.test(flow05NotFound.error ?? '')) {
   throw new Error('models error parity: unresolvable bare model did not produce a not-found error');
+}
+
 // ===== FLOW 03: package/settings =====
 const flow03Root = path.resolve('zig-out/pi-zig-flow03-fixture');
 const flow03Home = path.join(flow03Root, 'home');
@@ -9208,6 +9215,8 @@ if (
   fs.readFileSync(flow03GlobalSettingsPath, 'utf8') !== '{ not valid json'
 ) {
   throw new Error('flow03: invalid settings JSON must be reported and left untouched');
+}
+
 // ===== FLOW 08: tools =====
 // Edit tool upstream-shaped error messages, fuzzy matching, and access errors.
 const flow08EditDir = 'zig-out/pi-zig-flow08-edit';
@@ -9527,6 +9536,9 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
     }
   } finally {
     oauthServer.stop();
+  }
+}
+
 // ===== FLOW 09: sessions =====
 // Durable session JSONL, compaction-with-kept-messages context rebuild, fork/clone across
 // reload, custom-entry reload, and HTML export rendering of every supported message type.
@@ -9896,6 +9908,8 @@ if (!flowCliListHelp.includes('pi-zig list')) {
 const flowCliUninstallHelp = run(['uninstall', '--help']);
 if (!flowCliUninstallHelp.includes('pi-zig remove <source>')) {
   throw new Error('FLOW 02: uninstall --help did not alias to remove help');
+}
+
 // ===== FLOW 07: extensions =====
 // Full extension runner parity: jiti-equivalent TS/package loading, registered CLI flags
 // surfaced in --help and `extensions --flags`, flag-type validation, command-context
@@ -10097,6 +10111,8 @@ function runTuiCapture(args) {
   if (tuiPrintMode.stderr.includes('interactive TUI requires a terminal')) {
     throw new Error('tui print-mode bypass smoke incorrectly entered the interactive path');
   }
+}
+
 // ===== FLOW 12: packaging =====
 // Verifies the Prin7r release/integration artifacts without building or
 // writing anything: the packaging dry-run must succeed, the static integration

@@ -1092,8 +1092,12 @@ fn detectImageMimeTypeForFile(io: std.Io, path: []const u8) !?[]const u8 {
     // Sniff only the leading bytes upstream reads (mime.ts), regardless of file size.
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
+    // Use a reader buffer distinct from the sniff destination. Passing the reader's own
+    // buffer as the read target aliases memory and corrupts reads that fill the buffer
+    // (latent: F08's detection tests used <4100B PNGs; F06's 4.5MB fixtures surfaced it).
+    var reader_buf: [tools.image_type_sniff_bytes]u8 = undefined;
+    var reader = file.reader(io, &reader_buf);
     var buf: [tools.image_type_sniff_bytes]u8 = undefined;
-    var reader = file.reader(io, &buf);
     const read_len = reader.interface.readSliceShort(&buf) catch 0;
     return tools.detectImageMimeType(buf[0..read_len]);
 }
@@ -1278,6 +1282,11 @@ test "read image omits oversized image with upstream resize note" {
     const oversized = try std.testing.allocator.alloc(u8, image_resize_max_base64_bytes);
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'A');
+    // Valid PNG header (signature + IHDR length 13 + "IHDR") so magic-byte detection
+    // (tools.detectImageMimeType) recognizes this oversized payload as image/png; the
+    // 'A' padding keeps it above the resize size gate so it is omitted like upstream.
+    const png_header = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52 };
+    @memcpy(oversized[0..png_header.len], &png_header);
     try tools.writeFile(std.testing.io, path, oversized);
 
     var call = ai_client.ChatToolCall{
@@ -1310,6 +1319,11 @@ test "read oversized image for non-vision model appends both resize and non-visi
     const oversized = try std.testing.allocator.alloc(u8, image_resize_max_base64_bytes);
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'A');
+    // Valid PNG header (signature + IHDR length 13 + "IHDR") so magic-byte detection
+    // (tools.detectImageMimeType) recognizes this oversized payload as image/png; the
+    // 'A' padding keeps it above the resize size gate so it is omitted like upstream.
+    const png_header = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52 };
+    @memcpy(oversized[0..png_header.len], &png_header);
     try tools.writeFile(std.testing.io, path, oversized);
 
     var call = ai_client.ChatToolCall{
