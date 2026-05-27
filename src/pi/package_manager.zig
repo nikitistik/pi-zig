@@ -733,8 +733,8 @@ fn parseProtocolGit(original: []const u8, raw: []const u8) ?ParsedSource {
     if (std.mem.lastIndexOfScalar(u8, host, '@')) |at| host = host[at + 1 ..];
     const path_with_ref = after_scheme[slash + 1 ..];
     const split = splitGitPathRef(path_with_ref);
-    const path = stripGitSuffix(split.path);
-    if (host.len == 0 or path.len == 0) return null;
+    const path = normalizeGitPath(split.path);
+    if (host.len == 0 or !isValidGitPath(path)) return null;
     return .{ .kind = .git, .source = original, .host = host, .path = path, .ref = split.ref, .pinned = split.ref != null };
 }
 
@@ -743,8 +743,8 @@ fn parseGitAt(original: []const u8, raw: []const u8) ?ParsedSource {
     const colon = std.mem.indexOfScalar(u8, after_user, ':') orelse return null;
     const host = after_user[0..colon];
     const split = splitGitPathRef(after_user[colon + 1 ..]);
-    const path = stripGitSuffix(split.path);
-    if (host.len == 0 or path.len == 0) return null;
+    const path = normalizeGitPath(split.path);
+    if (host.len == 0 or !isValidGitPath(path)) return null;
     return .{ .kind = .git, .source = original, .host = host, .path = path, .ref = split.ref, .pinned = split.ref != null };
 }
 
@@ -753,8 +753,8 @@ fn parseHostPath(original: []const u8, raw: []const u8) ?ParsedSource {
     const host = raw[0..slash];
     if (!std.mem.eql(u8, host, "localhost") and std.mem.indexOfScalar(u8, host, '.') == null) return null;
     const split = splitGitPathRef(raw[slash + 1 ..]);
-    const path = stripGitSuffix(split.path);
-    if (host.len == 0 or path.len == 0) return null;
+    const path = normalizeGitPath(split.path);
+    if (host.len == 0 or !isValidGitPath(path)) return null;
     return .{ .kind = .git, .source = original, .host = host, .path = path, .ref = split.ref, .pinned = split.ref != null };
 }
 
@@ -797,6 +797,26 @@ fn stripRef(value: []const u8) []const u8 {
 
 fn stripGitSuffix(value: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, value, ".git")) value[0 .. value.len - ".git".len] else value;
+}
+
+// Mirrors upstream parseGenericGitUrl path normalization: strip a trailing
+// ".git" suffix and any leading slashes before validation.
+fn normalizeGitPath(value: []const u8) []const u8 {
+    var path = stripGitSuffix(value);
+    while (path.len > 0 and path[0] == '/') path = path[1..];
+    return path;
+}
+
+// Mirrors upstream parseGenericGitUrl: a git repository path must be non-empty
+// and contain at least two slash-separated segments (host/user/repo). Shorter
+// paths fall through to local-path handling, matching upstream.
+fn isValidGitPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    var segments: usize = 1;
+    for (path) |byte| {
+        if (byte == '/') segments += 1;
+    }
+    return segments >= 2;
 }
 
 fn sourceMatchKeyForInput(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, cwd: []const u8, source: []const u8) ![]u8 {
@@ -1881,4 +1901,192 @@ fn writeStdout(io: std.Io, bytes: []const u8) !void {
 
 fn writeStderr(io: std.Io, bytes: []const u8) !void {
     try std.Io.File.stderr().writeStreamingAll(io, bytes);
+}
+
+test "parseSource classifies npm specs with pinned versions" {
+    const unpinned = parseSource("npm:left-pad");
+    try std.testing.expectEqual(SourceKind.npm, unpinned.kind);
+    try std.testing.expectEqualStrings("left-pad", unpinned.name);
+    try std.testing.expect(!unpinned.pinned);
+
+    const pinned = parseSource("npm:left-pad@1.2.3");
+    try std.testing.expectEqual(SourceKind.npm, pinned.kind);
+    try std.testing.expectEqualStrings("left-pad", pinned.name);
+    try std.testing.expect(pinned.pinned);
+
+    const scoped = parseSource("npm:@scope/pkg@1.0.0");
+    try std.testing.expectEqual(SourceKind.npm, scoped.kind);
+    try std.testing.expectEqualStrings("@scope/pkg", scoped.name);
+    try std.testing.expect(scoped.pinned);
+
+    const scoped_unpinned = parseSource("npm:@scope/pkg");
+    try std.testing.expectEqualStrings("@scope/pkg", scoped_unpinned.name);
+    try std.testing.expect(!scoped_unpinned.pinned);
+}
+
+test "parseSource accepts git shorthand and protocol forms" {
+    const shorthand = parseSource("git:github.com/user/repo");
+    try std.testing.expectEqual(SourceKind.git, shorthand.kind);
+    try std.testing.expectEqualStrings("github.com", shorthand.host);
+    try std.testing.expectEqualStrings("user/repo", shorthand.path);
+    try std.testing.expect(!shorthand.pinned);
+    try std.testing.expect(shorthand.ref == null);
+
+    const pinned = parseSource("git:github.com/user/repo@v1.2.0");
+    try std.testing.expectEqual(SourceKind.git, pinned.kind);
+    try std.testing.expectEqualStrings("user/repo", pinned.path);
+    try std.testing.expect(pinned.pinned);
+    try std.testing.expectEqualStrings("v1.2.0", pinned.ref.?);
+
+    const ssh = parseSource("git:git@github.com:user/repo@v1.0.0");
+    try std.testing.expectEqual(SourceKind.git, ssh.kind);
+    try std.testing.expectEqualStrings("github.com", ssh.host);
+    try std.testing.expectEqualStrings("user/repo", ssh.path);
+    try std.testing.expectEqualStrings("v1.0.0", ssh.ref.?);
+
+    const https = parseSource("https://github.com/user/repo@v1");
+    try std.testing.expectEqual(SourceKind.git, https.kind);
+    try std.testing.expectEqualStrings("github.com", https.host);
+    try std.testing.expectEqualStrings("user/repo", https.path);
+    try std.testing.expectEqualStrings("v1", https.ref.?);
+
+    const ssh_protocol = parseSource("ssh://git@github.com/user/repo");
+    try std.testing.expectEqual(SourceKind.git, ssh_protocol.kind);
+    try std.testing.expectEqualStrings("github.com", ssh_protocol.host);
+    try std.testing.expectEqualStrings("user/repo", ssh_protocol.path);
+
+    const deep = parseSource("git:gitlab.example.com/group/sub/repo");
+    try std.testing.expectEqual(SourceKind.git, deep.kind);
+    try std.testing.expectEqualStrings("gitlab.example.com", deep.host);
+    try std.testing.expectEqualStrings("group/sub/repo", deep.path);
+}
+
+test "parseSource strips .git suffix from git paths" {
+    const parsed = parseSource("https://github.com/user/repo.git");
+    try std.testing.expectEqual(SourceKind.git, parsed.kind);
+    try std.testing.expectEqualStrings("user/repo", parsed.path);
+}
+
+test "parseSource falls back to local for git paths without two segments" {
+    // Upstream parseGenericGitUrl rejects paths with fewer than two segments,
+    // so the source falls through to local-path handling.
+    const single = parseSource("git:github.com/singleuser");
+    try std.testing.expectEqual(SourceKind.local, single.kind);
+    try std.testing.expectEqualStrings("git:github.com/singleuser", single.path);
+
+    // A host without a dot (and not localhost) is also not a git shorthand.
+    const no_dot = parseSource("git:user/repo");
+    try std.testing.expectEqual(SourceKind.local, no_dot.kind);
+}
+
+test "parseSource treats bare shorthand without git prefix as local" {
+    // Without git: prefix only protocol URLs are git; bare host/path is local.
+    const bare = parseSource("github.com/user/repo");
+    try std.testing.expectEqual(SourceKind.local, bare.kind);
+}
+
+test "parseSource classifies filesystem paths as local" {
+    try std.testing.expectEqual(SourceKind.local, parseSource("/absolute/path").kind);
+    try std.testing.expectEqual(SourceKind.local, parseSource("./relative/path").kind);
+    try std.testing.expectEqual(SourceKind.local, parseSource("../parent/path").kind);
+    try std.testing.expectEqual(SourceKind.local, parseSource("~/home/path").kind);
+}
+
+test "isValidGitPath mirrors upstream split length check" {
+    try std.testing.expect(!isValidGitPath(""));
+    try std.testing.expect(!isValidGitPath("single"));
+    try std.testing.expect(isValidGitPath("user/repo"));
+    try std.testing.expect(isValidGitPath("group/sub/repo"));
+    // Matches JS "user/".split("/").length === 2.
+    try std.testing.expect(isValidGitPath("user/"));
+}
+
+test "normalizeGitPath strips leading slashes and .git suffix" {
+    try std.testing.expectEqualStrings("user/repo", normalizeGitPath("user/repo.git"));
+    try std.testing.expectEqualStrings("user/repo", normalizeGitPath("//user/repo"));
+    try std.testing.expectEqualStrings("user/repo", normalizeGitPath("/user/repo.git"));
+}
+
+test "npmPackageName and npmPackageVersion split scoped specs" {
+    try std.testing.expectEqualStrings("pkg", npmPackageName("pkg"));
+    try std.testing.expectEqualStrings("pkg", npmPackageName("pkg@1.0.0"));
+    try std.testing.expectEqualStrings("@scope/pkg", npmPackageName("@scope/pkg@2.0.0"));
+    try std.testing.expectEqualStrings("@scope/pkg", npmPackageName("@scope/pkg"));
+
+    try std.testing.expect(npmPackageVersion("pkg") == null);
+    try std.testing.expectEqualStrings("1.0.0", npmPackageVersion("pkg@1.0.0").?);
+    try std.testing.expectEqualStrings("2.0.0", npmPackageVersion("@scope/pkg@2.0.0").?);
+    try std.testing.expect(npmPackageVersion("@scope/pkg") == null);
+}
+
+test "isNewerPackageVersion compares semantic versions" {
+    try std.testing.expect(isNewerPackageVersion("2.0.0", "1.0.0"));
+    try std.testing.expect(isNewerPackageVersion("1.1.0", "1.0.9"));
+    try std.testing.expect(isNewerPackageVersion("1.0.1", "1.0.0"));
+    try std.testing.expect(!isNewerPackageVersion("1.0.0", "1.0.0"));
+    try std.testing.expect(!isNewerPackageVersion("1.0.0", "2.0.0"));
+    // Stable release outranks a prerelease of the same version.
+    try std.testing.expect(isNewerPackageVersion("1.0.0", "1.0.0-beta.1"));
+    try std.testing.expect(!isNewerPackageVersion("1.0.0-beta.1", "1.0.0"));
+    // A leading "v" and build metadata are ignored.
+    try std.testing.expect(isNewerPackageVersion("v1.2.0", "1.1.0"));
+    try std.testing.expect(!isNewerPackageVersion("1.0.0+build1", "1.0.0+build2"));
+    // Non-semver values fall back to string inequality.
+    try std.testing.expect(isNewerPackageVersion("nightly", "stable"));
+    try std.testing.expect(!isNewerPackageVersion("same", "same"));
+}
+
+test "parseNpmVersionOutput unwraps json-encoded npm view output" {
+    const quoted = try parseNpmVersionOutput(std.testing.allocator, "\"1.2.3\"\n");
+    defer std.testing.allocator.free(quoted);
+    try std.testing.expectEqualStrings("1.2.3", quoted);
+
+    const bare = try parseNpmVersionOutput(std.testing.allocator, "4.5.6");
+    defer std.testing.allocator.free(bare);
+    try std.testing.expectEqualStrings("4.5.6", bare);
+
+    try std.testing.expectError(error.PackageCommandFailed, parseNpmVersionOutput(std.testing.allocator, "   \n"));
+}
+
+test "parseLatestSelfRelease reads version, package name, and note" {
+    const full = (try parseLatestSelfRelease(
+        std.testing.allocator,
+        "{\"version\":\"9.9.9\",\"packageName\":\"@scope/custom\",\"note\":\"upgrade soon\"}",
+    )).?;
+    defer full.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("9.9.9", full.version);
+    try std.testing.expectEqualStrings("@scope/custom", full.package_name);
+    try std.testing.expectEqualStrings("upgrade soon", full.note.?);
+
+    const minimal = (try parseLatestSelfRelease(std.testing.allocator, "{\"version\":\"1.0.0\"}")).?;
+    defer minimal.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("1.0.0", minimal.version);
+    try std.testing.expectEqualStrings(upstream_package_name, minimal.package_name);
+    try std.testing.expect(minimal.note == null);
+
+    try std.testing.expect((try parseLatestSelfRelease(std.testing.allocator, "{}")) == null);
+    try std.testing.expect((try parseLatestSelfRelease(std.testing.allocator, "not json")) == null);
+}
+
+test "packageManagerName resolves wrapper command basename" {
+    try std.testing.expectEqualStrings("npm", packageManagerName(&.{"npm"}));
+    try std.testing.expectEqualStrings("npm", packageManagerName(&.{ "mise", "exec", "node@20", "--", "npm" }));
+    try std.testing.expectEqualStrings("pnpm", packageManagerName(&.{ "/usr/local/bin/pnpm", "install" }));
+    try std.testing.expectEqualStrings("npm", packageManagerName(&.{"npm.cmd"}));
+}
+
+test "detectInstallMethodFromPath recognizes manager-specific layouts" {
+    try std.testing.expectEqual(InstallMethod.pnpm, detectInstallMethodFromPath("/home/u/.pnpm/global/pi"));
+    try std.testing.expectEqual(InstallMethod.yarn, detectInstallMethodFromPath("/home/u/.yarn/global/pi"));
+    try std.testing.expectEqual(InstallMethod.bun, detectInstallMethodFromPath("/home/u/.bun/install/global/node_modules/pi"));
+    try std.testing.expectEqual(InstallMethod.npm, detectInstallMethodFromPath("/usr/lib/node_modules/pi/bin/pi"));
+    try std.testing.expectEqual(InstallMethod.unknown, detectInstallMethodFromPath("/opt/local/bin/pi"));
+}
+
+test "isPathInsideRoot honors directory boundaries" {
+    try std.testing.expect(isPathInsideRoot("/a/b", "/a/b"));
+    try std.testing.expect(isPathInsideRoot("/a/b/c", "/a/b"));
+    try std.testing.expect(!isPathInsideRoot("/a/bc", "/a/b"));
+    try std.testing.expect(!isPathInsideRoot("/a", "/a/b"));
+    try std.testing.expect(!isPathInsideRoot("/a/b", ""));
 }

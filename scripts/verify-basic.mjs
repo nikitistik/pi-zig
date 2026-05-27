@@ -8572,4 +8572,167 @@ if (!cloneJsonl.includes(`"parentSession":"${cloneSessionFile}"`) || !cloneJsonl
   throw new Error('rpc clone JSONL did not record parent session and copied prompt');
 }
 
+// ===== FLOW 03: package/settings =====
+const flow03Root = path.resolve('zig-out/pi-zig-flow03-fixture');
+const flow03Home = path.join(flow03Root, 'home');
+const flow03Project = path.join(flow03Root, 'project');
+const flow03FakeBin = path.join(flow03Root, 'fake-bin');
+const flow03Record = path.join(flow03Root, 'commands.jsonl');
+const flow03GlobalSettingsPath = path.join(flow03Home, '.pi/agent/settings.json');
+const flow03Env = {
+  ...process.env,
+  HOME: flow03Home,
+  PATH: `${flow03FakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
+  PI_ZIG_FAKE_COMMAND_RECORD: flow03Record
+};
+fs.rmSync(flow03Root, { recursive: true, force: true });
+fs.mkdirSync(path.join(flow03Home, '.pi/agent'), { recursive: true });
+fs.mkdirSync(path.join(flow03Project, '.pi'), { recursive: true });
+fs.mkdirSync(flow03FakeBin, { recursive: true });
+function flow03Records() {
+  const text = fs.existsSync(flow03Record) ? fs.readFileSync(flow03Record, 'utf8').trim() : '';
+  return text ? text.split('\n').map((line) => JSON.parse(line)) : [];
+}
+fs.writeFileSync(
+  path.join(flow03FakeBin, 'npm'),
+  `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.PI_ZIG_FAKE_COMMAND_RECORD, JSON.stringify({ command: 'npm', args, cwd: process.cwd() }) + '\\n');
+function optionValue(name) { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; }
+function packageName(spec) { const s = spec.startsWith('@') ? 1 : 0; const at = spec.lastIndexOf('@'); return at > s ? spec.slice(0, at) : spec; }
+if (args[0] === 'view' && args[2] === 'version') { console.log(JSON.stringify(args[1] === 'pinned-extension' ? '1.0.0' : '2.0.0')); process.exit(0); }
+const root = optionValue('--prefix') || process.cwd();
+const installIndex = args.indexOf('install');
+if (installIndex >= 0) {
+  fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true });
+  for (const spec of args.slice(installIndex + 1)) {
+    if (spec.startsWith('--')) break;
+    const name = packageName(spec);
+    if (!name) continue;
+    const dir = path.join(root, 'node_modules', ...name.split('/'));
+    fs.mkdirSync(dir, { recursive: true });
+    const at = spec.startsWith('@') ? spec.slice(1).lastIndexOf('@') + 1 : spec.lastIndexOf('@');
+    const version = at > 0 && !spec.endsWith('@latest') ? spec.slice(at + 1) : '1.0.0';
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version }));
+  }
+}
+process.exit(0);
+`
+);
+fs.chmodSync(path.join(flow03FakeBin, 'npm'), 0o755);
+fs.writeFileSync(
+  path.join(flow03FakeBin, 'git'),
+  `#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.PI_ZIG_FAKE_COMMAND_RECORD, JSON.stringify({ command: 'git', args, cwd: process.cwd() }) + '\\n');
+if (args[0] === 'clone') {
+  const target = args[2];
+  fs.mkdirSync(path.join(target, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(target, 'extension.js'), 'fake git extension');
+} else if (args[0] === 'rev-parse') {
+  console.log(args.includes('HEAD') && !args.includes('FETCH_HEAD') ? 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' : 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+}
+process.exit(0);
+`
+);
+fs.chmodSync(path.join(flow03FakeBin, 'git'), 0o755);
+
+// Git source parsing parity: paths with fewer than two segments are not git
+// sources (matches upstream parseGenericGitUrl), so they fall through to local
+// handling and report a missing path instead of attempting a clone.
+const flow03SingleSegment = runFail(['install', 'git:github.com/singleuser'], undefined, { cwd: flow03Project, env: flow03Env });
+if (
+  flow03SingleSegment.status !== 1 ||
+  !flow03SingleSegment.stderr.includes('Path does not exist') ||
+  flow03Records().some((record) => record.command === 'git' && record.args[0] === 'clone')
+) {
+  throw new Error('flow03: single-segment git shorthand should fall through to local handling, not clone');
+}
+
+// Two-segment git shorthand still parses as a git source and clones.
+run(['install', 'git:github.com/user/repo'], undefined, { cwd: flow03Project, env: flow03Env });
+if (!fs.existsSync(path.join(flow03Home, '.pi/agent/git/github.com/user/repo/extension.js'))) {
+  throw new Error('flow03: two-segment git shorthand should clone into the managed git root');
+}
+run(['remove', 'git:github.com/user/repo'], undefined, { cwd: flow03Project, env: flow03Env });
+
+// Package object filters persist verbatim and list as "(filtered)".
+fs.writeFileSync(
+  flow03GlobalSettingsPath,
+  JSON.stringify({ packages: [{ source: 'npm:filtered-extension', skills: ['only-this'], extensions: [] }] }, null, 2)
+);
+const flow03FilteredList = run(['list'], undefined, { cwd: flow03Project, env: flow03Env });
+if (!flow03FilteredList.includes('npm:filtered-extension (filtered)')) {
+  throw new Error('flow03: object-form package source should be listed as filtered');
+}
+
+// Pinned npm versions are skipped by package updates; unpinned ones are checked.
+fs.writeFileSync(
+  flow03GlobalSettingsPath,
+  JSON.stringify({ packages: ['npm:pinned-extension@1.0.0', 'npm:fresh-extension'] }, null, 2)
+);
+run(['install', 'npm:pinned-extension@1.0.0'], undefined, { cwd: flow03Project, env: flow03Env });
+run(['install', 'npm:fresh-extension'], undefined, { cwd: flow03Project, env: flow03Env });
+const flow03UpdateRecordStart = flow03Records().length;
+run(['update', '--extensions'], undefined, { cwd: flow03Project, env: flow03Env });
+const flow03UpdateRecords = flow03Records().slice(flow03UpdateRecordStart);
+if (
+  flow03UpdateRecords.some((record) => record.command === 'npm' && record.args.includes('view') && record.args.includes('pinned-extension')) ||
+  flow03UpdateRecords.some((record) => record.command === 'npm' && record.args.includes('pinned-extension@latest')) ||
+  !flow03UpdateRecords.some((record) => record.command === 'npm' && record.args.includes('view') && record.args.includes('fresh-extension')) ||
+  !flow03UpdateRecords.some((record) => record.command === 'npm' && record.args.includes('fresh-extension@latest'))
+) {
+  throw new Error('flow03: package update should skip pinned npm versions and refresh unpinned stale ones');
+}
+
+// Pinned git refs are reconciled (fetched + reset to the ref) but not advanced.
+fs.writeFileSync(
+  flow03GlobalSettingsPath,
+  JSON.stringify({ packages: ['git:github.com/user/pinned@v1.0.0'] }, null, 2)
+);
+run(['install', 'git:github.com/user/pinned@v1.0.0'], undefined, { cwd: flow03Project, env: flow03Env });
+const flow03GitUpdateStart = flow03Records().length;
+run(['update', '--extensions'], undefined, { cwd: flow03Project, env: flow03Env });
+const flow03GitUpdateRecords = flow03Records().slice(flow03GitUpdateStart);
+if (
+  !flow03GitUpdateRecords.some((record) => record.command === 'git' && record.args[0] === 'fetch' && record.args.includes('v1.0.0')) ||
+  !flow03GitUpdateRecords.some((record) => record.command === 'git' && record.args[0] === 'reset' && record.args.includes('FETCH_HEAD'))
+) {
+  throw new Error('flow03: pinned git ref update should fetch and reset to the configured ref');
+}
+
+// Settings migration: legacy fields are rewritten and unrelated keys preserved.
+fs.writeFileSync(
+  flow03GlobalSettingsPath,
+  JSON.stringify({ queueMode: 'all', websockets: true, theme: 'dark', packages: ['npm:keep-me'] }, null, 2)
+);
+run(['settings', 'set', 'defaultModel', 'gpt-5-mini'], undefined, { cwd: flow03Project, env: flow03Env });
+const flow03Migrated = JSON.parse(fs.readFileSync(flow03GlobalSettingsPath, 'utf8'));
+if (
+  flow03Migrated.queueMode !== undefined ||
+  flow03Migrated.websockets !== undefined ||
+  flow03Migrated.steeringMode !== 'all' ||
+  flow03Migrated.transport !== 'websocket' ||
+  flow03Migrated.theme !== 'dark' ||
+  flow03Migrated.defaultModel !== 'gpt-5-mini' ||
+  flow03Migrated.packages?.[0] !== 'npm:keep-me'
+) {
+  throw new Error('flow03: settings write should migrate legacy fields and preserve unrelated keys');
+}
+
+// Invalid JSON settings must surface an error and never be rewritten.
+fs.writeFileSync(flow03GlobalSettingsPath, '{ not valid json');
+const flow03InvalidWrite = runFail(['settings', 'set', 'theme', 'light'], undefined, { cwd: flow03Project, env: flow03Env });
+if (
+  flow03InvalidWrite.status !== 1 ||
+  !flow03InvalidWrite.stderr.includes('Refusing to overwrite invalid settings file') ||
+  fs.readFileSync(flow03GlobalSettingsPath, 'utf8') !== '{ not valid json'
+) {
+  throw new Error('flow03: invalid settings JSON must be reported and left untouched');
+}
+
 console.log('basic pi-zig smokes passed');
