@@ -9896,6 +9896,167 @@ if (!flowCliListHelp.includes('pi-zig list')) {
 const flowCliUninstallHelp = run(['uninstall', '--help']);
 if (!flowCliUninstallHelp.includes('pi-zig remove <source>')) {
   throw new Error('FLOW 02: uninstall --help did not alias to remove help');
+// ===== FLOW 07: extensions =====
+// Full extension runner parity: jiti-equivalent TS/package loading, registered CLI flags
+// surfaced in --help and `extensions --flags`, flag-type validation, command-context
+// actions, and long-lived runner state across a session. Mirrors upstream
+// packages/coding-agent/src/core/extensions (loader.ts, runner.ts, types.ts) and the
+// printHelp() extension-flags section in cli/args.ts.
+const flow07Root = path.resolve('zig-out/pi-zig-flow07-extensions');
+const flow07Home = path.join(flow07Root, 'home');
+const flow07Project = path.join(flow07Root, 'project');
+const flow07Env = { ...process.env, HOME: flow07Home };
+fs.rmSync(flow07Root, { recursive: true, force: true });
+fs.mkdirSync(path.join(flow07Project, '.pi/extensions'), { recursive: true });
+fs.mkdirSync(path.join(flow07Project, 'packages/flow07-dep'), { recursive: true });
+fs.mkdirSync(path.join(flow07Home, '.pi/agent'), { recursive: true });
+// Package-style dependency imported by the extension (exercises dependency roots / module import).
+fs.writeFileSync(
+  path.join(flow07Project, 'packages/flow07-dep/index.ts'),
+  ['export const PRESET_DESCRIPTION: string = "Preset configuration to use";', 'export const startReason = (reason: string): string => `start:${reason}`;'].join('\n')
+);
+// TypeScript extension: imports a package dependency, registers flags with defaults,
+// keeps long-lived module state, and exposes a command-context command.
+fs.writeFileSync(
+  path.join(flow07Project, '.pi/extensions/flow07.ts'),
+  [
+    'import { PRESET_DESCRIPTION, startReason } from "../../packages/flow07-dep/index.ts";',
+    '',
+    'let starts = 0;',
+    'let marks = 0;',
+    '',
+    'export default function(pi: any): void {',
+    '  pi.registerFlag("plan", { description: "Start in plan mode", type: "boolean", default: false });',
+    '  pi.registerFlag("preset", { description: PRESET_DESCRIPTION, type: "string" });',
+    '  pi.on("session_start", (event: any) => {',
+    '    starts++;',
+    '    pi.appendEntry("flow07-start", { starts, reason: startReason(event.reason) });',
+    '    return { starts, reason: event.reason };',
+    '  });',
+    '  pi.registerCommand("flow07-mark", {',
+    '    description: "Append an accumulating long-lived state entry",',
+    '    handler: async (args: string, ctx: any) => {',
+    '      await ctx.waitForIdle();',
+    '      marks++;',
+    '      await pi.appendEntry("flow07-mark", { marks, args, hasUI: ctx.hasUI });',
+    '    }',
+    '  });',
+    '}'
+  ].join('\n')
+);
+
+// TypeScript path + package dependency import + flag discovery via `extensions --flags --json`.
+const flow07Flags = JSON.parse(run(
+  ['extensions', '--flags', '--json'],
+  undefined,
+  { cwd: flow07Project, env: flow07Env }
+)).flags;
+const flow07PlanFlag = flow07Flags.find((flag) => flag.name === 'plan');
+const flow07PresetFlag = flow07Flags.find((flag) => flag.name === 'preset');
+if (
+  flow07Flags.length !== 2 ||
+  !flow07PlanFlag || flow07PlanFlag.type !== 'boolean' || flow07PlanFlag.default !== false ||
+  flow07PlanFlag.description !== 'Start in plan mode' || !flow07PlanFlag.extensionPath.endsWith('/.pi/extensions/flow07.ts') ||
+  !flow07PresetFlag || flow07PresetFlag.type !== 'string' || flow07PresetFlag.default !== null ||
+  // Description resolved through an imported package dependency constant.
+  flow07PresetFlag.description !== 'Preset configuration to use'
+) {
+  throw new Error('flow07 extensions --flags did not surface TS extension flags with package-dependency import and defaults');
+}
+
+// Registered flags appear in the top-level --help output (upstream printHelp section).
+const flow07Help = run(['--help'], undefined, { cwd: flow07Project, env: flow07Env });
+if (
+  !flow07Help.includes('Extension CLI Flags:') ||
+  !/--plan\s+Start in plan mode/.test(flow07Help) ||
+  !/--preset <value>\s+Preset configuration to use/.test(flow07Help)
+) {
+  throw new Error('flow07 --help did not surface extension-registered CLI flags');
+}
+
+// Flag validation matches upstream applyExtensionFlagValues: a typed string flag given
+// no value is rejected; a typed boolean flag coerces any presence to true (never errors);
+// valid values pass; unknown flags pass through unchanged.
+const flow07MissingValue = runFail(
+  ['--preset', '-p', 'hi', '--no-session'],
+  undefined,
+  { cwd: flow07Project, env: flow07Env }
+);
+if (flow07MissingValue.status !== 1 || !flow07MissingValue.stderr.includes('Extension flag "--preset" requires a value')) {
+  throw new Error('flow07 flag validation did not reject a typed string flag missing its value');
+}
+const flow07ValidFlags = run(
+  ['-p', 'hi', '--preset', 'plan', '--plan', '--no-session'],
+  undefined,
+  { cwd: flow07Project, env: flow07Env }
+);
+if (!flow07ValidFlags.includes('print-mode foundation')) {
+  throw new Error('flow07 flag validation rejected a valid string value and bare boolean flag');
+}
+// A boolean flag accepts an explicit value (coerced to true upstream), no error.
+const flow07BooleanWithValue = run(
+  ['-p', 'hi', '--plan=anything', '--no-session'],
+  undefined,
+  { cwd: flow07Project, env: flow07Env }
+);
+if (!flow07BooleanWithValue.includes('print-mode foundation')) {
+  throw new Error('flow07 flag validation incorrectly rejected a boolean flag given a value');
+}
+// An unknown (non-extension) flag is passed through unchanged.
+const flow07UnknownFlag = run(
+  ['-p', 'hi', '--not-a-registered-flag=x', '--no-session'],
+  undefined,
+  { cwd: flow07Project, env: flow07Env }
+);
+if (!flow07UnknownFlag.includes('print-mode foundation')) {
+  throw new Error('flow07 flag validation incorrectly rejected an unknown non-extension flag');
+}
+
+// Command-context action: a registered command awaits ctx.waitForIdle(), reads ctx.hasUI,
+// and appends a state entry. Durable long-lived state lives in the session JSONL: both
+// invocations persist, accumulating across the session.
+// DIVERGENCE: pi-zig spawns one Node process per command invocation, so extension
+// module-level state (the `marks` counter) does NOT persist across separate RPC commands
+// (each starts at 1). Long-lived module state across events within a single runner pass is
+// instead proven by the Zig test "extension runner keeps long-lived state across a
+// lifecycle sequence" (runLifecycleSequence drives multiple events in one process).
+const flow07SessionFile = path.join(flow07Project, 'flow07-session.jsonl');
+fs.rmSync(flow07SessionFile, { force: true });
+const flow07CommandOutput = run(
+  ['--mode', 'rpc', '--session', flow07SessionFile, '--extension', '.pi/extensions/flow07.ts'],
+  [
+    JSON.stringify({ id: 'flow07-mark-1', type: 'prompt', message: '/flow07-mark first' }),
+    JSON.stringify({ id: 'flow07-mark-2', type: 'prompt', message: '/flow07-mark second' }),
+    JSON.stringify({ id: 'flow07-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { cwd: flow07Project, env: flow07Env }
+);
+const flow07CommandResponses = flow07CommandOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const flow07Mark1 = flow07CommandResponses.find((response) => response.id === 'flow07-mark-1');
+const flow07Mark2 = flow07CommandResponses.find((response) => response.id === 'flow07-mark-2');
+const flow07Messages = flow07CommandResponses.find((response) => response.id === 'flow07-messages');
+if (
+  !flow07Mark1?.success || !flow07Mark2?.success ||
+  // Command-context commands do not enqueue user-visible messages.
+  flow07Messages?.data?.messages?.length !== 0
+) {
+  throw new Error('flow07 command-context command did not execute cleanly through the RPC runner');
+}
+const flow07SessionEntries = fs.readFileSync(flow07SessionFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const flow07MarkEntries = flow07SessionEntries.filter((entry) => entry.type === 'custom' && entry.customType === 'flow07-mark');
+if (
+  // Both command invocations persisted accumulating durable state to the session.
+  flow07MarkEntries.length !== 2 ||
+  flow07MarkEntries[0]?.data?.args !== 'first' ||
+  flow07MarkEntries[1]?.data?.args !== 'second' ||
+  // Command context reports headless RPC mode (no TUI) and the awaited ctx.waitForIdle()
+  // resolved so the appendEntry ran with the per-process counter at 1.
+  flow07MarkEntries[0]?.data?.hasUI !== false ||
+  flow07MarkEntries[0]?.data?.marks !== 1 ||
+  flow07MarkEntries[1]?.data?.marks !== 1
+) {
+  throw new Error('flow07 command-context appendEntry did not persist accumulating durable session state');
 }
 
 console.log('basic pi-zig smokes passed');

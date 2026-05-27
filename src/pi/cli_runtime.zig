@@ -77,7 +77,7 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     try writeDiagnostics(init.io, parsed);
     if (hasErrorDiagnostics(parsed)) return error.InvalidCliArguments;
 
-    if (parsed.help) return writeTopLevelHelp(init.io);
+    if (parsed.help) return writeTopLevelHelpWithExtensions(init.io, init.gpa, init.environ_map);
     if (parsed.version) return writeStdout(init.io, config.version ++ "\n");
 
     if (parsed.list_models) {
@@ -100,6 +100,7 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     }
 
     try validateSessionFlags(init.io, parsed);
+    try validateExtensionFlags(init.io, init.gpa, init.environ_map, parsed);
 
     const mode = parsed.mode orelse cli.Mode.text;
     if (mode == .rpc) {
@@ -209,6 +210,20 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
         \\
     );
 }
+
+// ===== FLOW 07: extension-aware help =====
+// Print the base top-level help, then append CLI flags registered by discovered
+// extensions (matching upstream printHelp(extensionFlags)). Discovery/runner failures
+// are non-fatal: help still prints without the extension section.
+pub fn writeTopLevelHelpWithExtensions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+) !void {
+    try writeTopLevelHelp(io);
+    try writeExtensionFlagHelp(io, allocator, env);
+}
+// ===== END FLOW 07 =====
 
 fn runTextPrintFoundation(
     io: std.Io,
@@ -1327,6 +1342,94 @@ fn extensionFlagValuesFromParsed(allocator: std.mem.Allocator, parsed: cli.Parse
     }
     return values;
 }
+
+// ===== FLOW 07: extension flag validation/help surfacing =====
+// Validate CLI-provided unknown flags against the extension-registered flag set.
+// Mirrors upstream registerFlag typing: a boolean flag rejects an explicit value and a
+// string flag requires one. Unknown (non-extension) flags are left untouched, matching
+// upstream which passes them through. Returns error.InvalidCliArguments after reporting
+// when any registered extension flag was given an invalid value.
+fn validateExtensionFlags(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+) !void {
+    if (parsed.unknown_flags_len == 0) return;
+
+    var runtime_extensions = try discoverRuntimeExtensionPaths(io, allocator, env, parsed);
+    defer runtime_extensions.deinit(allocator);
+    if (runtime_extensions.paths.len == 0) return;
+
+    const provided = try extensionFlagValuesFromParsed(allocator, parsed);
+    defer if (provided.len > 0) allocator.free(provided);
+
+    var runner = extension_runner.Runner{
+        .io = io,
+        .allocator = allocator,
+        .extension_paths = runtime_extensions.paths,
+    };
+    const definitions = try runner.discoverFlagDefinitions();
+    defer runner.deinitFlagDefinitions(definitions);
+    if (definitions.len == 0) return;
+
+    const errors = try runner.validateFlags(definitions, provided);
+    defer runner.deinitFlagValidationErrors(errors);
+    if (errors.len == 0) return;
+
+    for (errors) |err| {
+        try writeStderr(io, err.message);
+        try writeStderr(io, "\n");
+    }
+    std.process.exit(1);
+}
+
+// Append extension-registered CLI flags to the top-level help output, matching upstream
+// printHelp()'s "Extension CLI Flags:" section in cli/args.ts.
+fn writeExtensionFlagHelp(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+) !void {
+    var runtime_extensions = discoverRuntimeExtensionPaths(io, allocator, env, .{}) catch return;
+    defer runtime_extensions.deinit(allocator);
+    if (runtime_extensions.paths.len == 0) return;
+
+    var runner = extension_runner.Runner{
+        .io = io,
+        .allocator = allocator,
+        .extension_paths = runtime_extensions.paths,
+    };
+    const definitions = runner.discoverFlagDefinitions() catch return;
+    defer runner.deinitFlagDefinitions(definitions);
+    if (definitions.len == 0) return;
+
+    try writeStdout(io, "\nExtension CLI Flags:\n");
+    for (definitions) |definition| {
+        try writeExtensionFlagHelpLine(io, allocator, definition);
+    }
+}
+
+fn writeExtensionFlagHelpLine(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    definition: extension_runner.Runner.FlagDefinition,
+) !void {
+    const value_hint = if (definition.flag_type == .string) " <value>" else "";
+    const left = try std.fmt.allocPrint(allocator, "  --{s}{s}", .{ definition.name, value_hint });
+    defer allocator.free(left);
+    try writeStdout(io, left);
+    var pad = left.len;
+    while (pad < 32) : (pad += 1) try writeStdout(io, " ");
+    if (definition.description) |description| {
+        try writeStdout(io, description);
+    } else {
+        try writeStdout(io, "Registered by ");
+        try writeStdout(io, definition.extension_path);
+    }
+    try writeStdout(io, "\n");
+}
+// ===== END FLOW 07 =====
 
 fn extensionToolAllowed(parsed: cli.ParsedArgs, name: []const u8) bool {
     if (parsed.no_tools) return false;

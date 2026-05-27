@@ -1,4 +1,5 @@
 const std = @import("std");
+const extension_runner = @import("extension_runner.zig");
 
 const max_settings_bytes = 1024 * 1024;
 const max_manifest_bytes = 256 * 1024;
@@ -17,6 +18,7 @@ const Entry = struct {
 const Options = struct {
     json: bool = false,
     no_extensions: bool = false,
+    flags: bool = false,
     explicit_paths: std.ArrayList([]const u8) = .empty,
     help: bool = false,
     invalid_option: ?[]const u8 = null,
@@ -64,12 +66,96 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
     defer deinitEntries(allocator, &entries);
     sortEntries(entries.items);
 
+    if (options.flags) {
+        try runFlags(io, allocator, entries.items, options.json);
+        return true;
+    }
+
     if (options.json) {
         try writeJson(io, entries.items);
     } else {
         try writeText(io, entries.items);
     }
     return true;
+}
+
+// Surface CLI flags registered by the discovered, runnable extensions. This drives the
+// extension runner over the same load targets the inventory uses, so flag discovery
+// stays consistent with package-manager/settings discovery output.
+fn runFlags(io: std.Io, allocator: std.mem.Allocator, entries: []const Entry, json: bool) !void {
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(allocator);
+    for (entries) |entry| {
+        if (!entry.enabled or !entry.exists or !isRunnableExtensionFile(entry.path)) continue;
+        if (pathListContains(paths.items, entry.path)) continue;
+        try paths.append(allocator, entry.path);
+    }
+
+    var runner = extension_runner.Runner{
+        .io = io,
+        .allocator = allocator,
+        .extension_paths = paths.items,
+    };
+    const definitions = try runner.discoverFlagDefinitions();
+    defer runner.deinitFlagDefinitions(definitions);
+
+    if (json) {
+        try writeFlagsJson(io, definitions);
+    } else {
+        try writeFlagsText(io, definitions);
+    }
+}
+
+fn writeFlagsJson(io: std.Io, definitions: []const extension_runner.Runner.FlagDefinition) !void {
+    var buf: [16 * 1024]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buf);
+    const w = &writer.interface;
+    try w.writeAll("{\"flags\":[");
+    for (definitions, 0..) |definition, index| {
+        if (index != 0) try w.writeAll(",");
+        try w.writeAll("{\"name\":");
+        try writeJsonString(w, definition.name);
+        try w.writeAll(",\"type\":");
+        switch (definition.flag_type) {
+            .boolean => try writeJsonString(w, "boolean"),
+            .string => try writeJsonString(w, "string"),
+            .unspecified => try w.writeAll("null"),
+        }
+        try w.writeAll(",\"description\":");
+        if (definition.description) |description| {
+            try writeJsonString(w, description);
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"default\":");
+        if (definition.default_json) |default_json| {
+            try w.writeAll(default_json);
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"extensionPath\":");
+        try writeJsonString(w, definition.extension_path);
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}\n");
+    try w.flush();
+}
+
+fn writeFlagsText(io: std.Io, definitions: []const extension_runner.Runner.FlagDefinition) !void {
+    if (definitions.len == 0) {
+        try writeStdout(io, "No extension flags registered.\n");
+        return;
+    }
+    for (definitions) |definition| {
+        try writeStdout(io, "--");
+        try writeStdout(io, definition.name);
+        try writeStdout(io, if (definition.flag_type == .string) " <value>" else "");
+        if (definition.description) |description| {
+            try writeStdout(io, "  ");
+            try writeStdout(io, description);
+        }
+        try writeStdout(io, "\n");
+    }
 }
 
 pub fn discoverRuntimePaths(
@@ -112,6 +198,10 @@ fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Options {
             options.json = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--flags")) {
+            options.flags = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--no-extensions") or std.mem.eql(u8, arg, "-ne")) {
             options.no_extensions = true;
             continue;
@@ -138,13 +228,17 @@ fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Options {
 fn writeHelp(io: std.Io) !void {
     try writeStdout(io,
         \\Usage:
-        \\  pi-zig extensions [--json] [--no-extensions] [--extension <path>] [path...]
+        \\  pi-zig extensions [--json] [--flags] [--no-extensions] [--extension <path>] [path...]
         \\
         \\Discover extension entry points using upstream order:
         \\  project settings, project .pi/extensions, user settings, user extensions,
         \\  package-provided extensions, then explicit CLI paths.
         \\
-        \\This command inventories load targets only. Extension execution is not ported yet.
+        \\  --json            Emit discovered entry points (or flags with --flags) as JSON.
+        \\  --flags           List CLI flags registered by the discovered extensions.
+        \\
+        \\Inventory mode lists load targets only. With --flags the extension runner loads
+        \\the discovered extensions to report their registered CLI flags.
         \\
     );
 }

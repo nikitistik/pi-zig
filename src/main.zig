@@ -8,7 +8,7 @@ pub fn main(init: std.process.Init) !void {
     const command = args[1];
 
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
-        return pi.cli_runtime.writeTopLevelHelp(init.io);
+        return pi.cli_runtime.writeTopLevelHelpWithExtensions(init.io, init.arena.allocator(), init.environ_map);
     }
 
     if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v") or std.mem.eql(u8, command, "version")) {
