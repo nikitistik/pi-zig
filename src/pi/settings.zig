@@ -719,3 +719,156 @@ fn writeStdout(io: std.Io, bytes: []const u8) !void {
 fn writeStderr(io: std.Io, bytes: []const u8) !void {
     try std.Io.File.stderr().writeStreamingAll(io, bytes);
 }
+
+// Migrations mirror production by allocating new keys from a long-lived arena
+// (main.zig passes init.arena.allocator()); the parsed JSON keeps its own arena.
+fn parseAndMigrate(allocator: std.mem.Allocator, json: []const u8) !std.json.Value {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    try migrateSettings(allocator, &parsed.value);
+    return parsed.value;
+}
+
+test "migrateSettings renames queueMode to steeringMode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try parseAndMigrate(arena.allocator(), "{\"queueMode\":\"all\"}");
+    try std.testing.expect(value.object.get("queueMode") == null);
+    try std.testing.expectEqualStrings("all", value.object.get("steeringMode").?.string);
+}
+
+test "migrateSettings keeps explicit steeringMode over legacy queueMode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try parseAndMigrate(arena.allocator(), "{\"queueMode\":\"all\",\"steeringMode\":\"one-at-a-time\"}");
+    try std.testing.expect(value.object.get("queueMode") == null);
+    try std.testing.expectEqualStrings("one-at-a-time", value.object.get("steeringMode").?.string);
+}
+
+test "migrateSettings converts websockets boolean to transport" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const on = try parseAndMigrate(arena.allocator(), "{\"websockets\":true}");
+    try std.testing.expect(on.object.get("websockets") == null);
+    try std.testing.expectEqualStrings("websocket", on.object.get("transport").?.string);
+
+    const off = try parseAndMigrate(arena.allocator(), "{\"websockets\":false}");
+    try std.testing.expectEqualStrings("sse", off.object.get("transport").?.string);
+
+    // An explicit transport wins over the legacy websockets flag.
+    const explicit = try parseAndMigrate(arena.allocator(), "{\"websockets\":true,\"transport\":\"sse\"}");
+    try std.testing.expectEqualStrings("sse", explicit.object.get("transport").?.string);
+}
+
+test "migrateSettings flattens legacy skills object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try parseAndMigrate(
+        arena.allocator(),
+        "{\"skills\":{\"enableSkillCommands\":false,\"customDirectories\":[\"legacy-skills\"]}}",
+    );
+    try std.testing.expectEqual(false, value.object.get("enableSkillCommands").?.bool);
+    const skills = value.object.get("skills").?;
+    try std.testing.expectEqual(@as(usize, 1), skills.array.items.len);
+    try std.testing.expectEqualStrings("legacy-skills", skills.array.items[0].string);
+}
+
+test "migrateSettings drops legacy skills object without custom directories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try parseAndMigrate(arena.allocator(), "{\"skills\":{\"enableSkillCommands\":true}}");
+    try std.testing.expectEqual(true, value.object.get("enableSkillCommands").?.bool);
+    try std.testing.expect(value.object.get("skills") == null);
+}
+
+test "migrateSettings moves retry maxDelayMs to provider maxRetryDelayMs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try parseAndMigrate(arena.allocator(), "{\"retry\":{\"maxDelayMs\":1234,\"maxRetries\":4}}");
+    const retry = value.object.get("retry").?.object;
+    try std.testing.expect(retry.get("maxDelayMs") == null);
+    try std.testing.expectEqual(@as(i64, 4), numberToI64(retry.get("maxRetries").?).?);
+    try std.testing.expectEqual(@as(i64, 1234), numberToI64(retry.get("provider").?.object.get("maxRetryDelayMs").?).?);
+}
+
+test "migrateSettings preserves explicit provider maxRetryDelayMs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const value = try parseAndMigrate(
+        arena.allocator(),
+        "{\"retry\":{\"maxDelayMs\":1234,\"provider\":{\"maxRetryDelayMs\":555}}}",
+    );
+    const retry = value.object.get("retry").?.object;
+    try std.testing.expect(retry.get("maxDelayMs") == null);
+    try std.testing.expectEqual(@as(i64, 555), numberToI64(retry.get("provider").?.object.get("maxRetryDelayMs").?).?);
+}
+
+test "mergeSettings merges nested objects with project precedence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const global = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"theme\":\"dark\",\"compaction\":{\"enabled\":true,\"reserveTokens\":16384}}",
+        .{},
+    );
+    const project = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"compaction\":{\"reserveTokens\":8192}}",
+        .{},
+    );
+
+    const merged = try mergeSettings(allocator, global.value, project.value);
+    // Top-level key only present globally is preserved.
+    try std.testing.expectEqualStrings("dark", merged.object.get("theme").?.string);
+    const compaction = merged.object.get("compaction").?.object;
+    // Project override wins for the overlapping nested key...
+    try std.testing.expectEqual(@as(i64, 8192), compaction.get("reserveTokens").?.integer);
+    // ...while sibling nested keys from global survive the merge.
+    try std.testing.expectEqual(true, compaction.get("enabled").?.bool);
+}
+
+fn parseHttpIdleProbe(json: []const u8) !?i64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    return parseHttpIdleTimeoutMs(parsed.value);
+}
+
+test "parseHttpIdleTimeoutMs accepts numbers, disabled, and rejects negatives" {
+    try std.testing.expectEqual(@as(?i64, 1000), try parseHttpIdleProbe("1000"));
+    try std.testing.expectEqual(@as(?i64, 0), try parseHttpIdleProbe("\"disabled\""));
+    try std.testing.expectEqual(@as(?i64, 2000), try parseHttpIdleProbe("\"2000\""));
+    try std.testing.expectEqual(@as(?i64, 0), try parseHttpIdleProbe("0"));
+    try std.testing.expectEqual(@as(?i64, null), try parseHttpIdleProbe("-5"));
+    try std.testing.expectEqual(@as(?i64, null), try parseHttpIdleProbe("\"oops\""));
+    try std.testing.expectEqual(@as(?i64, null), try parseHttpIdleProbe("true"));
+}
+
+test "setDottedValue creates nested objects and preserves siblings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"theme\":\"dark\"}", .{});
+    try setDottedValue(allocator, &parsed.value, "compaction.reserveTokens", .{ .integer = 4096 });
+    try std.testing.expectEqualStrings("dark", parsed.value.object.get("theme").?.string);
+    try std.testing.expectEqual(@as(i64, 4096), parsed.value.object.get("compaction").?.object.get("reserveTokens").?.integer);
+
+    try std.testing.expectError(error.InvalidSettingPath, setDottedValue(allocator, &parsed.value, "", .{ .bool = true }));
+}
+
+test "findPath reads nested dotted values" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"compaction\":{\"keepRecentTokens\":222}}",
+        .{},
+    );
+    defer parsed.deinit();
+    const value = findPath(parsed.value, "compaction.keepRecentTokens").?;
+    try std.testing.expectEqual(@as(i64, 222), value.integer);
+    try std.testing.expect(findPath(parsed.value, "compaction.missing") == null);
+    try std.testing.expect(findPath(parsed.value, "absent") == null);
+}
