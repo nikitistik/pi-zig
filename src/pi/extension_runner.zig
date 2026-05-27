@@ -95,6 +95,22 @@ pub const Runner = struct {
 
     pub const CommandExecutionResult = struct {
         handled: bool = false,
+        actions: []CommandAction = &.{},
+
+        pub fn deinit(self: CommandExecutionResult, allocator: std.mem.Allocator) void {
+            for (self.actions) |action| action.deinit(allocator);
+            if (self.actions.len > 0) allocator.free(self.actions);
+        }
+    };
+
+    pub const CommandAction = union(enum) {
+        send_user_message: []u8,
+
+        pub fn deinit(self: CommandAction, allocator: std.mem.Allocator) void {
+            switch (self) {
+                .send_user_message => |message| allocator.free(message),
+            }
+        }
     };
 
     pub fn discoverCommandDefinitions(self: *Runner) ![]CommandDefinition {
@@ -164,7 +180,17 @@ pub const Runner = struct {
         if (parsed.value != .object) return error.ExtensionHookInvalidResponse;
         const handled = parsed.value.object.get("handled") orelse return error.ExtensionHookInvalidResponse;
         if (handled != .bool) return error.ExtensionHookInvalidResponse;
-        return .{ .handled = handled.bool };
+        var actions: []CommandAction = &.{};
+        errdefer {
+            for (actions) |action| action.deinit(self.allocator);
+            if (actions.len > 0) self.allocator.free(actions);
+        }
+        if (handled.bool) {
+            if (parsed.value.object.get("actions")) |action_value| {
+                actions = try commandActionsToOwned(self.allocator, action_value);
+            }
+        }
+        return .{ .handled = handled.bool, .actions = actions };
     }
 
     fn runBeforeToolCall(self: *Runner, call: ai_client.ChatToolCall) !agent.BeforeToolCallResult {
@@ -509,6 +535,39 @@ fn contentPartsToOwned(allocator: std.mem.Allocator, content: std.json.Value) ![
     return trimmed;
 }
 
+fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![]Runner.CommandAction {
+    if (value != .array) return error.ExtensionHookInvalidResponse;
+    if (value.array.items.len == 0) return &.{};
+
+    var actions: std.ArrayList(Runner.CommandAction) = .empty;
+    errdefer {
+        for (actions.items) |action| action.deinit(allocator);
+        actions.deinit(allocator);
+    }
+
+    for (value.array.items) |item| {
+        if (item != .object) return error.ExtensionHookInvalidResponse;
+        const kind = item.object.get("type") orelse return error.ExtensionHookInvalidResponse;
+        if (kind != .string) return error.ExtensionHookInvalidResponse;
+        if (std.mem.eql(u8, kind.string, "send_user_message")) {
+            const content = item.object.get("content") orelse return error.ExtensionHookInvalidResponse;
+            const owned_content = switch (content) {
+                .string => try allocator.dupe(u8, content.string),
+                .array => try textContentToOwnedString(allocator, content),
+                else => return error.ExtensionHookInvalidResponse,
+            };
+            actions.append(allocator, .{ .send_user_message = owned_content }) catch |err| {
+                allocator.free(owned_content);
+                return err;
+            };
+        } else {
+            return error.ExtensionHookInvalidResponse;
+        }
+    }
+    if (actions.items.len == 0) return &.{};
+    return actions.toOwnedSlice(allocator);
+}
+
 fn freeContentParts(allocator: std.mem.Allocator, parts: []ai_client.ChatContentPart) void {
     if (parts.len == 0) return;
     for (parts) |part| {
@@ -654,6 +713,7 @@ const hook_runner_script =
     \\let activeFlagMap = null;
     \\const payloadFlags = payload.flags && typeof payload.flags === "object" ? payload.flags : {};
     \\const diagnostics = [];
+    \\const actions = [];
     \\const api = {
     \\  on(type, handler) {
     \\    if (!handlers.has(type)) handlers.set(type, []);
@@ -680,6 +740,10 @@ const hook_runner_script =
     \\      if (Object.prototype.hasOwnProperty.call(flag, "defaultValue")) return flag.defaultValue;
     \\    }
     \\    return undefined;
+    \\  },
+    \\  sendUserMessage(content, options = {}) {
+    \\    void options;
+    \\    actions.push({ type: "send_user_message", content });
     \\  },
     \\  events: { on() {}, emit() {} },
     \\};
@@ -826,7 +890,7 @@ const hook_runner_script =
     \\        stack: err && err.stack ? err.stack : undefined,
     \\      });
     \\    }
-    \\    process.stdout.write(JSON.stringify({ handled: true, diagnostics }) + "\n");
+    \\    process.stdout.write(JSON.stringify({ handled: true, actions, diagnostics }) + "\n");
     \\    return;
     \\  }
     \\  if (event?.type === "execute_tool") {
@@ -1094,6 +1158,33 @@ test "extension runner executes registered commands by invocation name" {
 
     const missing = try runner.runRegisteredCommand("missing-command", "ignored");
     try std.testing.expect(!missing.handled);
+}
+
+test "extension runner returns send user message command actions" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-command-action-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const extension_path = fixture_dir ++ "/command-action.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerCommand("send-user", {
+        \\    description: "Send a raw user message",
+        \\    handler: async (args) => {
+        \\      await pi.sendUserMessage(args);
+        \\    }
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const result = try runner.runRegisteredCommand("send-user", "/write-marker raw user");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.handled);
+    try std.testing.expectEqual(@as(usize, 1), result.actions.len);
+    switch (result.actions[0]) {
+        .send_user_message => |message| try std.testing.expectEqualStrings("/write-marker raw user", message),
+    }
 }
 
 test "extension runner executes duplicate registered commands by suffix" {

@@ -2314,6 +2314,12 @@ fs.writeFileSync(
     `      fs.writeFileSync(${JSON.stringify(commandsFixtureCommandExecMarker)}, args + "|hasUI:" + ctx.hasUI);`,
     '    }',
     '  });',
+    '  pi.registerCommand("send-user-message", {',
+    '    description: "Send raw text as a user message",',
+    '    handler: async (args) => {',
+    '      await pi.sendUserMessage(args);',
+    '    }',
+    '  });',
     '}'
   ].join('\n')
 );
@@ -2709,6 +2715,33 @@ if (
   !rpcCommandExecUnknownMessages?.data?.messages?.some((message) => message.role === 'user' && message.content === '/not-an-extension-command ordinary prompt')
 ) {
   throw new Error('rpc extension command execution smoke did not match upstream prompt/queue semantics');
+}
+fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
+const fixtureRpcCommandSendUserOutput = run(
+  [
+    '--mode',
+    'rpc',
+    '--session',
+    path.join(commandsFixtureRoot, 'rpc-command-send-user-message.jsonl'),
+    '--extension',
+    'extensions/command-exec.mjs'
+  ],
+  [
+    JSON.stringify({ id: 'rpc-command-send-user', type: 'prompt', message: '/send-user-message /write-marker raw user' }),
+    JSON.stringify({ id: 'rpc-command-send-user-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { cwd: commandsFixtureRoot, env: commandsFixtureEnv }
+);
+const fixtureRpcCommandSendUserResponses = fixtureRpcCommandSendUserOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcCommandSendUser = fixtureRpcCommandSendUserResponses.find((response) => response.id === 'rpc-command-send-user');
+const rpcCommandSendUserMessages = fixtureRpcCommandSendUserResponses.find((response) => response.id === 'rpc-command-send-user-messages');
+if (
+  !rpcCommandSendUser?.success ||
+  fs.existsSync(commandsFixtureCommandExecMarker) ||
+  !rpcCommandSendUserMessages?.data?.messages?.some((message) => message.role === 'user' && message.content === '/write-marker raw user')
+) {
+  throw new Error('rpc extension command sendUserMessage action did not persist raw slash-looking user text');
 }
 fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
 const topLevelCommandEnv = envWithoutAnthropicAuth({ HOME: commandsFixtureHome });

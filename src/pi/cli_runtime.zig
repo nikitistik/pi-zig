@@ -386,6 +386,7 @@ fn runTopLevelRegisteredCommand(
         .flag_values = extension_flag_values,
     };
     const result = try runner.runRegisteredCommand(invocation.name, invocation.args);
+    defer result.deinit(allocator);
     return result.handled;
 }
 

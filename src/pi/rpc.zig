@@ -1605,6 +1605,7 @@ const Runtime = struct {
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
+        output: *RpcOutput,
         w: *std.Io.Writer,
         id: ?[]const u8,
         command: []const u8,
@@ -1614,7 +1615,19 @@ const Runtime = struct {
         if (self.run_options.extension_paths.len == 0) return false;
         var runner = self.makeExtensionRunner(io, allocator);
         const result = try runner.runRegisteredCommand(invocation.name, invocation.args);
+        defer result.deinit(allocator);
         if (!result.handled) return false;
+        var started_prompt = false;
+        for (result.actions) |action| {
+            switch (action) {
+                .send_user_message => |content| {
+                    if (started_prompt) return error.MultipleCommandPromptActionsUnsupported;
+                    try self.startPromptAsync(io, allocator, output, id, content, &.{});
+                    started_prompt = true;
+                },
+            }
+        }
+        if (started_prompt) return true;
         try writeSuccess(w, id, command);
         return true;
     }
@@ -1696,7 +1709,7 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "prompt requires a string message");
             };
-            if (self.handleExtensionPromptCommand(io, allocator, w, id, command, message) catch |err| {
+            if (self.handleExtensionPromptCommand(io, allocator, output, w, id, command, message) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             }) return;
             const image_parts = parseRpcImages(allocator, value) catch {
