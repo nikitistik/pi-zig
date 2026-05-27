@@ -2326,6 +2326,12 @@ fs.writeFileSync(
     '      await pi.sendMessage({ customType: "test-extension", content: args, display: false });',
     '    }',
     '  });',
+    '  pi.registerCommand("send-trigger-message", {',
+    '    description: "Send a custom message and trigger a turn",',
+    '    handler: async (args) => {',
+    '      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { triggerTurn: true });',
+    '    }',
+    '  });',
     '  pi.registerCommand("send-next-turn-message", {',
     '    description: "Queue a custom message for the next turn",',
     '    handler: async (args) => {',
@@ -2965,6 +2971,180 @@ if (
   topLevelJsonCommandSessionText.includes('/write-marker top json')
 ) {
   throw new Error('top-level JSON mode extension command did not match upstream command-only prompt semantics');
+}
+const topLevelAppendEntrySession = path.join(commandsFixtureRoot, 'top-level-command-append-entry.jsonl');
+fs.rmSync(topLevelAppendEntrySession, { force: true });
+const topLevelAppendEntryOutput = run(
+  [
+    '--session',
+    topLevelAppendEntrySession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/append-entry top hidden state'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelAppendEntryEntries = fs.existsSync(topLevelAppendEntrySession)
+  ? fs.readFileSync(topLevelAppendEntrySession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+const topLevelAppendEntry = topLevelAppendEntryEntries.find((entry) =>
+  entry.type === 'custom' &&
+  entry.customType === 'test-entry' &&
+  entry.data?.content === 'top hidden state' &&
+  entry.data?.n === 1
+);
+if (
+  topLevelAppendEntryOutput !== '' ||
+  !topLevelAppendEntry ||
+  topLevelAppendEntryEntries.some((entry) => entry.type === 'message' || entry.type === 'custom_message')
+) {
+  throw new Error('top-level extension command appendEntry smoke did not persist a hidden custom entry without model output');
+}
+fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
+const topLevelSendUserSession = path.join(commandsFixtureRoot, 'top-level-command-send-user-message.jsonl');
+fs.rmSync(topLevelSendUserSession, { force: true });
+const topLevelSendUserOutput = run(
+  [
+    '--session',
+    topLevelSendUserSession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/send-user-message /write-marker raw top user'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelSendUserEntries = fs.existsSync(topLevelSendUserSession)
+  ? fs.readFileSync(topLevelSendUserSession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+if (
+  !topLevelSendUserOutput.includes('pi-zig print-mode foundation accepted') ||
+  !topLevelSendUserOutput.includes('Prompt:\n/write-marker raw top user') ||
+  fs.existsSync(commandsFixtureCommandExecMarker) ||
+  topLevelSendUserEntries.some((entry) => entry.type === 'message' && entry.message?.content === '/send-user-message /write-marker raw top user') ||
+  !topLevelSendUserEntries.some((entry) => entry.type === 'message' && entry.message?.role === 'user' && entry.message?.content === '/write-marker raw top user') ||
+  !topLevelSendUserEntries.some((entry) => entry.type === 'message' && entry.message?.role === 'assistant')
+) {
+  throw new Error('top-level extension command sendUserMessage smoke did not run a raw slash-looking prompt');
+}
+fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
+const topLevelJsonSendUserSession = path.join(commandsFixtureRoot, 'top-level-command-json-send-user-message.jsonl');
+fs.rmSync(topLevelJsonSendUserSession, { force: true });
+const topLevelJsonSendUserOutput = run(
+  [
+    '--mode',
+    'json',
+    '--session',
+    topLevelJsonSendUserSession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/send-user-message /write-marker raw top json user'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelJsonSendUserLines = jsonLines(topLevelJsonSendUserOutput);
+const topLevelJsonSendUserEntries = fs.existsSync(topLevelJsonSendUserSession)
+  ? fs.readFileSync(topLevelJsonSendUserSession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+if (
+  !topLevelJsonSendUserLines.some((line) => line.type === 'agent_start') ||
+  !topLevelJsonSendUserLines.some((line) => line.type === 'turn_end') ||
+  !topLevelJsonSendUserLines.some((line) => line.type === 'agent_end') ||
+  fs.existsSync(commandsFixtureCommandExecMarker) ||
+  topLevelJsonSendUserEntries.some((entry) => entry.type === 'message' && entry.message?.content === '/send-user-message /write-marker raw top json user') ||
+  !topLevelJsonSendUserEntries.some((entry) => entry.type === 'message' && entry.message?.role === 'user' && entry.message?.content === '/write-marker raw top json user') ||
+  !topLevelJsonSendUserEntries.some((entry) => entry.type === 'message' && entry.message?.role === 'assistant')
+) {
+  throw new Error('top-level JSON extension command sendUserMessage smoke did not run a raw slash-looking prompt');
+}
+const topLevelCustomMessageSession = path.join(commandsFixtureRoot, 'top-level-command-send-custom-message.jsonl');
+fs.rmSync(topLevelCustomMessageSession, { force: true });
+const topLevelCustomMessageOutput = run(
+  [
+    '--session',
+    topLevelCustomMessageSession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/send-custom-message top custom note'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelCustomMessageEntries = fs.existsSync(topLevelCustomMessageSession)
+  ? fs.readFileSync(topLevelCustomMessageSession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+if (
+  topLevelCustomMessageOutput !== '' ||
+  !topLevelCustomMessageEntries.some((entry) =>
+    entry.type === 'custom_message' &&
+    entry.customType === 'test-extension' &&
+    entry.content === 'top custom note' &&
+    entry.display === false
+  ) ||
+  topLevelCustomMessageEntries.some((entry) => entry.type === 'message')
+) {
+  throw new Error('top-level extension command sendMessage smoke did not persist custom_message without triggering a turn');
+}
+const topLevelTriggerMessageSession = path.join(commandsFixtureRoot, 'top-level-command-send-trigger-message.jsonl');
+fs.rmSync(topLevelTriggerMessageSession, { force: true });
+const topLevelTriggerMessageOutput = run(
+  [
+    '--session',
+    topLevelTriggerMessageSession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/send-trigger-message top triggered note'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelTriggerMessageEntries = fs.existsSync(topLevelTriggerMessageSession)
+  ? fs.readFileSync(topLevelTriggerMessageSession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+if (
+  !topLevelTriggerMessageOutput.includes('pi-zig print-mode foundation accepted') ||
+  !topLevelTriggerMessageOutput.includes('Prompt:\ntop triggered note') ||
+  !topLevelTriggerMessageEntries.some((entry) =>
+    entry.type === 'custom_message' &&
+    entry.customType === 'test-extension' &&
+    entry.content === 'top triggered note' &&
+    entry.display === true
+  ) ||
+  topLevelTriggerMessageEntries.some((entry) => entry.type === 'message' && entry.message?.role === 'user') ||
+  !topLevelTriggerMessageEntries.some((entry) => entry.type === 'message' && entry.message?.role === 'assistant')
+) {
+  throw new Error('top-level extension command triggerTurn sendMessage smoke did not persist custom_message and run a prompt');
+}
+const topLevelNextTurnSession = path.join(commandsFixtureRoot, 'top-level-command-send-next-turn-message.jsonl');
+fs.rmSync(topLevelNextTurnSession, { force: true });
+const topLevelNextTurnFailure = runFail(
+  [
+    '--session',
+    topLevelNextTurnSession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/send-next-turn-message top queued custom note'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelNextTurnEntries = fs.existsSync(topLevelNextTurnSession)
+  ? fs.readFileSync(topLevelNextTurnSession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+if (
+  !(topLevelNextTurnFailure.stdout + topLevelNextTurnFailure.stderr).includes('UnsupportedCommandActionNextTurn') ||
+  topLevelNextTurnEntries.some((entry) => entry.type === 'message' || entry.type === 'custom_message') ||
+  topLevelNextTurnEntries.some((entry) => JSON.stringify(entry).includes('top queued custom note'))
+) {
+  throw new Error('top-level extension command sendMessage nextTurn smoke did not fail visibly without side effects');
 }
 const topLevelUnknownSlashSession = path.join(commandsFixtureRoot, 'top-level-unknown-slash.jsonl');
 fs.rmSync(topLevelUnknownSlashSession, { force: true });

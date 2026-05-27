@@ -192,14 +192,30 @@ fn runTextPrintFoundation(
     prompt: []const u8,
     image_parts: []const ai_client.ChatContentPart,
 ) !void {
-    if (try runTopLevelRegisteredCommand(io, allocator, env, parsed, prompt)) return;
+    const command_outcome = try runTopLevelRegisteredCommand(io, allocator, env, parsed, prompt);
+    defer command_outcome.deinit(allocator);
+    const prompt_request = switch (command_outcome) {
+        .not_handled => TopLevelPromptRequest{
+            .content = prompt,
+            .image_parts = image_parts,
+            .persist_user_message = true,
+        },
+        .handled => return,
+        .prompt => |command_prompt| TopLevelPromptRequest{
+            .content = command_prompt.content,
+            .image_parts = &.{},
+            .persist_user_message = command_prompt.persist_user_message,
+        },
+    };
 
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
-        if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
+        if (prompt_request.persist_user_message and prompt_request.content.len > 0) {
+            _ = try persistent.appendMessage(io, allocator, .user, prompt_request.content);
+        }
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt, image_parts, false, null, null, null, null, null, null);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt_request.content, prompt_request.image_parts, false, null, null, null, null, null, null);
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -218,20 +234,36 @@ fn runJsonPrintFoundation(
     prompt: []const u8,
     image_parts: []const ai_client.ChatContentPart,
 ) !void {
-    if (try runTopLevelRegisteredCommand(io, allocator, env, parsed, prompt)) {
-        var store = try maybeOpenStore(io, allocator, env, parsed);
-        const session_id = if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral";
-        try emitJsonSessionHeader(io, allocator, session_id);
-        return;
-    }
+    const command_outcome = try runTopLevelRegisteredCommand(io, allocator, env, parsed, prompt);
+    defer command_outcome.deinit(allocator);
+    const prompt_request = switch (command_outcome) {
+        .not_handled => TopLevelPromptRequest{
+            .content = prompt,
+            .image_parts = image_parts,
+            .persist_user_message = true,
+        },
+        .handled => {
+            var store = try maybeOpenStore(io, allocator, env, parsed);
+            const session_id = if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral";
+            try emitJsonSessionHeader(io, allocator, session_id);
+            return;
+        },
+        .prompt => |command_prompt| TopLevelPromptRequest{
+            .content = command_prompt.content,
+            .image_parts = &.{},
+            .persist_user_message = command_prompt.persist_user_message,
+        },
+    };
 
     if (shouldUseProviderTextStream(parsed)) {
-        return runJsonProviderTextStream(io, allocator, env, parsed, prompt, image_parts);
+        return runJsonProviderTextStream(io, allocator, env, parsed, prompt_request.content, prompt_request.image_parts, prompt_request.persist_user_message);
     }
 
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
-        if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
+        if (prompt_request.persist_user_message and prompt_request.content.len > 0) {
+            _ = try persistent.appendMessage(io, allocator, .user, prompt_request.content);
+        }
     }
 
     const session_id = if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral";
@@ -253,8 +285,8 @@ fn runJsonPrintFoundation(
             allocator,
             env,
             parsed,
-            prompt,
-            image_parts,
+            prompt_request.content,
+            prompt_request.image_parts,
             true,
             &tool_event_context,
             handleJsonToolStart,
@@ -355,6 +387,34 @@ const SlashCommandInvocation = struct {
     args: []const u8,
 };
 
+const TopLevelPromptRequest = struct {
+    content: []const u8,
+    image_parts: []const ai_client.ChatContentPart,
+    persist_user_message: bool,
+};
+
+const TopLevelCommandPrompt = struct {
+    content: []u8,
+    persist_user_message: bool,
+
+    fn deinit(self: TopLevelCommandPrompt, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+    }
+};
+
+const TopLevelCommandOutcome = union(enum) {
+    not_handled,
+    handled,
+    prompt: TopLevelCommandPrompt,
+
+    fn deinit(self: TopLevelCommandOutcome, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .prompt => |command_prompt| command_prompt.deinit(allocator),
+            .not_handled, .handled => {},
+        }
+    }
+};
+
 fn parseSlashCommandInvocation(message: []const u8) ?SlashCommandInvocation {
     if (message.len < 2 or message[0] != '/') return null;
     const rest = message[1..];
@@ -371,11 +431,11 @@ fn runTopLevelRegisteredCommand(
     env: *const std.process.Environ.Map,
     parsed: cli.ParsedArgs,
     prompt: []const u8,
-) !bool {
-    const invocation = parseSlashCommandInvocation(prompt) orelse return false;
+) !TopLevelCommandOutcome {
+    const invocation = parseSlashCommandInvocation(prompt) orelse return .not_handled;
     var runtime_extensions = try discoverRuntimeExtensionPaths(io, allocator, env, parsed);
     defer runtime_extensions.deinit(allocator);
-    if (runtime_extensions.paths.len == 0) return false;
+    if (runtime_extensions.paths.len == 0) return .not_handled;
 
     const extension_flag_values = try extensionFlagValuesFromParsed(allocator, parsed);
     defer if (extension_flag_values.len > 0) allocator.free(extension_flag_values);
@@ -387,7 +447,54 @@ fn runTopLevelRegisteredCommand(
     };
     const result = try runner.runRegisteredCommand(invocation.name, invocation.args);
     defer result.deinit(allocator);
-    return result.handled;
+    if (!result.handled) return .not_handled;
+
+    var store: ?session.PersistentStore = null;
+    var command_prompt: ?TopLevelCommandPrompt = null;
+    errdefer if (command_prompt) |owned_prompt| owned_prompt.deinit(allocator);
+    for (result.actions) |action| {
+        if (command_prompt != null) return error.MultipleCommandPromptActionsUnsupported;
+        switch (action) {
+            .send_user_message => |content| {
+                command_prompt = .{
+                    .content = try allocator.dupe(u8, content),
+                    .persist_user_message = true,
+                };
+            },
+            .send_message => |custom_message| {
+                if (custom_message.next_turn) return error.UnsupportedCommandActionNextTurn;
+                if (store == null) store = try maybeOpenStore(io, allocator, env, parsed);
+                if (store) |*persistent| {
+                    _ = try persistent.appendCustomMessage(
+                        io,
+                        allocator,
+                        custom_message.custom_type,
+                        custom_message.content,
+                        custom_message.display,
+                    );
+                }
+                if (custom_message.trigger_turn) {
+                    command_prompt = .{
+                        .content = try allocator.dupe(u8, custom_message.content),
+                        .persist_user_message = false,
+                    };
+                }
+            },
+            .append_entry => |entry| {
+                if (store == null) store = try maybeOpenStore(io, allocator, env, parsed);
+                if (store) |*persistent| {
+                    _ = try persistent.appendCustomEntryRawJson(
+                        io,
+                        allocator,
+                        entry.custom_type,
+                        entry.data_json,
+                    );
+                }
+            },
+        }
+    }
+    if (command_prompt) |owned_prompt| return .{ .prompt = owned_prompt };
+    return .handled;
 }
 
 fn runJsonProviderTextStream(
@@ -397,10 +504,11 @@ fn runJsonProviderTextStream(
     parsed: cli.ParsedArgs,
     prompt: []const u8,
     image_parts: []const ai_client.ChatContentPart,
+    persist_user_message: bool,
 ) !void {
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
-        if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
+        if (persist_user_message and prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
     }
 
     const provider = parsed.provider.?;
