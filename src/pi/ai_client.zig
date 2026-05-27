@@ -1,5 +1,9 @@
 const std = @import("std");
 const config = @import("config.zig");
+const models = @import("models.zig");
+
+const non_vision_user_image_placeholder = "(image omitted: model does not support images)";
+const non_vision_tool_image_placeholder = "(tool image omitted: model does not support images)";
 
 pub const ChatCompletionRequest = struct {
     provider: []const u8,
@@ -1281,10 +1285,28 @@ fn buildPayload(allocator: std.mem.Allocator, request: ChatTurnRequest) ![]u8 {
     return buildPayloadWithStream(allocator, request, false);
 }
 
+fn requestSupportsImages(request: ChatTurnRequest) bool {
+    if (models.find(request.provider, request.model)) |model| return model.input_image;
+    if (models.findExactModelReference(request.model)) |model| {
+        if (std.ascii.eqlIgnoreCase(model.provider, request.provider)) return model.input_image;
+    }
+    return true;
+}
+
+fn imagePlaceholderForMessage(message: ChatMessage, supports_images: bool) ?[]const u8 {
+    if (supports_images) return null;
+    return switch (message.role) {
+        .user => non_vision_user_image_placeholder,
+        .tool => non_vision_tool_image_placeholder,
+        else => null,
+    };
+}
+
 fn buildPayloadWithStream(allocator: std.mem.Allocator, request: ChatTurnRequest, stream: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    const supports_images = requestSupportsImages(request);
 
     try w.writeAll("{\"model\":");
     try writeJsonString(w, request.model);
@@ -1298,18 +1320,18 @@ fn buildPayloadWithStream(allocator: std.mem.Allocator, request: ChatTurnRequest
             var has_images = false;
             while (index < request.messages.len and request.messages[index].role == .tool) : (index += 1) {
                 if (emitted != 0) try w.writeByte(',');
-                try writeOpenAIToolTextMessage(w, request.messages[index]);
+                try writeOpenAIToolTextMessage(w, request.messages[index], supports_images);
                 emitted += 1;
                 if (hasImageContentParts(request.messages[index].content_parts)) has_images = true;
             }
-            if (has_images) {
+            if (has_images and supports_images) {
                 if (emitted != 0) try w.writeByte(',');
                 try writeOpenAIToolResultImagesMessage(w, request.messages[tool_start..index]);
                 emitted += 1;
             }
         } else {
             if (emitted != 0) try w.writeByte(',');
-            try writeMessage(w, message);
+            try writeMessage(w, message, supports_images);
             emitted += 1;
             index += 1;
         }
@@ -1332,6 +1354,7 @@ fn buildAnthropicMessagesPayload(allocator: std.mem.Allocator, request: ChatTurn
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    const supports_images = requestSupportsImages(request);
 
     try w.writeAll("{\"model\":");
     try writeJsonString(w, request.model);
@@ -1350,9 +1373,9 @@ fn buildAnthropicMessagesPayload(allocator: std.mem.Allocator, request: ChatTurn
         }
         if (emitted != 0) try w.writeByte(',');
         if (message.role == .tool) {
-            try writeAnthropicToolResultMessage(w, request.messages, &index);
+            try writeAnthropicToolResultMessage(w, request.messages, &index, supports_images);
         } else {
-            try writeAnthropicMessage(w, message);
+            try writeAnthropicMessage(w, message, supports_images);
             index += 1;
         }
         emitted += 1;
@@ -1374,6 +1397,7 @@ fn buildGoogleGenerateContentPayload(allocator: std.mem.Allocator, request: Chat
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    const supports_images = requestSupportsImages(request);
 
     try w.writeAll("{\"contents\":[");
     var emitted: usize = 0;
@@ -1386,9 +1410,9 @@ fn buildGoogleGenerateContentPayload(allocator: std.mem.Allocator, request: Chat
         }
         if (emitted != 0) try w.writeByte(',');
         if (message.role == .tool) {
-            try writeGoogleToolResultContent(w, request.messages, &index);
+            try writeGoogleToolResultContent(w, request.messages, &index, supports_images);
         } else {
-            try writeGoogleContent(w, message);
+            try writeGoogleContent(w, message, supports_images);
             index += 1;
         }
         emitted += 1;
@@ -1411,6 +1435,7 @@ fn buildMistralChatPayload(allocator: std.mem.Allocator, request: ChatTurnReques
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    const supports_images = requestSupportsImages(request);
 
     try w.writeAll("{\"model\":");
     try writeJsonString(w, request.model);
@@ -1419,7 +1444,7 @@ fn buildMistralChatPayload(allocator: std.mem.Allocator, request: ChatTurnReques
     try w.writeAll(",\"messages\":[");
     for (request.messages, 0..) |message, index| {
         if (index != 0) try w.writeByte(',');
-        try writeMistralMessage(w, request.messages, index, message);
+        try writeMistralMessage(w, request.messages, index, message, supports_images);
     }
     try w.writeByte(']');
     if (request.tools.len > 0) {
@@ -1438,6 +1463,7 @@ fn buildBedrockConversePayload(allocator: std.mem.Allocator, request: ChatTurnRe
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    const supports_images = requestSupportsImages(request);
 
     try w.writeAll("{\"messages\":[");
     var emitted: usize = 0;
@@ -1450,9 +1476,9 @@ fn buildBedrockConversePayload(allocator: std.mem.Allocator, request: ChatTurnRe
         }
         if (emitted != 0) try w.writeByte(',');
         if (message.role == .tool) {
-            try writeBedrockToolResultMessage(w, request.messages, &index);
+            try writeBedrockToolResultMessage(w, request.messages, &index, supports_images);
         } else {
-            try writeBedrockMessage(w, message);
+            try writeBedrockMessage(w, message, supports_images);
             index += 1;
         }
         emitted += 1;
@@ -1484,7 +1510,7 @@ fn writeAnthropicSystem(w: *std.Io.Writer, messages: []const ChatMessage) !void 
     if (emitted != 0) try w.writeByte(']');
 }
 
-fn writeAnthropicMessage(w: *std.Io.Writer, message: ChatMessage) !void {
+fn writeAnthropicMessage(w: *std.Io.Writer, message: ChatMessage, supports_images: bool) !void {
     try w.writeAll("{\"role\":");
     try writeJsonString(w, switch (message.role) {
         .assistant => "assistant",
@@ -1492,14 +1518,11 @@ fn writeAnthropicMessage(w: *std.Io.Writer, message: ChatMessage) !void {
     });
     try w.writeAll(",\"content\":[");
     var emitted: usize = 0;
+    const image_placeholder = imagePlaceholderForMessage(message, supports_images);
     if (message.role == .assistant and message.content.len > 0) {
         try writeAnthropicTextBlock(w, message.content, &emitted);
     } else if (message.content_parts.len > 0) {
-        for (message.content_parts) |part| {
-            if (emitted != 0) try w.writeByte(',');
-            try writeAnthropicContentPart(w, part);
-            emitted += 1;
-        }
+        try writeAnthropicContentPartsInto(w, message.content_parts, image_placeholder, &emitted);
     } else if (message.content.len > 0) {
         try writeAnthropicTextBlock(w, message.content, &emitted);
     }
@@ -1513,17 +1536,18 @@ fn writeAnthropicMessage(w: *std.Io.Writer, message: ChatMessage) !void {
     try w.writeAll("]}");
 }
 
-fn writeAnthropicToolResultMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize) !void {
+fn writeAnthropicToolResultMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize, supports_images: bool) !void {
     try w.writeAll("{\"role\":\"user\",\"content\":[");
     var emitted: usize = 0;
     while (index.* < messages.len and messages[index.*].role == .tool) : (index.* += 1) {
         if (emitted != 0) try w.writeByte(',');
         const message = messages[index.*];
+        const image_placeholder = imagePlaceholderForMessage(message, supports_images);
         try w.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
         try writeJsonString(w, message.tool_call_id orelse "");
         try w.writeAll(",\"content\":");
         if (message.content_parts.len > 0) {
-            try writeAnthropicContentParts(w, message.content_parts);
+            try writeAnthropicContentParts(w, message.content_parts, image_placeholder);
         } else {
             try writeJsonString(w, message.content);
         }
@@ -1541,14 +1565,22 @@ fn writeAnthropicTextBlock(w: *std.Io.Writer, text: []const u8, emitted: *usize)
     emitted.* += 1;
 }
 
-fn writeAnthropicContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
+fn writeAnthropicTextPart(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeAll("{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+}
+
+fn writeAnthropicContentPart(w: *std.Io.Writer, part: ChatContentPart, image_placeholder: ?[]const u8) !void {
     switch (part) {
         .text => |text| {
-            try w.writeAll("{\"type\":\"text\",\"text\":");
-            try writeJsonString(w, text);
-            try w.writeByte('}');
+            try writeAnthropicTextPart(w, text);
         },
         .image => |image| {
+            if (image_placeholder) |placeholder| {
+                try writeAnthropicTextPart(w, placeholder);
+                return;
+            }
             try w.writeAll("{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
             try writeJsonString(w, image.mime_type);
             try w.writeAll(",\"data\":");
@@ -1558,12 +1590,43 @@ fn writeAnthropicContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
     }
 }
 
-fn writeAnthropicContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
-    try w.writeByte('[');
-    for (parts, 0..) |part, index| {
-        if (index != 0) try w.writeByte(',');
-        try writeAnthropicContentPart(w, part);
+fn writeAnthropicContentPartsInto(
+    w: *std.Io.Writer,
+    parts: []const ChatContentPart,
+    image_placeholder: ?[]const u8,
+    emitted: *usize,
+) !void {
+    var previous_was_placeholder = false;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                if (emitted.* != 0) try w.writeByte(',');
+                try writeAnthropicTextPart(w, text);
+                emitted.* += 1;
+                previous_was_placeholder = if (image_placeholder) |placeholder| std.mem.eql(u8, text, placeholder) else false;
+            },
+            .image => {
+                if (image_placeholder) |placeholder| {
+                    if (previous_was_placeholder) continue;
+                    if (emitted.* != 0) try w.writeByte(',');
+                    try writeAnthropicTextPart(w, placeholder);
+                    emitted.* += 1;
+                    previous_was_placeholder = true;
+                } else {
+                    if (emitted.* != 0) try w.writeByte(',');
+                    try writeAnthropicContentPart(w, part, null);
+                    emitted.* += 1;
+                    previous_was_placeholder = false;
+                }
+            },
+        }
     }
+}
+
+fn writeAnthropicContentParts(w: *std.Io.Writer, parts: []const ChatContentPart, image_placeholder: ?[]const u8) !void {
+    try w.writeByte('[');
+    var emitted: usize = 0;
+    try writeAnthropicContentPartsInto(w, parts, image_placeholder, &emitted);
     try w.writeByte(']');
 }
 
@@ -1604,19 +1667,16 @@ fn writeGoogleSystemInstruction(w: *std.Io.Writer, messages: []const ChatMessage
     if (emitted != 0) try w.writeAll("]}");
 }
 
-fn writeGoogleContent(w: *std.Io.Writer, message: ChatMessage) !void {
+fn writeGoogleContent(w: *std.Io.Writer, message: ChatMessage, supports_images: bool) !void {
     try w.writeAll("{\"role\":");
     try writeJsonString(w, if (message.role == .assistant) "model" else "user");
     try w.writeAll(",\"parts\":[");
     var emitted: usize = 0;
+    const image_placeholder = imagePlaceholderForMessage(message, supports_images);
     if (message.role == .assistant and message.content.len > 0) {
         try writeGoogleTextPart(w, message.content, &emitted);
     } else if (message.content_parts.len > 0) {
-        for (message.content_parts) |part| {
-            if (emitted != 0) try w.writeByte(',');
-            try writeGoogleContentPart(w, part);
-            emitted += 1;
-        }
+        try writeGoogleContentPartsInto(w, message.content_parts, image_placeholder, &emitted);
     } else if (message.content.len > 0) {
         try writeGoogleTextPart(w, message.content, &emitted);
     }
@@ -1630,21 +1690,31 @@ fn writeGoogleContent(w: *std.Io.Writer, message: ChatMessage) !void {
     try w.writeAll("]}");
 }
 
-fn writeGoogleToolResultContent(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize) !void {
+fn writeGoogleToolResultContent(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize, supports_images: bool) !void {
     try w.writeAll("{\"role\":\"user\",\"parts\":[");
     var emitted: usize = 0;
     while (index.* < messages.len and messages[index.*].role == .tool) : (index.* += 1) {
         const message = messages[index.*];
         const tool_call_id = message.tool_call_id orelse return error.ProviderResponseInvalid;
         const tool_name = findToolNameForToolResult(messages, index.*, tool_call_id) orelse return error.ProviderResponseInvalid;
+        const has_images = hasImageContentParts(message.content_parts);
         if (emitted != 0) try w.writeByte(',');
         try w.writeAll("{\"functionResponse\":{\"name\":");
         try writeJsonString(w, tool_name);
         try w.writeAll(",\"response\":{\"output\":");
-        try writeJsonString(w, message.content);
+        if (!supports_images and has_images) {
+            try writeJsonStringFromContentPartsWithImagePlaceholder(
+                w,
+                message.content_parts,
+                message.content,
+                non_vision_tool_image_placeholder,
+            );
+        } else {
+            try writeJsonString(w, message.content);
+        }
         try w.writeAll("}}}");
         emitted += 1;
-        if (hasImageContentParts(message.content_parts)) {
+        if (has_images and supports_images) {
             if (emitted != 0) try w.writeByte(',');
             try w.writeAll("{\"text\":\"Tool result image:\"}");
             emitted += 1;
@@ -1653,7 +1723,7 @@ fn writeGoogleToolResultContent(w: *std.Io.Writer, messages: []const ChatMessage
                     .text => {},
                     .image => {
                         if (emitted != 0) try w.writeByte(',');
-                        try writeGoogleContentPart(w, part);
+                        try writeGoogleContentPart(w, part, null);
                         emitted += 1;
                     },
                 }
@@ -1678,26 +1748,65 @@ fn findToolNameForToolResult(messages: []const ChatMessage, up_to_index: usize, 
 
 fn writeGoogleTextPart(w: *std.Io.Writer, text: []const u8, emitted: *usize) !void {
     if (emitted.* != 0) try w.writeByte(',');
-    try w.writeAll("{\"text\":");
-    try writeJsonString(w, text);
-    try w.writeByte('}');
+    try writeGoogleTextPartValue(w, text);
     emitted.* += 1;
 }
 
-fn writeGoogleContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
+fn writeGoogleTextPartValue(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeAll("{\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+}
+
+fn writeGoogleContentPart(w: *std.Io.Writer, part: ChatContentPart, image_placeholder: ?[]const u8) !void {
     switch (part) {
         .text => |text| {
-            try w.writeAll("{\"text\":");
-            try writeJsonString(w, text);
-            try w.writeByte('}');
+            try writeGoogleTextPartValue(w, text);
         },
         .image => |image| {
+            if (image_placeholder) |placeholder| {
+                try writeGoogleTextPartValue(w, placeholder);
+                return;
+            }
             try w.writeAll("{\"inlineData\":{\"mimeType\":");
             try writeJsonString(w, image.mime_type);
             try w.writeAll(",\"data\":");
             try writeJsonString(w, image.data);
             try w.writeAll("}}");
         },
+    }
+}
+
+fn writeGoogleContentPartsInto(
+    w: *std.Io.Writer,
+    parts: []const ChatContentPart,
+    image_placeholder: ?[]const u8,
+    emitted: *usize,
+) !void {
+    var previous_was_placeholder = false;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                if (emitted.* != 0) try w.writeByte(',');
+                try writeGoogleTextPartValue(w, text);
+                emitted.* += 1;
+                previous_was_placeholder = if (image_placeholder) |placeholder| std.mem.eql(u8, text, placeholder) else false;
+            },
+            .image => {
+                if (image_placeholder) |placeholder| {
+                    if (previous_was_placeholder) continue;
+                    if (emitted.* != 0) try w.writeByte(',');
+                    try writeGoogleTextPartValue(w, placeholder);
+                    emitted.* += 1;
+                    previous_was_placeholder = true;
+                } else {
+                    if (emitted.* != 0) try w.writeByte(',');
+                    try writeGoogleContentPart(w, part, null);
+                    emitted.* += 1;
+                    previous_was_placeholder = false;
+                }
+            },
+        }
     }
 }
 
@@ -1728,7 +1837,13 @@ fn writeGoogleToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void 
     try w.writeByte('}');
 }
 
-fn writeMistralMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: usize, message: ChatMessage) !void {
+fn writeMistralMessage(
+    w: *std.Io.Writer,
+    messages: []const ChatMessage,
+    index: usize,
+    message: ChatMessage,
+    supports_images: bool,
+) !void {
     try w.writeAll("{\"role\":");
     try writeJsonString(w, message.role.label());
     if (message.role == .assistant and message.tool_calls.len > 0) {
@@ -1755,7 +1870,7 @@ fn writeMistralMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: 
         }
         try w.writeAll(",\"content\":");
         if (message.content_parts.len > 0) {
-            try writeMistralContentParts(w, message.content_parts);
+            try writeMistralContentParts(w, message.content_parts, imagePlaceholderForMessage(message, supports_images));
         } else {
             try w.writeAll("[{\"type\":\"text\",\"text\":");
             try writeJsonString(w, if (message.content.len > 0) message.content else "(no tool output)");
@@ -1764,7 +1879,7 @@ fn writeMistralMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: 
     } else {
         try w.writeAll(",\"content\":");
         if (message.content_parts.len > 0) {
-            try writeMistralContentParts(w, message.content_parts);
+            try writeMistralContentParts(w, message.content_parts, imagePlaceholderForMessage(message, supports_images));
         } else {
             try writeJsonString(w, message.content);
         }
@@ -1772,22 +1887,41 @@ fn writeMistralMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: 
     try w.writeByte('}');
 }
 
-fn writeMistralContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
+fn writeMistralTextPart(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeAll("{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+}
+
+fn writeMistralContentParts(w: *std.Io.Writer, parts: []const ChatContentPart, image_placeholder: ?[]const u8) !void {
     try w.writeByte('[');
-    for (parts, 0..) |part, index| {
-        if (index != 0) try w.writeByte(',');
+    var emitted: usize = 0;
+    var previous_was_placeholder = false;
+    for (parts) |part| {
         switch (part) {
             .text => |text| {
-                try w.writeAll("{\"type\":\"text\",\"text\":");
-                try writeJsonString(w, text);
-                try w.writeByte('}');
+                if (emitted != 0) try w.writeByte(',');
+                try writeMistralTextPart(w, text);
+                emitted += 1;
+                previous_was_placeholder = if (image_placeholder) |placeholder| std.mem.eql(u8, text, placeholder) else false;
             },
             .image => |image| {
+                if (image_placeholder) |placeholder| {
+                    if (previous_was_placeholder) continue;
+                    if (emitted != 0) try w.writeByte(',');
+                    try writeMistralTextPart(w, placeholder);
+                    emitted += 1;
+                    previous_was_placeholder = true;
+                    continue;
+                }
+                if (emitted != 0) try w.writeByte(',');
                 try w.writeAll("{\"type\":\"image_url\",\"image_url\":\"data:");
                 try writeJsonStringFragment(w, image.mime_type);
                 try w.writeAll(";base64,");
                 try writeJsonStringFragment(w, image.data);
                 try w.writeAll("\"}");
+                emitted += 1;
+                previous_was_placeholder = false;
             },
         }
     }
@@ -1827,19 +1961,16 @@ fn writeBedrockSystem(w: *std.Io.Writer, messages: []const ChatMessage) !void {
     if (emitted != 0) try w.writeByte(']');
 }
 
-fn writeBedrockMessage(w: *std.Io.Writer, message: ChatMessage) !void {
+fn writeBedrockMessage(w: *std.Io.Writer, message: ChatMessage, supports_images: bool) !void {
     try w.writeAll("{\"role\":");
     try writeJsonString(w, if (message.role == .assistant) "assistant" else "user");
     try w.writeAll(",\"content\":[");
     var emitted: usize = 0;
+    const image_placeholder = imagePlaceholderForMessage(message, supports_images);
     if (message.role == .assistant and message.content.len > 0) {
         try writeBedrockTextBlock(w, message.content, &emitted);
     } else if (message.content_parts.len > 0) {
-        for (message.content_parts) |part| {
-            if (emitted != 0) try w.writeByte(',');
-            try writeBedrockContentPart(w, part);
-            emitted += 1;
-        }
+        try writeBedrockContentPartsInto(w, message.content_parts, image_placeholder, &emitted);
     } else if (message.content.len > 0) {
         try writeBedrockTextBlock(w, message.content, &emitted);
     }
@@ -1853,17 +1984,18 @@ fn writeBedrockMessage(w: *std.Io.Writer, message: ChatMessage) !void {
     try w.writeAll("]}");
 }
 
-fn writeBedrockToolResultMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize) !void {
+fn writeBedrockToolResultMessage(w: *std.Io.Writer, messages: []const ChatMessage, index: *usize, supports_images: bool) !void {
     try w.writeAll("{\"role\":\"user\",\"content\":[");
     var emitted: usize = 0;
     while (index.* < messages.len and messages[index.*].role == .tool) : (index.* += 1) {
         if (emitted != 0) try w.writeByte(',');
         const message = messages[index.*];
+        const image_placeholder = imagePlaceholderForMessage(message, supports_images);
         try w.writeAll("{\"toolResult\":{\"toolUseId\":");
         try writeJsonString(w, message.tool_call_id orelse "");
         try w.writeAll(",\"content\":");
         if (message.content_parts.len > 0) {
-            try writeBedrockContentParts(w, message.content_parts);
+            try writeBedrockContentParts(w, message.content_parts, image_placeholder);
         } else {
             try w.writeAll("[{\"text\":");
             try writeJsonString(w, if (message.content.len > 0) message.content else "(no tool output)");
@@ -1883,14 +2015,22 @@ fn writeBedrockTextBlock(w: *std.Io.Writer, text: []const u8, emitted: *usize) !
     emitted.* += 1;
 }
 
-fn writeBedrockContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
+fn writeBedrockTextPart(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeAll("{\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+}
+
+fn writeBedrockContentPart(w: *std.Io.Writer, part: ChatContentPart, image_placeholder: ?[]const u8) !void {
     switch (part) {
         .text => |text| {
-            try w.writeAll("{\"text\":");
-            try writeJsonString(w, text);
-            try w.writeByte('}');
+            try writeBedrockTextPart(w, text);
         },
         .image => |image| {
+            if (image_placeholder) |placeholder| {
+                try writeBedrockTextPart(w, placeholder);
+                return;
+            }
             try w.writeAll("{\"image\":{\"format\":");
             try writeJsonString(w, bedrockImageFormatFromMime(image.mime_type));
             try w.writeAll(",\"source\":{\"bytes\":");
@@ -1900,12 +2040,43 @@ fn writeBedrockContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
     }
 }
 
-fn writeBedrockContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
-    try w.writeByte('[');
-    for (parts, 0..) |part, index| {
-        if (index != 0) try w.writeByte(',');
-        try writeBedrockContentPart(w, part);
+fn writeBedrockContentPartsInto(
+    w: *std.Io.Writer,
+    parts: []const ChatContentPart,
+    image_placeholder: ?[]const u8,
+    emitted: *usize,
+) !void {
+    var previous_was_placeholder = false;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                if (emitted.* != 0) try w.writeByte(',');
+                try writeBedrockTextPart(w, text);
+                emitted.* += 1;
+                previous_was_placeholder = if (image_placeholder) |placeholder| std.mem.eql(u8, text, placeholder) else false;
+            },
+            .image => {
+                if (image_placeholder) |placeholder| {
+                    if (previous_was_placeholder) continue;
+                    if (emitted.* != 0) try w.writeByte(',');
+                    try writeBedrockTextPart(w, placeholder);
+                    emitted.* += 1;
+                    previous_was_placeholder = true;
+                } else {
+                    if (emitted.* != 0) try w.writeByte(',');
+                    try writeBedrockContentPart(w, part, null);
+                    emitted.* += 1;
+                    previous_was_placeholder = false;
+                }
+            },
+        }
     }
+}
+
+fn writeBedrockContentParts(w: *std.Io.Writer, parts: []const ChatContentPart, image_placeholder: ?[]const u8) !void {
+    try w.writeByte('[');
+    var emitted: usize = 0;
+    try writeBedrockContentPartsInto(w, parts, image_placeholder, &emitted);
     try w.writeByte(']');
 }
 
@@ -3071,7 +3242,7 @@ fn streamToolCallIndex(value: std.json.Value) !usize {
     };
 }
 
-fn writeMessage(w: *std.Io.Writer, message: ChatMessage) !void {
+fn writeMessage(w: *std.Io.Writer, message: ChatMessage, supports_images: bool) !void {
     try w.writeAll("{\"role\":");
     try writeJsonString(w, message.role.label());
     if (message.role == .assistant and message.tool_calls.len > 0) {
@@ -3096,7 +3267,7 @@ fn writeMessage(w: *std.Io.Writer, message: ChatMessage) !void {
         }
         try w.writeAll(",\"content\":");
         if (message.content_parts.len > 0) {
-            try writeContentParts(w, message.content_parts);
+            try writeContentParts(w, message.content_parts, imagePlaceholderForMessage(message, supports_images));
         } else {
             try writeJsonString(w, message.content);
         }
@@ -3104,14 +3275,21 @@ fn writeMessage(w: *std.Io.Writer, message: ChatMessage) !void {
     try w.writeByte('}');
 }
 
-fn writeOpenAIToolTextMessage(w: *std.Io.Writer, message: ChatMessage) !void {
+fn writeOpenAIToolTextMessage(w: *std.Io.Writer, message: ChatMessage, supports_images: bool) !void {
     try w.writeAll("{\"role\":\"tool\"");
     if (message.tool_call_id) |tool_call_id| {
         try w.writeAll(",\"tool_call_id\":");
         try writeJsonString(w, tool_call_id);
     }
     try w.writeAll(",\"content\":");
-    if (message.content.len > 0) {
+    if (!supports_images and hasImageContentParts(message.content_parts)) {
+        try writeJsonStringFromContentPartsWithImagePlaceholder(
+            w,
+            message.content_parts,
+            message.content,
+            non_vision_tool_image_placeholder,
+        );
+    } else if (message.content.len > 0) {
         try writeJsonString(w, message.content);
     } else if (hasImageContentParts(message.content_parts)) {
         try writeJsonString(w, "(see attached image)");
@@ -3129,7 +3307,7 @@ fn writeOpenAIToolResultImagesMessage(w: *std.Io.Writer, messages: []const ChatM
                 .text => {},
                 .image => {
                     try w.writeByte(',');
-                    try writeContentPart(w, part);
+                    try writeContentPart(w, part, null);
                 },
             }
         }
@@ -3137,23 +3315,53 @@ fn writeOpenAIToolResultImagesMessage(w: *std.Io.Writer, messages: []const ChatM
     try w.writeAll("]}");
 }
 
-fn writeContentParts(w: *std.Io.Writer, parts: []const ChatContentPart) !void {
+fn writeTextContentPart(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeAll("{\"type\":\"text\",\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+}
+
+fn writeContentParts(w: *std.Io.Writer, parts: []const ChatContentPart, image_placeholder: ?[]const u8) !void {
     try w.writeByte('[');
-    for (parts, 0..) |part, index| {
-        if (index != 0) try w.writeByte(',');
-        try writeContentPart(w, part);
+    var emitted: usize = 0;
+    var previous_was_placeholder = false;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                if (emitted != 0) try w.writeByte(',');
+                try writeTextContentPart(w, text);
+                emitted += 1;
+                previous_was_placeholder = if (image_placeholder) |placeholder| std.mem.eql(u8, text, placeholder) else false;
+            },
+            .image => {
+                if (image_placeholder) |placeholder| {
+                    if (previous_was_placeholder) continue;
+                    if (emitted != 0) try w.writeByte(',');
+                    try writeTextContentPart(w, placeholder);
+                    emitted += 1;
+                    previous_was_placeholder = true;
+                } else {
+                    if (emitted != 0) try w.writeByte(',');
+                    try writeContentPart(w, part, null);
+                    emitted += 1;
+                    previous_was_placeholder = false;
+                }
+            },
+        }
     }
     try w.writeByte(']');
 }
 
-fn writeContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
+fn writeContentPart(w: *std.Io.Writer, part: ChatContentPart, image_placeholder: ?[]const u8) !void {
     switch (part) {
         .text => |text| {
-            try w.writeAll("{\"type\":\"text\",\"text\":");
-            try writeJsonString(w, text);
-            try w.writeByte('}');
+            try writeTextContentPart(w, text);
         },
         .image => |image| {
+            if (image_placeholder) |placeholder| {
+                try writeTextContentPart(w, placeholder);
+                return;
+            }
             try w.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
             try writeJsonStringFragment(w, image.mime_type);
             try w.writeAll(";base64,");
@@ -3161,6 +3369,53 @@ fn writeContentPart(w: *std.Io.Writer, part: ChatContentPart) !void {
             try w.writeAll("\"}}");
         },
     }
+}
+
+fn writeJsonStringFromContentPartsWithImagePlaceholder(
+    w: *std.Io.Writer,
+    parts: []const ChatContentPart,
+    fallback_text: []const u8,
+    image_placeholder: []const u8,
+) !void {
+    try w.writeByte('"');
+    var emitted = false;
+    var previous_was_placeholder = false;
+    if (!hasTextContentParts(parts) and fallback_text.len > 0) {
+        try writeJsonStringFragment(w, fallback_text);
+        emitted = true;
+        previous_was_placeholder = std.mem.eql(u8, fallback_text, image_placeholder);
+    }
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| {
+                if (text.len > 0) {
+                    if (emitted) try w.writeAll("\\n");
+                    try writeJsonStringFragment(w, text);
+                    emitted = true;
+                }
+                previous_was_placeholder = std.mem.eql(u8, text, image_placeholder);
+            },
+            .image => {
+                if (previous_was_placeholder) continue;
+                if (emitted) try w.writeAll("\\n");
+                try writeJsonStringFragment(w, image_placeholder);
+                emitted = true;
+                previous_was_placeholder = true;
+            },
+        }
+    }
+    if (!emitted) try writeJsonStringFragment(w, image_placeholder);
+    try w.writeByte('"');
+}
+
+fn hasTextContentParts(parts: []const ChatContentPart) bool {
+    for (parts) |part| {
+        switch (part) {
+            .text => return true,
+            .image => {},
+        }
+    }
+    return false;
 }
 
 fn hasImageContentParts(parts: []const ChatContentPart) bool {
@@ -3453,6 +3708,40 @@ test "serializes OpenAI-compatible tool result images as a follow-up user messag
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"ok\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Attached image(s) from tool result:\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGVsbG8=\"}}]") != null);
+}
+
+test "downgrades OpenAI-compatible images for resolved non-vision models" {
+    const parts = [_]ChatContentPart{
+        .{ .text = "inspect this" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+        .{ .image = .{ .mime_type = "image/png", .data = "c2Vjb25k" } },
+    };
+    const tool_result_parts = [_]ChatContentPart{
+        .{ .text = "ok" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const tool_calls = [_]ChatToolCall{
+        .{ .id = @constCast("call_1"), .name = @constCast("read"), .arguments_json = @constCast("{\"path\":\"image.png\"}") },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content_parts = parts[0..] },
+        .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
+        .{ .role = .tool, .content = "ok", .content_parts = tool_result_parts[0..], .tool_call_id = "call_1" },
+    };
+    const payload = try buildPayload(std.testing.allocator, .{
+        .provider = "openai",
+        .model = "gpt-4",
+        .api_key = "unused",
+        .messages = messages[0..],
+    });
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"content\":[{\"type\":\"text\",\"text\":\"inspect this\"},{\"type\":\"text\",\"text\":\"(image omitted: model does not support images)\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"ok\\n(tool image omitted: model does not support images)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "Attached image(s) from tool result") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "image_url") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "aGVsbG8=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "c2Vjb25k") == null);
 }
 
 test "serializes Anthropic messages payload with images tools and tool results" {

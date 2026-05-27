@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_client = @import("ai_client.zig");
+const models = @import("models.zig");
 const tools = @import("tools.zig");
 
 pub const ToolStartCallback = *const fn (ctx: *anyopaque, call: ai_client.ChatToolCall) anyerror!void;
@@ -219,6 +220,7 @@ const find_parameters_json =
 const ls_parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"number","description":"Maximum number of entries to return"}},"additionalProperties":false}
 ;
+const non_vision_image_note = "[Current model does not support images. The image will be omitted from this request.]";
 
 const all_tool_definitions = [_]ai_client.ChatToolDefinition{
     .{
@@ -343,11 +345,14 @@ pub fn runPrompt(
         try checkCancellation(options);
         const borrowed = try borrowMessages(allocator, messages.items);
         defer allocator.free(borrowed);
+        const request_provider = active_provider orelse options.provider;
+        const request_model = active_model orelse options.model;
+        const request_api_key = active_api_key orelse options.api_key;
 
         const request: ai_client.ChatTurnRequest = .{
-            .provider = active_provider orelse options.provider,
-            .model = active_model orelse options.model,
-            .api_key = active_api_key orelse options.api_key,
+            .provider = request_provider,
+            .model = request_model,
+            .api_key = request_api_key,
             .messages = borrowed,
             .tools = tool_definitions_list.items,
             .cancellation_context = options.cancellation_context,
@@ -383,12 +388,16 @@ pub fn runPrompt(
             .first_tool_result_index = batch_results_start,
             .tool_results_count = tool_calls.len,
         });
+        var tool_options = options;
+        tool_options.provider = request_provider;
+        tool_options.model = request_model;
+        tool_options.api_key = request_api_key;
         for (tool_calls) |call| {
             try checkCancellation(options);
             if (options.on_tool_start) |callback| {
                 if (options.tool_event_context) |context| try callback(context, call);
             }
-            var tool_execution = try executeToolCallWithHooks(io, allocator, call, options);
+            var tool_execution = try executeToolCallWithHooks(io, allocator, call, tool_options);
             errdefer tool_execution.deinit(allocator);
             try checkCancellation(options);
             const tool_call_id = try allocator.dupe(u8, call.id);
@@ -841,7 +850,7 @@ fn executeToolCallWithUpdates(
             }
         }
     }
-    if (std.mem.eql(u8, call.name, "read")) return executeReadTool(io, allocator, call.arguments_json);
+    if (std.mem.eql(u8, call.name, "read")) return executeReadTool(io, allocator, call.arguments_json, readToolModelSupportsImages(options));
     if (std.mem.eql(u8, call.name, "bash")) return executeBashTool(io, allocator, call, options);
     if (std.mem.eql(u8, call.name, "edit")) return executeEditTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "write")) return executeWriteTool(io, allocator, call.arguments_json);
@@ -858,12 +867,18 @@ fn customToolEnabled(custom_tools: []const ai_client.ChatToolDefinition, name: [
     return false;
 }
 
-fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
+fn readToolModelSupportsImages(options: ?RunOptions) bool {
+    const run_options = options orelse return true;
+    const model = models.find(run_options.provider, run_options.model) orelse return true;
+    return model.input_image;
+}
+
+fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8, model_supports_images: bool) !ToolExecutionResult {
     var parsed = parseArguments(allocator, "read", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "read", err));
     defer parsed.deinit();
     const path = requiredString(parsed.value, "path") orelse return toolError(try allocator.dupe(u8, "read tool arguments are missing path."));
     if (imageMimeTypeForPath(path)) |mime_type| {
-        return executeReadImageTool(io, allocator, path, mime_type) catch |err| {
+        return executeReadImageTool(io, allocator, path, mime_type, model_supports_images) catch |err| {
             return toolError(try std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)}));
         };
     }
@@ -875,7 +890,7 @@ fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []c
     return toolOk(content);
 }
 
-fn executeReadImageTool(io: std.Io, allocator: std.mem.Allocator, path: []const u8, mime_type: []const u8) !ToolExecutionResult {
+fn executeReadImageTool(io: std.Io, allocator: std.mem.Allocator, path: []const u8, mime_type: []const u8, model_supports_images: bool) !ToolExecutionResult {
     const bytes = try tools.readFile(io, allocator, path, 16 * 1024 * 1024);
     defer allocator.free(bytes);
 
@@ -887,7 +902,10 @@ fn executeReadImageTool(io: std.Io, allocator: std.mem.Allocator, path: []const 
     const mime_owned = try allocator.dupe(u8, mime_type);
     errdefer allocator.free(mime_owned);
 
-    const content = try std.fmt.allocPrint(allocator, "Read image file [{s}]", .{mime_type});
+    const content = if (model_supports_images)
+        try std.fmt.allocPrint(allocator, "Read image file [{s}]", .{mime_type})
+    else
+        try std.fmt.allocPrint(allocator, "Read image file [{s}]\n{s}", .{ mime_type, non_vision_image_note });
     errdefer allocator.free(content);
 
     const content_note = try allocator.dupe(u8, content);
@@ -1146,6 +1164,83 @@ test "failed tool calls are marked as errors" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.startsWith(u8, result.content, "read tool failed:"));
+}
+
+test "read image appends non-vision note and keeps image parts for provider downgrade" {
+    const path = "zig-out/pi-zig-read-nonvision-test.png";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    try tools.writeFile(std.testing.io, path, "fake image bytes");
+
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_read_nonvision_image"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path}),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "amazon-bedrock",
+        .model = "amazon.nova-micro-v1:0",
+        .api_key = "",
+        .prompt = "",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings(
+        "Read image file [image/png]\n" ++ non_vision_image_note,
+        result.content,
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.content_parts.len);
+    switch (result.content_parts[0]) {
+        .text => |text| try std.testing.expectEqualStrings("Read image file [image/png]\n" ++ non_vision_image_note, text),
+        .image => return error.ExpectedTextContentPart,
+    }
+    switch (result.content_parts[1]) {
+        .image => |image| {
+            try std.testing.expectEqualStrings("image/png", image.mime_type);
+            try std.testing.expectEqualStrings("ZmFrZSBpbWFnZSBieXRlcw==", image.data);
+        },
+        .text => return error.ExpectedImageContentPart,
+    }
+}
+
+test "read image keeps image parts for vision model" {
+    const path = "zig-out/pi-zig-read-vision-test.png";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    try tools.writeFile(std.testing.io, path, "fake image bytes");
+
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_read_vision_image"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path}),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "amazon-bedrock",
+        .model = "amazon.nova-pro-v1:0",
+        .api_key = "",
+        .prompt = "",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("Read image file [image/png]", result.content);
+    try std.testing.expectEqual(@as(usize, 2), result.content_parts.len);
+    switch (result.content_parts[0]) {
+        .text => |text| try std.testing.expectEqualStrings("Read image file [image/png]", text),
+        .image => return error.ExpectedTextContentPart,
+    }
+    switch (result.content_parts[1]) {
+        .image => |image| {
+            try std.testing.expectEqualStrings("image/png", image.mime_type);
+            try std.testing.expectEqualStrings("ZmFrZSBpbWFnZSBieXRlcw==", image.data);
+        },
+        .text => return error.ExpectedImageContentPart,
+    }
 }
 
 test "invalid tool argument JSON returns a tool error result" {

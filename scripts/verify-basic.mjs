@@ -471,7 +471,7 @@ const server = http.createServer((req, res) => {
       writeStreamEvents([{ choices: [{ delta: { content: 'image json observed' } }] }]);
       return;
     }
-    if (user.includes('image input agent')) {
+    if (user.includes('image input agent') && !user.includes('non vision image input agent')) {
       const content = lastUserMessage?.content;
       const hasText = Array.isArray(content) && content.some((part) => part?.type === 'text' && part.text?.includes('image input agent'));
       const hasImage = Array.isArray(content) && content.some((part) => part?.type === 'image_url' && part.image_url?.url === 'data:image/png;base64,aW1hZ2Utc21va2U=');
@@ -482,6 +482,59 @@ const server = http.createServer((req, res) => {
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: 'image agent observed' } }] }));
+      return;
+    }
+    if (user.includes('non vision image input agent')) {
+      const content = lastUserMessage?.content;
+      const hasText = Array.isArray(content) && content.some((part) => part?.type === 'text' && part.text?.includes('non vision image input agent'));
+      const hasPlaceholder = Array.isArray(content) && content.some((part) => part?.type === 'text' && part.text === '(image omitted: model does not support images)');
+      const hasImage = Array.isArray(content) && content.some((part) => part?.type === 'image_url');
+      if (!hasText || !hasPlaceholder || hasImage || body.model !== 'gpt-4' || (body.tools?.length ?? 0) === 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'non-vision agent image input was not downgraded', content, model: body.model, tools: body.tools }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'non vision image agent observed' } }] }));
+      return;
+    }
+    if (userMessages.some((message) => message.includes('non vision read image result'))) {
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_nonvision_read_image_1',
+                type: 'function',
+                function: {
+                  name: 'read',
+                  arguments: JSON.stringify({ path: 'zig-out/pi-zig-provider-image-fixture/input.png' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const readToolMessage = toolMessages.find((message) => message.tool_call_id === 'call_nonvision_read_image_1');
+      const readToolText = String(readToolMessage?.content ?? '');
+      const serializedMessages = JSON.stringify(body.messages);
+      if (
+        body.model !== 'gpt-4' ||
+        !readToolText.includes('Read image file [image/png]') ||
+        !readToolText.includes('[Current model does not support images. The image will be omitted from this request.]') ||
+        !readToolText.includes('(tool image omitted: model does not support images)') ||
+        serializedMessages.includes('data:image/png;base64') ||
+        serializedMessages.includes('Attached image(s) from tool result')
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'non-vision read image result was not downgraded', messages: body.messages, model: body.model }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'non vision read image result complete' } }] }));
       return;
     }
     if (user.includes('image input rpc')) {
@@ -3801,6 +3854,22 @@ export default function(pi: any): void {
   );
   if (!providerAgentImage.includes('image agent observed')) {
     throw new Error('provider-backed agent loop did not send image content parts');
+  }
+  const providerNonVisionAgentImage = run(
+    ['--no-session', '--provider', 'openai', '--model', 'gpt-4', '@' + providerImagePath, '-p', 'non vision image input agent'],
+    undefined,
+    { env: providerEnv }
+  );
+  if (!providerNonVisionAgentImage.includes('non vision image agent observed')) {
+    throw new Error('provider-backed agent loop did not downgrade direct image content parts for non-vision models');
+  }
+  const providerNonVisionReadImage = run(
+    ['--no-session', '--provider', 'openai', '--model', 'gpt-4', '-p', 'non vision read image result'],
+    undefined,
+    { env: providerEnv }
+  );
+  if (!providerNonVisionReadImage.includes('non vision read image result complete')) {
+    throw new Error('provider-backed agent loop did not downgrade read-tool image result parts for non-vision models');
   }
 
   const providerJsonToolLines = run(
