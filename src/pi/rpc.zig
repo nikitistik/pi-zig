@@ -1919,7 +1919,7 @@ const Runtime = struct {
             if (started_prompt) return error.MultipleCommandPromptActionsUnsupported;
             switch (action) {
                 .send_user_message => |user_message| {
-                    try self.startPromptAsync(io, allocator, output, id, user_message.content, &.{});
+                    try self.startPromptAsync(io, allocator, output, id, user_message.content, user_message.image_parts);
                     started_prompt = true;
                 },
                 .send_message => |custom_message| {
@@ -1979,7 +1979,7 @@ const Runtime = struct {
                         try writeError(w, id, command, "Queued extension sendUserMessage must use matching deliverAs");
                         return true;
                     }
-                    queue.enqueue(allocator, user_message.content, &.{}) catch |err| {
+                    queue.enqueue(allocator, user_message.content, user_message.image_parts) catch |err| {
                         try writeError(w, id, command, @errorName(err));
                         return true;
                     };
@@ -2031,14 +2031,14 @@ const Runtime = struct {
                     };
                     switch (delivery) {
                         .steer => {
-                            self.steering_queue.enqueue(allocator, user_message.content, &.{}) catch |err| {
+                            self.steering_queue.enqueue(allocator, user_message.content, user_message.image_parts) catch |err| {
                                 try writeError(w, id, command, @errorName(err));
                                 return true;
                             };
                             queued = true;
                         },
                         .follow_up => {
-                            self.follow_up_queue.enqueue(allocator, user_message.content, &.{}) catch |err| {
+                            self.follow_up_queue.enqueue(allocator, user_message.content, user_message.image_parts) catch |err| {
                                 try writeError(w, id, command, @errorName(err));
                                 return true;
                             };

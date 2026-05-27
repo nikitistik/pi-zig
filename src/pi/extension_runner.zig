@@ -125,10 +125,12 @@ pub const Runner = struct {
 
     pub const CommandUserMessageAction = struct {
         content: []u8,
+        image_parts: []ai_client.ChatContentPart = &.{},
         deliver_as: ?CommandDelivery = null,
 
         pub fn deinit(self: CommandUserMessageAction, allocator: std.mem.Allocator) void {
             allocator.free(self.content);
+            freeContentParts(allocator, self.image_parts);
         }
     };
 
@@ -577,6 +579,34 @@ fn contentPartsToOwned(allocator: std.mem.Allocator, content: std.json.Value) ![
     return trimmed;
 }
 
+fn imageContentPartsToOwned(allocator: std.mem.Allocator, content: std.json.Value) ![]ai_client.ChatContentPart {
+    const parts = try contentPartsToOwned(allocator, content);
+    if (parts.len == 0) return &.{};
+
+    var image_count: usize = 0;
+    for (parts) |part| {
+        if (part == .image) image_count += 1;
+    }
+    if (image_count == 0) {
+        freeContentParts(allocator, parts);
+        return &.{};
+    }
+
+    const images = try allocator.alloc(ai_client.ChatContentPart, image_count);
+    var index: usize = 0;
+    for (parts) |part| {
+        switch (part) {
+            .text => |text| allocator.free(text),
+            .image => |image| {
+                images[index] = .{ .image = image };
+                index += 1;
+            },
+        }
+    }
+    allocator.free(parts);
+    return images;
+}
+
 fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![]Runner.CommandAction {
     if (value != .array) return error.ExtensionHookInvalidResponse;
     if (value.array.items.len == 0) return &.{};
@@ -593,9 +623,14 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
         if (kind != .string) return error.ExtensionHookInvalidResponse;
         if (std.mem.eql(u8, kind.string, "send_user_message")) {
             const content = item.object.get("content") orelse return error.ExtensionHookInvalidResponse;
+            var image_parts: []ai_client.ChatContentPart = &.{};
+            errdefer freeContentParts(allocator, image_parts);
             const owned_content = switch (content) {
                 .string => try allocator.dupe(u8, content.string),
-                .array => try textContentToOwnedString(allocator, content),
+                .array => blk: {
+                    image_parts = try imageContentPartsToOwned(allocator, content);
+                    break :blk try textContentToOwnedString(allocator, content);
+                },
                 else => return error.ExtensionHookInvalidResponse,
             };
             var deliver_as: ?Runner.CommandDelivery = null;
@@ -607,11 +642,13 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
             }
             actions.append(allocator, .{ .send_user_message = .{
                 .content = owned_content,
+                .image_parts = image_parts,
                 .deliver_as = deliver_as,
             } }) catch |err| {
                 allocator.free(owned_content);
                 return err;
             };
+            image_parts = &.{};
         } else if (std.mem.eql(u8, kind.string, "send_message")) {
             const message = item.object.get("message") orelse return error.ExtensionHookInvalidResponse;
             if (message != .object) return error.ExtensionHookInvalidResponse;
@@ -1301,6 +1338,15 @@ test "extension runner returns send user message command actions" {
         \\      await pi.sendUserMessage(args);
         \\    }
         \\  });
+        \\  pi.registerCommand("send-user-image", {
+        \\    description: "Send raw user text with an image",
+        \\    handler: async (args) => {
+        \\      await pi.sendUserMessage([
+        \\        { type: "text", text: args },
+        \\        { type: "image", data: "aW1hZ2Utc21va2U=", mimeType: "image/png" }
+        \\      ]);
+        \\    }
+        \\  });
         \\  pi.registerCommand("send-user-steer", {
         \\    description: "Queue a raw steering message",
         \\    handler: async (args) => {
@@ -1324,6 +1370,27 @@ test "extension runner returns send user message command actions" {
     switch (result.actions[0]) {
         .send_user_message => |message| {
             try std.testing.expectEqualStrings("/write-marker raw user", message.content);
+            try std.testing.expectEqual(@as(usize, 0), message.image_parts.len);
+            try std.testing.expect(message.deliver_as == null);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+
+    const image_result = try runner.runRegisteredCommand("send-user-image", "raw user image");
+    defer image_result.deinit(allocator);
+    try std.testing.expect(image_result.handled);
+    try std.testing.expectEqual(@as(usize, 1), image_result.actions.len);
+    switch (image_result.actions[0]) {
+        .send_user_message => |message| {
+            try std.testing.expectEqualStrings("raw user image", message.content);
+            try std.testing.expectEqual(@as(usize, 1), message.image_parts.len);
+            switch (message.image_parts[0]) {
+                .image => |image| {
+                    try std.testing.expectEqualStrings("aW1hZ2Utc21va2U=", image.data);
+                    try std.testing.expectEqualStrings("image/png", image.mime_type);
+                },
+                else => return error.UnexpectedCommandAction,
+            }
             try std.testing.expect(message.deliver_as == null);
         },
         else => return error.UnexpectedCommandAction,

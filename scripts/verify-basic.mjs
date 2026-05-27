@@ -672,6 +672,18 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'image rpc observed' } }] }));
       return;
     }
+    if (user.includes('rpc command image user')) {
+      const content = lastUserMessage?.content;
+      const hasText = Array.isArray(content) && content.some((part) => part?.type === 'text' && part.text?.includes('rpc command image user'));
+      if (!hasText || !hasSmokeImage(content) || (body.tools?.length ?? 0) === 0) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing extension command image content part', content, tools: body.tools }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc command image user observed' } }] }));
+      return;
+    }
     if (user.includes('rpc image history replay')) {
       const priorContent = userMessageIncluding('image input rpc')?.content;
       if (!hasSmokeImage(priorContent) || (body.tools?.length ?? 0) === 0) {
@@ -2666,6 +2678,15 @@ fs.writeFileSync(
     '      await pi.sendUserMessage(args);',
     '    }',
     '  });',
+    '  pi.registerCommand("send-user-image-message", {',
+    '    description: "Send raw text and an image as a user message",',
+    '    handler: async (args) => {',
+    '      await pi.sendUserMessage([',
+    '        { type: "text", text: args },',
+    '        { type: "image", data: "aW1hZ2Utc21va2U=", mimeType: "image/png" }',
+    '      ]);',
+    '    }',
+    '  });',
     '  pi.registerCommand("send-custom-message", {',
     '    description: "Send an extension custom message",',
     '    handler: async (args) => {',
@@ -3156,6 +3177,34 @@ if (
 ) {
   throw new Error('rpc extension command sendUserMessage action did not persist raw slash-looking user text');
 }
+const fixtureRpcCommandSendUserImageOutput = run(
+  [
+    '--mode',
+    'rpc',
+    '--session',
+    path.join(commandsFixtureRoot, 'rpc-command-send-user-image-message.jsonl'),
+    '--extension',
+    'extensions/command-exec.mjs'
+  ],
+  [
+    JSON.stringify({ id: 'rpc-command-send-user-image', type: 'prompt', message: '/send-user-image-message rpc command image user' }),
+    JSON.stringify({ id: 'rpc-command-send-user-image-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { cwd: commandsFixtureRoot, env: commandsFixtureEnv }
+);
+const fixtureRpcCommandSendUserImageResponses = fixtureRpcCommandSendUserImageOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcCommandSendUserImage = fixtureRpcCommandSendUserImageResponses.find((response) => response.id === 'rpc-command-send-user-image');
+const rpcCommandSendUserImageMessages = fixtureRpcCommandSendUserImageResponses.find((response) => response.id === 'rpc-command-send-user-image-messages');
+const rpcCommandSendUserImageMessage = rpcCommandSendUserImageMessages?.data?.messages?.find((message) => message.role === 'user' && message.content === 'rpc command image user');
+if (
+  !rpcCommandSendUserImage?.success ||
+  rpcCommandSendUserImageMessage?.images?.[0]?.type !== 'image' ||
+  rpcCommandSendUserImageMessage?.images?.[0]?.data !== 'aW1hZ2Utc21va2U=' ||
+  rpcCommandSendUserImageMessage?.images?.[0]?.mimeType !== 'image/png'
+) {
+  throw new Error('rpc extension command sendUserMessage image action did not persist user image content');
+}
 const fixtureRpcCommandCustomSession = path.join(commandsFixtureRoot, 'rpc-command-send-custom-message.jsonl');
 fs.rmSync(fixtureRpcCommandCustomSession, { force: true });
 const fixtureRpcCommandCustomOutput = run(
@@ -3417,6 +3466,35 @@ if (
   !topLevelSendUserEntries.some((entry) => entry.type === 'message' && entry.message?.role === 'assistant')
 ) {
   throw new Error('top-level extension command sendUserMessage smoke did not run a raw slash-looking prompt');
+}
+const topLevelSendUserImageSession = path.join(commandsFixtureRoot, 'top-level-command-send-user-image-message.jsonl');
+fs.rmSync(topLevelSendUserImageSession, { force: true });
+const topLevelSendUserImageOutput = run(
+  [
+    '--session',
+    topLevelSendUserImageSession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/send-user-image-message top image user'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelSendUserImageEntries = fs.existsSync(topLevelSendUserImageSession)
+  ? fs.readFileSync(topLevelSendUserImageSession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+const topLevelSendUserImageUser = topLevelSendUserImageEntries.find((entry) => entry.type === 'message' && entry.message?.role === 'user');
+if (
+  !topLevelSendUserImageOutput.includes('pi-zig print-mode foundation accepted') ||
+  !topLevelSendUserImageOutput.includes('Prompt:\ntop image user') ||
+  fs.existsSync(commandsFixtureCommandExecMarker) ||
+  topLevelSendUserImageEntries.some((entry) => entry.type === 'message' && entry.message?.content === '/send-user-image-message top image user') ||
+  !Array.isArray(topLevelSendUserImageUser?.message?.content) ||
+  !topLevelSendUserImageUser.message.content.some((part) => part?.type === 'text' && part.text === 'top image user') ||
+  !topLevelSendUserImageUser.message.content.some((part) => part?.type === 'image' && part.data === 'aW1hZ2Utc21va2U=' && part.mimeType === 'image/png')
+) {
+  throw new Error('top-level extension command sendUserMessage image smoke did not persist image content');
 }
 fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
 const topLevelJsonSendUserSession = path.join(commandsFixtureRoot, 'top-level-command-json-send-user-message.jsonl');
@@ -7113,6 +7191,31 @@ export default function(pi) {
     rpcProviderImageReplayUser?.images?.[0]?.mimeType !== 'image/png'
   ) {
     throw new Error('rpc get_messages smoke did not expose persisted user image content');
+  }
+
+  const rpcProviderCommandImageSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-command-image-smoke.jsonl');
+  fs.rmSync(rpcProviderCommandImageSessionFile, { force: true });
+  const rpcProviderCommandImageOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderCommandImageSessionFile, '--extension', 'extensions/command-exec.mjs'],
+    [
+      JSON.stringify({ id: 'rpc-provider-command-image-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-provider-command-image-prompt', type: 'prompt', message: '/send-user-image-message rpc command image user' }),
+      JSON.stringify({ id: 'rpc-provider-command-image-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { cwd: commandsFixtureRoot, env: { ...rpcProviderEnv, HOME: commandsFixtureHome } }
+  );
+  const rpcProviderCommandImageResponses = rpcProviderCommandImageOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderCommandImagePrompt = rpcProviderCommandImageResponses.find((response) => response.id === 'rpc-provider-command-image-prompt');
+  const rpcProviderCommandImageMessages = rpcProviderCommandImageResponses.find((response) => response.id === 'rpc-provider-command-image-messages');
+  const rpcProviderCommandImageUser = rpcProviderCommandImageMessages?.data?.messages?.find((message) => message.role === 'user' && message.content === 'rpc command image user');
+  if (
+    !rpcProviderCommandImagePrompt?.success ||
+    rpcProviderCommandImagePrompt?.data?.text !== 'rpc command image user observed' ||
+    rpcProviderCommandImageUser?.images?.[0]?.data !== 'aW1hZ2Utc21va2U=' ||
+    rpcProviderCommandImageUser?.images?.[0]?.mimeType !== 'image/png'
+  ) {
+    throw new Error('rpc provider extension command sendUserMessage image smoke did not forward image content to provider');
   }
 
   const rpcProviderQueuedImageSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-queued-image-smoke.jsonl');

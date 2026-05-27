@@ -203,15 +203,15 @@ fn runTextPrintFoundation(
         .handled => return,
         .prompt => |command_prompt| TopLevelPromptRequest{
             .content = command_prompt.content,
-            .image_parts = &.{},
+            .image_parts = command_prompt.image_parts,
             .persist_user_message = command_prompt.persist_user_message,
         },
     };
 
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
-        if (prompt_request.persist_user_message and prompt_request.content.len > 0) {
-            _ = try persistent.appendMessage(io, allocator, .user, prompt_request.content);
+        if (prompt_request.persist_user_message and (prompt_request.content.len > 0 or prompt_request.image_parts.len > 0)) {
+            _ = try persistent.appendMessageWithContentParts(io, allocator, .user, prompt_request.content, prompt_request.image_parts);
         }
     }
 
@@ -250,7 +250,7 @@ fn runJsonPrintFoundation(
         },
         .prompt => |command_prompt| TopLevelPromptRequest{
             .content = command_prompt.content,
-            .image_parts = &.{},
+            .image_parts = command_prompt.image_parts,
             .persist_user_message = command_prompt.persist_user_message,
         },
     };
@@ -261,8 +261,8 @@ fn runJsonPrintFoundation(
 
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
-        if (prompt_request.persist_user_message and prompt_request.content.len > 0) {
-            _ = try persistent.appendMessage(io, allocator, .user, prompt_request.content);
+        if (prompt_request.persist_user_message and (prompt_request.content.len > 0 or prompt_request.image_parts.len > 0)) {
+            _ = try persistent.appendMessageWithContentParts(io, allocator, .user, prompt_request.content, prompt_request.image_parts);
         }
     }
 
@@ -395,10 +395,12 @@ const TopLevelPromptRequest = struct {
 
 const TopLevelCommandPrompt = struct {
     content: []u8,
+    image_parts: []ai_client.ChatContentPart = &.{},
     persist_user_message: bool,
 
     fn deinit(self: TopLevelCommandPrompt, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
+        freeOwnedContentParts(allocator, self.image_parts);
     }
 };
 
@@ -456,10 +458,17 @@ fn runTopLevelRegisteredCommand(
         if (command_prompt != null) return error.MultipleCommandPromptActionsUnsupported;
         switch (action) {
             .send_user_message => |user_message| {
+                const owned_content = try allocator.dupe(u8, user_message.content);
+                var assigned_prompt = false;
+                errdefer if (!assigned_prompt) allocator.free(owned_content);
+                const owned_image_parts = try cloneContentParts(allocator, user_message.image_parts);
+                errdefer if (!assigned_prompt) freeOwnedContentParts(allocator, owned_image_parts);
                 command_prompt = .{
-                    .content = try allocator.dupe(u8, user_message.content),
+                    .content = owned_content,
+                    .image_parts = owned_image_parts,
                     .persist_user_message = true,
                 };
+                assigned_prompt = true;
             },
             .send_message => |custom_message| {
                 if (custom_message.deliver_as != null and custom_message.deliver_as.? == .next_turn) return error.UnsupportedCommandActionNextTurn;
@@ -508,7 +517,7 @@ fn runJsonProviderTextStream(
 ) !void {
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
-        if (persist_user_message and prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
+        if (persist_user_message and (prompt.len > 0 or image_parts.len > 0)) _ = try persistent.appendMessageWithContentParts(io, allocator, .user, prompt, image_parts);
     }
 
     const provider = parsed.provider.?;
@@ -1304,6 +1313,46 @@ fn buildPromptContentParts(
         index += 1;
     }
     return parts;
+}
+
+fn cloneContentParts(allocator: std.mem.Allocator, parts: []const ai_client.ChatContentPart) ![]ai_client.ChatContentPart {
+    if (parts.len == 0) return &.{};
+    const cloned = try allocator.alloc(ai_client.ChatContentPart, parts.len);
+    var len: usize = 0;
+    errdefer {
+        for (cloned[0..len]) |part| freeOwnedContentPart(allocator, part);
+        allocator.free(cloned);
+    }
+    for (parts) |part| {
+        cloned[len] = switch (part) {
+            .text => |text| .{ .text = try allocator.dupe(u8, text) },
+            .image => |image| blk: {
+                const owned_data = try allocator.dupe(u8, image.data);
+                errdefer allocator.free(owned_data);
+                const owned_mime_type = try allocator.dupe(u8, image.mime_type);
+                errdefer allocator.free(owned_mime_type);
+                break :blk .{ .image = .{ .data = owned_data, .mime_type = owned_mime_type } };
+            },
+        };
+        len += 1;
+    }
+    return cloned;
+}
+
+fn freeOwnedContentParts(allocator: std.mem.Allocator, parts: []const ai_client.ChatContentPart) void {
+    if (parts.len == 0) return;
+    for (parts) |part| freeOwnedContentPart(allocator, part);
+    allocator.free(parts);
+}
+
+fn freeOwnedContentPart(allocator: std.mem.Allocator, part: ai_client.ChatContentPart) void {
+    switch (part) {
+        .text => |text| allocator.free(text),
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+    }
 }
 
 fn imageMimeTypeForPath(path: []const u8) ?[]const u8 {
