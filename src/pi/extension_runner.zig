@@ -106,11 +106,13 @@ pub const Runner = struct {
     pub const CommandAction = union(enum) {
         send_user_message: []u8,
         send_message: CommandCustomMessageAction,
+        append_entry: CommandAppendEntryAction,
 
         pub fn deinit(self: CommandAction, allocator: std.mem.Allocator) void {
             switch (self) {
                 .send_user_message => |message| allocator.free(message),
                 .send_message => |message| message.deinit(allocator),
+                .append_entry => |entry| entry.deinit(allocator),
             }
         }
     };
@@ -125,6 +127,16 @@ pub const Runner = struct {
         pub fn deinit(self: CommandCustomMessageAction, allocator: std.mem.Allocator) void {
             allocator.free(self.custom_type);
             allocator.free(self.content);
+        }
+    };
+
+    pub const CommandAppendEntryAction = struct {
+        custom_type: []u8,
+        data_json: []u8,
+
+        pub fn deinit(self: CommandAppendEntryAction, allocator: std.mem.Allocator) void {
+            allocator.free(self.custom_type);
+            allocator.free(self.data_json);
         }
     };
 
@@ -622,6 +634,22 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
                 return err;
             };
             appended = true;
+        } else if (std.mem.eql(u8, kind.string, "append_entry")) {
+            const custom_type = item.object.get("customType") orelse return error.ExtensionHookInvalidResponse;
+            if (custom_type != .string or custom_type.string.len == 0) return error.ExtensionHookInvalidResponse;
+            const owned_custom_type = try allocator.dupe(u8, custom_type.string);
+            var appended = false;
+            errdefer if (!appended) allocator.free(owned_custom_type);
+            const owned_data_json = if (item.object.get("data")) |data|
+                try jsonValueToOwnedString(allocator, data)
+            else
+                try allocator.dupe(u8, "null");
+            errdefer if (!appended) allocator.free(owned_data_json);
+            try actions.append(allocator, .{ .append_entry = .{
+                .custom_type = owned_custom_type,
+                .data_json = owned_data_json,
+            } });
+            appended = true;
         } else {
             return error.ExtensionHookInvalidResponse;
         }
@@ -809,6 +837,9 @@ const hook_runner_script =
     \\  },
     \\  sendMessage(message, options = {}) {
     \\    actions.push({ type: "send_message", message, options });
+    \\  },
+    \\  appendEntry(customType, data) {
+    \\    actions.push({ type: "append_entry", customType, data });
     \\  },
     \\  events: { on() {}, emit() {} },
     \\};
@@ -1323,6 +1354,68 @@ test "extension runner returns send custom message command actions" {
             try std.testing.expect(message.display);
             try std.testing.expect(!message.trigger_turn);
             try std.testing.expect(message.next_turn);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+}
+
+test "extension runner returns append entry command actions" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-command-append-entry-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const extension_path = fixture_dir ++ "/command-append-entry.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerCommand("append-state", {
+        \\    description: "Append custom extension state",
+        \\    handler: async (args) => {
+        \\      await pi.appendEntry("state-entry", { args, nested: { ok: true }, items: [1, "two"] });
+        \\    }
+        \\  });
+        \\  pi.registerCommand("append-empty", {
+        \\    description: "Append custom extension state without data",
+        \\    handler: async () => {
+        \\      await pi.appendEntry("empty-entry");
+        \\    }
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const result = try runner.runRegisteredCommand("append-state", "persist me");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.handled);
+    try std.testing.expectEqual(@as(usize, 1), result.actions.len);
+    switch (result.actions[0]) {
+        .append_entry => |entry| {
+            try std.testing.expectEqualStrings("state-entry", entry.custom_type);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.data_json, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value == .object);
+            const args = parsed.value.object.get("args") orelse return error.MissingAppendEntryArgs;
+            try std.testing.expect(args == .string);
+            try std.testing.expectEqualStrings("persist me", args.string);
+            const nested = parsed.value.object.get("nested") orelse return error.MissingAppendEntryNested;
+            try std.testing.expect(nested == .object);
+            const ok = nested.object.get("ok") orelse return error.MissingAppendEntryOk;
+            try std.testing.expect(ok == .bool);
+            try std.testing.expect(ok.bool);
+            const items = parsed.value.object.get("items") orelse return error.MissingAppendEntryItems;
+            try std.testing.expect(items == .array);
+            try std.testing.expectEqual(@as(usize, 2), items.array.items.len);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+
+    const empty_result = try runner.runRegisteredCommand("append-empty", "");
+    defer empty_result.deinit(allocator);
+    try std.testing.expect(empty_result.handled);
+    try std.testing.expectEqual(@as(usize, 1), empty_result.actions.len);
+    switch (empty_result.actions[0]) {
+        .append_entry => |entry| {
+            try std.testing.expectEqualStrings("empty-entry", entry.custom_type);
+            try std.testing.expectEqualStrings("null", entry.data_json);
         },
         else => return error.UnexpectedCommandAction,
     }

@@ -335,6 +335,63 @@ pub const PersistentStore = struct {
         return self.leaf_id_buf[0..self.leaf_id_len];
     }
 
+    pub fn appendCustomEntry(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        custom_type: []const u8,
+        data: std.json.Value,
+    ) ![]const u8 {
+        var data_json: std.Io.Writer.Allocating = .init(allocator);
+        defer data_json.deinit();
+        try std.json.Stringify.value(data, .{}, &data_json.writer);
+        return self.appendCustomEntryValidatedJson(io, allocator, custom_type, data_json.written());
+    }
+
+    pub fn appendCustomEntryRawJson(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        custom_type: []const u8,
+        data_json: []const u8,
+    ) ![]const u8 {
+        const trimmed = std.mem.trim(u8, data_json, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidCustomEntryDataJson;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return error.InvalidCustomEntryDataJson;
+        defer parsed.deinit();
+        return self.appendCustomEntryValidatedJson(io, allocator, custom_type, trimmed);
+    }
+
+    fn appendCustomEntryValidatedJson(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        custom_type: []const u8,
+        data_json: []const u8,
+    ) ![]const u8 {
+        var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
+        const id = try self.nextEntryId(&entry_id_buf);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll("{\"type\":\"custom\",\"id\":");
+        try writeJsonString(w, id);
+        try w.writeAll(",\"parentId\":");
+        try self.writeLeafParent(w);
+        try w.writeAll(",\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll(",\"customType\":");
+        try writeJsonString(w, custom_type);
+        try w.writeAll(",\"data\":");
+        try w.writeAll(data_json);
+        try w.writeAll("}\n");
+
+        try appendBytes(io, self.path(), out.written());
+        try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
+        return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+
     pub fn appendAssistantToolCallMessage(
         self: *PersistentStore,
         io: std.Io,
@@ -1085,6 +1142,59 @@ test "persistent session store writes upstream-shaped jsonl" {
     _ = try store.appendMessage(std.testing.io, std.testing.allocator, .user, "hello");
     try std.testing.expectEqual(@as(usize, 1), store.user_messages);
     try std.testing.expect(store.sessionId().len > 0);
+}
+
+test "persistent session store appends upstream custom entries without message counters" {
+    const path = "zig-out/pi-zig-session-custom-entry-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try PersistentStore.init(std.testing.io, std.testing.allocator, path);
+
+    const raw_id = try store.appendCustomEntryRawJson(
+        std.testing.io,
+        std.testing.allocator,
+        "state",
+        " {\"count\":42,\"items\":[true,null]} ",
+    );
+    try std.testing.expectEqualStrings("m-1", raw_id);
+    try std.testing.expectEqual(@as(usize, 0), store.totalMessages());
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"source\":\"value\",\"nested\":{\"ok\":true}}", .{});
+    defer parsed.deinit();
+    const value_id = try store.appendCustomEntry(std.testing.io, std.testing.allocator, "value-state", parsed.value);
+    try std.testing.expectEqualStrings("m-2", value_id);
+    try std.testing.expectEqual(@as(usize, 0), store.totalMessages());
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next() orelse return error.MissingSessionHeader;
+    const raw_entry = lines.next() orelse return error.MissingCustomEntry;
+    const value_entry = lines.next() orelse return error.MissingCustomEntry;
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"custom\",\"id\":\"m-1\",\"parentId\":null,\"timestamp\":\"local-foundation\",\"customType\":\"state\",\"data\":{\"count\":42,\"items\":[true,null]}}",
+        raw_entry,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"custom\",\"id\":\"m-2\",\"parentId\":\"m-1\",\"timestamp\":\"local-foundation\",\"customType\":\"value-state\",\"data\":{\"source\":\"value\",\"nested\":{\"ok\":true}}}",
+        value_entry,
+    );
+
+    const loaded = try PersistentStore.open(std.testing.io, std.testing.allocator, path);
+    try std.testing.expectEqualStrings("m-2", loaded.leaf_id_buf[0..loaded.leaf_id_len]);
+    try std.testing.expectEqual(@as(usize, 0), loaded.totalMessages());
+    try std.testing.expectEqual(@as(usize, 2), loaded.entry_counter);
+}
+
+test "persistent session store rejects invalid raw custom entry JSON" {
+    const path = "zig-out/pi-zig-session-custom-entry-invalid-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try PersistentStore.init(std.testing.io, std.testing.allocator, path);
+    try std.testing.expectError(
+        error.InvalidCustomEntryDataJson,
+        store.appendCustomEntryRawJson(std.testing.io, std.testing.allocator, "state", "{\"unterminated\""),
+    );
+    try std.testing.expectEqual(@as(usize, 0), store.totalMessages());
+    try std.testing.expectEqual(@as(usize, 0), store.entry_counter);
 }
 
 test "persistent session store opens existing jsonl without truncating" {

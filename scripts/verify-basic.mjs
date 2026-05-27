@@ -2332,6 +2332,12 @@ fs.writeFileSync(
     '      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { deliverAs: "nextTurn" });',
     '    }',
     '  });',
+    '  pi.registerCommand("append-entry", {',
+    '    description: "Append an extension state entry",',
+    '    handler: async (args) => {',
+    '      await pi.appendEntry("test-entry", { content: args, n: 1 });',
+    '    }',
+    '  });',
     '}'
   ].join('\n')
 );
@@ -2822,6 +2828,80 @@ if (
   rpcNextTurnSessionText.includes('queued custom note')
 ) {
   throw new Error('rpc extension command sendMessage nextTurn action was not rejected visibly');
+}
+const fixtureRpcCommandAppendEntrySession = path.join(commandsFixtureRoot, 'rpc-command-append-entry.jsonl');
+fs.rmSync(fixtureRpcCommandAppendEntrySession, { force: true });
+const fixtureRpcCommandAppendEntryOutput = run(
+  [
+    '--mode',
+    'rpc',
+    '--session',
+    fixtureRpcCommandAppendEntrySession,
+    '--extension',
+    'extensions/command-exec.mjs'
+  ],
+  [
+    JSON.stringify({ id: 'rpc-command-append-entry', type: 'prompt', message: '/append-entry persisted state' }),
+    JSON.stringify({ id: 'rpc-command-append-entry-messages', type: 'get_messages' }),
+    JSON.stringify({ id: 'rpc-command-append-entry-state', type: 'get_state' }),
+    JSON.stringify({ id: 'rpc-command-append-entry-after-prompt', type: 'prompt', message: 'after append entry' }),
+    JSON.stringify({ id: 'rpc-command-append-entry-after-messages', type: 'get_messages' }),
+    JSON.stringify({ id: 'rpc-command-append-entry-clone', type: 'clone' }),
+    JSON.stringify({ id: 'rpc-command-append-entry-clone-state', type: 'get_state' }),
+    JSON.stringify({ id: 'rpc-command-append-entry-clone-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { cwd: commandsFixtureRoot, env: commandsFixtureEnv }
+);
+const fixtureRpcCommandAppendEntryResponses = fixtureRpcCommandAppendEntryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcCommandAppendEntry = fixtureRpcCommandAppendEntryResponses.find((response) => response.id === 'rpc-command-append-entry');
+const rpcCommandAppendEntryMessages = fixtureRpcCommandAppendEntryResponses.find((response) => response.id === 'rpc-command-append-entry-messages');
+const rpcCommandAppendEntryState = fixtureRpcCommandAppendEntryResponses.find((response) => response.id === 'rpc-command-append-entry-state');
+const rpcCommandAppendEntryAfterPrompt = fixtureRpcCommandAppendEntryResponses.find((response) => response.id === 'rpc-command-append-entry-after-prompt');
+const rpcCommandAppendEntryAfterMessages = fixtureRpcCommandAppendEntryResponses.find((response) => response.id === 'rpc-command-append-entry-after-messages');
+const rpcCommandAppendEntryClone = fixtureRpcCommandAppendEntryResponses.find((response) => response.id === 'rpc-command-append-entry-clone');
+const rpcCommandAppendEntryCloneState = fixtureRpcCommandAppendEntryResponses.find((response) => response.id === 'rpc-command-append-entry-clone-state');
+const rpcCommandAppendEntryCloneMessages = fixtureRpcCommandAppendEntryResponses.find((response) => response.id === 'rpc-command-append-entry-clone-messages');
+const rpcAppendEntrySessionEntries = fs.existsSync(fixtureRpcCommandAppendEntrySession)
+  ? fs.readFileSync(fixtureRpcCommandAppendEntrySession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+const rpcAppendEntry = rpcAppendEntrySessionEntries.find((entry) =>
+  entry.type === 'custom' &&
+  entry.customType === 'test-entry' &&
+  entry.data?.content === 'persisted state' &&
+  entry.data?.n === 1
+);
+const rpcAppendEntryAfterPromptEntry = rpcAppendEntrySessionEntries.find((entry) =>
+  entry.type === 'message' &&
+  entry.message?.role === 'user' &&
+  entry.message?.content === 'after append entry'
+);
+const rpcAppendEntryCloneSession = rpcCommandAppendEntryCloneState?.data?.sessionFile;
+const rpcAppendEntryCloneSessionEntries = rpcAppendEntryCloneSession && fs.existsSync(rpcAppendEntryCloneSession)
+  ? fs.readFileSync(rpcAppendEntryCloneSession, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  : [];
+if (
+  !rpcCommandAppendEntry?.success ||
+  rpcCommandAppendEntryMessages?.data?.messages?.length !== 0 ||
+  rpcCommandAppendEntryState?.data?.messageCount !== 0 ||
+  !rpcAppendEntry ||
+  !rpcCommandAppendEntryAfterPrompt?.success ||
+  !rpcCommandAppendEntryAfterMessages?.data?.messages?.some((message) => message.role === 'user' && message.content === 'after append entry') ||
+  rpcCommandAppendEntryAfterMessages?.data?.messages?.some((message) => message.customType === 'test-entry' || message.content === 'persisted state') ||
+  !rpcAppendEntryAfterPromptEntry ||
+  rpcAppendEntryAfterPromptEntry.parentId !== rpcAppendEntry.id ||
+  !rpcCommandAppendEntryClone?.success ||
+  !rpcCommandAppendEntryCloneState?.success ||
+  !rpcCommandAppendEntryCloneMessages?.data?.messages?.some((message) => message.role === 'user' && message.content === 'after append entry') ||
+  rpcCommandAppendEntryCloneMessages?.data?.messages?.some((message) => message.customType === 'test-entry' || message.content === 'persisted state') ||
+  !rpcAppendEntryCloneSessionEntries.some((entry) =>
+    entry.type === 'custom' &&
+    entry.customType === 'test-entry' &&
+    entry.data?.content === 'persisted state' &&
+    entry.data?.n === 1
+  )
+) {
+  throw new Error('rpc extension command appendEntry smoke did not persist a hidden custom entry, continue the parent chain, and preserve clone state');
 }
 fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
 const topLevelCommandEnv = envWithoutAnthropicAuth({ HOME: commandsFixtureHome });

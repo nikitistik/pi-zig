@@ -194,6 +194,7 @@ const StoredRole = enum {
     bash_execution,
     compaction_summary,
     custom,
+    custom_entry,
 
     fn label(self: StoredRole) []const u8 {
         return switch (self) {
@@ -204,6 +205,7 @@ const StoredRole = enum {
             .bash_execution => "bashExecution",
             .compaction_summary => "compactionSummary",
             .custom => "custom",
+            .custom_entry => "customEntry",
         };
     }
 
@@ -698,6 +700,9 @@ const Runtime = struct {
                 .custom => {
                     _ = try new_store.appendCustomMessage(io, allocator, message.customType(), message.text(), message.custom_display);
                 },
+                .custom_entry => {
+                    _ = try new_store.appendCustomEntryRawJson(io, allocator, message.customType(), message.text());
+                },
             }
         }
         if (previous_model) |model| try new_store.appendModelChange(io, allocator, model.provider, model.id);
@@ -749,8 +754,20 @@ const Runtime = struct {
                 try self.loadCompactionEntry(parsed.value.object);
             } else if (std.mem.eql(u8, entry_type, "custom_message")) {
                 try self.loadCustomMessageEntry(parsed.value.object);
+            } else if (std.mem.eql(u8, entry_type, "custom")) {
+                try self.loadCustomEntry(allocator, parsed.value.object);
             }
         }
+    }
+
+    fn loadCustomEntry(self: *Runtime, allocator: std.mem.Allocator, object: std.json.ObjectMap) !void {
+        const id = getStringFieldObject(object, "id") orelse return error.InvalidSessionEntry;
+        const custom_type = getStringFieldObject(object, "customType") orelse return error.InvalidSessionEntry;
+        const data = object.get("data") orelse .null;
+        var data_json: std.Io.Writer.Allocating = .init(allocator);
+        defer data_json.deinit();
+        try std.json.Stringify.value(data, .{}, &data_json.writer);
+        try self.addLoadedCustomEntry(id, custom_type, data_json.written());
     }
 
     fn loadCustomMessageEntry(self: *Runtime, object: std.json.ObjectMap) !void {
@@ -908,6 +925,55 @@ const Runtime = struct {
         slot.custom_type_len = custom_type.len;
         @memcpy(slot.custom_type[0..custom_type.len], custom_type);
         slot.custom_display = display;
+    }
+
+    fn addLoadedCustomEntry(self: *Runtime, entry_id: []const u8, custom_type: []const u8, data_json: []const u8) !void {
+        if (entry_id.len > 32) return error.ValueTooLong;
+        if (custom_type.len > max_custom_type_bytes) return error.ValueTooLong;
+        if (data_json.len > max_message_bytes) return error.MessageTooLarge;
+        if (self.message_count >= max_messages) return error.MessageLimitReached;
+
+        var slot = &self.messages[self.message_count];
+        slot.role = .custom_entry;
+        slot.id_len = entry_id.len;
+        @memcpy(slot.id[0..entry_id.len], entry_id);
+        slot.len = data_json.len;
+        @memcpy(slot.content[0..data_json.len], data_json);
+        slot.image_parts = &.{};
+        slot.command_len = 0;
+        slot.exit_code = null;
+        slot.cancelled = false;
+        slot.truncated = false;
+        slot.full_output_path_len = 0;
+        slot.tool_call_id_len = 0;
+        slot.tool_name_len = 0;
+        slot.tool_is_error = false;
+        slot.tool_terminate = false;
+        slot.tool_calls_count = 0;
+        slot.assistant_stop_reason_len = 0;
+        slot.assistant_error_message_len = 0;
+        slot.first_kept_entry_id_len = 0;
+        slot.tokens_before = 0;
+        slot.custom_type_len = custom_type.len;
+        @memcpy(slot.custom_type[0..custom_type.len], custom_type);
+        slot.custom_display = false;
+        self.message_count += 1;
+    }
+
+    fn addCustomEntry(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        custom_type: []const u8,
+        data_json: []const u8,
+    ) !void {
+        const trimmed = std.mem.trim(u8, data_json, " \t\r\n");
+        if (trimmed.len > max_message_bytes) return error.MessageTooLarge;
+        if (custom_type.len > max_custom_type_bytes) return error.ValueTooLong;
+        if (self.message_count >= max_messages) return error.MessageLimitReached;
+
+        const entry_id = try self.store.appendCustomEntryRawJson(io, allocator, custom_type, trimmed);
+        try self.addLoadedCustomEntry(entry_id, custom_type, trimmed);
     }
 
     fn addLoadedBash(self: *Runtime, entry_id: []const u8, command: []const u8, result: tools.ShellResult) !void {
@@ -1104,7 +1170,7 @@ const Runtime = struct {
         try w.writeAll(",\"tokensBefore\":");
         try w.print("{d}", .{tokens_before});
         try w.writeAll(",\"details\":{\"local\":true,\"messageCount\":");
-        try w.print("{d}", .{self.message_count});
+        try w.print("{d}", .{self.visibleMessageCount()});
         if (custom_instructions) |instructions| {
             try w.writeAll(",\"customInstructions\":");
             try writeJsonString(w, instructions);
@@ -1333,6 +1399,7 @@ const Runtime = struct {
             .bash_execution => try appendOwnedHistoryMessage(allocator, history, .user, try self.bashExecutionHistoryText(allocator, message)),
             .compaction_summary => {},
             .custom => try appendHistoryMessage(allocator, history, .user, message.text()),
+            .custom_entry => {},
             else => {},
         }
     }
@@ -1736,6 +1803,9 @@ const Runtime = struct {
                     } else {
                         try self.addCustomMessage(io, allocator, custom_message.custom_type, custom_message.content, custom_message.display);
                     }
+                },
+                .append_entry => |entry| {
+                    try self.addCustomEntry(io, allocator, entry.custom_type, entry.data_json);
                 },
             }
         }
@@ -2201,7 +2271,7 @@ const Runtime = struct {
         try w.writeAll(",\"lastRetryDelayMs\":");
         try w.print("{d}", .{self.last_retry_delay_ms});
         try w.writeAll(",\"messageCount\":");
-        try w.print("{d}", .{self.message_count});
+        try w.print("{d}", .{self.visibleMessageCount()});
         try w.writeAll(",\"pendingMessageCount\":");
         try w.print("{d}", .{self.steering_queue.count + self.follow_up_queue.count});
         try w.writeAll(",\"pendingSteeringCount\":");
@@ -2213,6 +2283,15 @@ const Runtime = struct {
             try writeJsonString(w, name);
         }
         try w.writeAll("}}\n");
+    }
+
+    fn visibleMessageCount(self: *Runtime) usize {
+        var count: usize = 0;
+        for (self.messages[0..self.message_count]) |*message| {
+            if (message.role == .custom_entry) continue;
+            count += 1;
+        }
+        return count;
     }
 
     fn writeMessages(self: *Runtime, w: *std.Io.Writer, id: ?[]const u8, command: []const u8) !void {
@@ -2233,7 +2312,7 @@ const Runtime = struct {
     fn writeMessageRange(self: *Runtime, w: *std.Io.Writer, start: usize, end: usize, emitted: *usize) !void {
         if (start >= end) return;
         for (self.messages[start..end]) |*message| {
-            if (message.role == .compaction_summary) continue;
+            if (message.role == .compaction_summary or message.role == .custom_entry) continue;
             try self.writeStoredMessageWithComma(w, message, emitted);
         }
     }
