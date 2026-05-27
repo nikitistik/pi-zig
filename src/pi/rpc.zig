@@ -350,11 +350,20 @@ const StoredMessage = struct {
     }
 };
 
+const PendingMessageKind = enum {
+    user,
+    custom,
+};
+
 const PendingMessageQueue = struct {
     count: usize = 0,
+    kinds: [max_pending_messages]PendingMessageKind = undefined,
     lengths: [max_pending_messages]usize = undefined,
     messages: [max_pending_messages][max_message_bytes]u8 = undefined,
     image_parts: [max_pending_messages][]ai_client.ChatContentPart = [_][]ai_client.ChatContentPart{&.{}} ** max_pending_messages,
+    custom_type_lengths: [max_pending_messages]usize = undefined,
+    custom_types: [max_pending_messages][max_custom_type_bytes]u8 = undefined,
+    displays: [max_pending_messages]bool = undefined,
 
     fn enqueue(
         self: *PendingMessageQueue,
@@ -366,9 +375,31 @@ const PendingMessageQueue = struct {
         if (self.count >= max_pending_messages) return error.PendingMessageLimitReached;
         const owned_image_parts = try cloneImageParts(allocator, image_parts);
         errdefer freeRpcContentParts(allocator, owned_image_parts);
+        self.kinds[self.count] = .user;
         self.lengths[self.count] = message.len;
         @memcpy(self.messages[self.count][0..message.len], message);
         self.image_parts[self.count] = owned_image_parts;
+        self.custom_type_lengths[self.count] = 0;
+        self.displays[self.count] = true;
+        self.count += 1;
+    }
+
+    fn enqueueCustom(
+        self: *PendingMessageQueue,
+        custom_type: []const u8,
+        content: []const u8,
+        display: bool,
+    ) !void {
+        if (custom_type.len == 0 or custom_type.len > max_custom_type_bytes) return error.ValueTooLong;
+        if (content.len > max_message_bytes) return error.MessageTooLarge;
+        if (self.count >= max_pending_messages) return error.PendingMessageLimitReached;
+        self.kinds[self.count] = .custom;
+        self.lengths[self.count] = content.len;
+        @memcpy(self.messages[self.count][0..content.len], content);
+        self.image_parts[self.count] = &.{};
+        self.custom_type_lengths[self.count] = custom_type.len;
+        @memcpy(self.custom_types[self.count][0..custom_type.len], custom_type);
+        self.displays[self.count] = display;
         self.count += 1;
     }
 
@@ -384,10 +415,17 @@ const PendingMessageQueue = struct {
         };
     }
 
-    fn at(self: *const PendingMessageQueue, index: usize) UserBatchMessage {
-        return .{
-            .text = self.messages[index][0..self.lengths[index]],
-            .image_parts = self.image_parts[index],
+    fn at(self: *const PendingMessageQueue, index: usize) QueuedBatchMessage {
+        return switch (self.kinds[index]) {
+            .user => .{ .user = .{
+                .text = self.messages[index][0..self.lengths[index]],
+                .image_parts = self.image_parts[index],
+            } },
+            .custom => .{ .custom = .{
+                .custom_type = self.custom_types[index][0..self.custom_type_lengths[index]],
+                .content = self.messages[index][0..self.lengths[index]],
+                .display = self.displays[index],
+            } },
         };
     }
 
@@ -400,10 +438,16 @@ const PendingMessageQueue = struct {
         const remaining = self.count - prefix_count;
         for (0..remaining) |index| {
             const source = index + prefix_count;
+            self.kinds[index] = self.kinds[source];
             self.lengths[index] = self.lengths[source];
-            @memcpy(self.messages[index][0..self.lengths[source]], self.messages[source][0..self.lengths[source]]);
+            std.mem.copyForwards(u8, self.messages[index][0..self.lengths[source]], self.messages[source][0..self.lengths[source]]);
             self.image_parts[index] = self.image_parts[source];
             self.image_parts[source] = &.{};
+            self.custom_type_lengths[index] = self.custom_type_lengths[source];
+            if (self.custom_type_lengths[source] > 0) {
+                std.mem.copyForwards(u8, self.custom_types[index][0..self.custom_type_lengths[source]], self.custom_types[source][0..self.custom_type_lengths[source]]);
+            }
+            self.displays[index] = self.displays[source];
         }
         self.count = remaining;
     }
@@ -465,6 +509,25 @@ fn parseSlashCommandInvocation(message: []const u8) ?SlashCommandInvocation {
 const UserBatchMessage = struct {
     text: []const u8,
     image_parts: []const ai_client.ChatContentPart = &.{},
+};
+
+const QueuedBatchMessage = union(enum) {
+    user: UserBatchMessage,
+    custom: PendingCustomMessage,
+
+    fn text(self: QueuedBatchMessage) []const u8 {
+        return switch (self) {
+            .user => |message| message.text,
+            .custom => |message| message.content,
+        };
+    }
+
+    fn imageParts(self: QueuedBatchMessage) []const ai_client.ChatContentPart {
+        return switch (self) {
+            .user => |message| message.image_parts,
+            .custom => &.{},
+        };
+    }
 };
 
 const PendingCustomMessage = struct {
@@ -1250,7 +1313,7 @@ const Runtime = struct {
         allocator: std.mem.Allocator,
         prompt_job: ?*ActivePromptJob,
         history_limit: usize,
-        batch_history_messages: []const UserBatchMessage,
+        batch_history_messages: []const QueuedBatchMessage,
         batch_custom_messages: []const PendingCustomMessage,
         prompt: []const u8,
         prompt_image_parts: []const ai_client.ChatContentPart,
@@ -1266,7 +1329,7 @@ const Runtime = struct {
         var history = try self.buildAgentHistory(allocator, history_limit);
         defer deinitAgentHistory(allocator, &history);
         for (batch_history_messages) |message| {
-            try appendBatchHistoryMessage(allocator, &history, message);
+            try appendQueuedHistoryMessage(allocator, &history, message);
         }
         for (batch_custom_messages) |message| {
             try appendHistoryMessage(allocator, &history, .user, message.content);
@@ -1354,7 +1417,7 @@ const Runtime = struct {
         retry_event_output: ?*RpcOutput,
         prompt_job: ?*ActivePromptJob,
         history_limit: usize,
-        batch_history_messages: []const UserBatchMessage,
+        batch_history_messages: []const QueuedBatchMessage,
         batch_custom_messages: []const PendingCustomMessage,
         prompt: []const u8,
         prompt_image_parts: []const ai_client.ChatContentPart,
@@ -1492,6 +1555,13 @@ const Runtime = struct {
         };
         errdefer deinitHistoryMessage(allocator, chat_message);
         try history.append(allocator, chat_message);
+    }
+
+    fn appendQueuedHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), message: QueuedBatchMessage) !void {
+        switch (message) {
+            .user => |user_message| try appendBatchHistoryMessage(allocator, history, user_message),
+            .custom => |custom_message| try appendHistoryMessage(allocator, history, .user, custom_message.content),
+        }
     }
 
     fn appendOwnedHistoryMessage(allocator: std.mem.Allocator, history: *std.ArrayList(ai_client.ChatMessage), role: ai_client.ChatRole, content: []u8) !void {
@@ -1691,20 +1761,23 @@ const Runtime = struct {
         try w.writeAll("}}\n");
     }
 
-    fn runUserBatch(
+    fn runQueuedBatch(
         self: *Runtime,
         io: std.Io,
         allocator: std.mem.Allocator,
         w: *std.Io.Writer,
         retry_event_output: ?*RpcOutput,
         prompt_job: ?*ActivePromptJob,
-        messages: []const UserBatchMessage,
+        messages: []const QueuedBatchMessage,
         last_result: *?agent.RunResult,
     ) !void {
         if (messages.len == 0) return;
         const history_limit = self.message_count;
         for (messages) |message| {
-            try self.addUserMessageWithImages(io, allocator, message.text, message.image_parts);
+            switch (message) {
+                .user => |user_message| try self.addUserMessageWithImages(io, allocator, user_message.text, user_message.image_parts),
+                .custom => |custom_message| try self.addCustomMessage(io, allocator, custom_message.custom_type, custom_message.content, custom_message.display),
+            }
         }
 
         const prompt_message = messages[messages.len - 1];
@@ -1717,8 +1790,8 @@ const Runtime = struct {
             history_limit,
             messages[0 .. messages.len - 1],
             &.{},
-            prompt_message.text,
-            prompt_message.image_parts,
+            prompt_message.text(),
+            prompt_message.imageParts(),
         ) catch |err| {
             if (err != error.RetryCancelled) {
                 const stop_reason: []const u8 = if (err == error.AgentAborted) "aborted" else "error";
@@ -1736,7 +1809,7 @@ const Runtime = struct {
         last_result.* = run_result;
     }
 
-    fn drainQueueBatch(self: *Runtime, queue: *PendingMessageQueue, mode: QueueMode, batch: []UserBatchMessage) usize {
+    fn drainQueueBatch(self: *Runtime, queue: *PendingMessageQueue, mode: QueueMode, batch: []QueuedBatchMessage) usize {
         _ = self;
         const count = queue.drainCount(mode);
         for (0..count) |index| {
@@ -1754,16 +1827,16 @@ const Runtime = struct {
         prompt_job: ?*ActivePromptJob,
         last_result: *?agent.RunResult,
     ) !void {
-        var batch: [max_pending_messages]UserBatchMessage = undefined;
+        var batch: [max_pending_messages]QueuedBatchMessage = undefined;
         while (self.steering_queue.count > 0 or self.follow_up_queue.count > 0) {
             if (self.steering_queue.count > 0) {
                 const count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, &batch);
-                try self.runUserBatch(io, allocator, w, retry_event_output, prompt_job, batch[0..count], last_result);
+                try self.runQueuedBatch(io, allocator, w, retry_event_output, prompt_job, batch[0..count], last_result);
                 self.steering_queue.dropPrefix(allocator, count);
                 continue;
             }
             const count = self.drainQueueBatch(&self.follow_up_queue, self.follow_up_mode, &batch);
-            try self.runUserBatch(io, allocator, w, retry_event_output, prompt_job, batch[0..count], last_result);
+            try self.runQueuedBatch(io, allocator, w, retry_event_output, prompt_job, batch[0..count], last_result);
             self.follow_up_queue.dropPrefix(allocator, count);
         }
     }
@@ -1786,6 +1859,10 @@ const Runtime = struct {
         queue.enqueue(allocator, message, image_parts) catch |err| {
             return writeError(w, id, command, @errorName(err));
         };
+        try self.writePendingQueueState(w, id, command);
+    }
+
+    fn writePendingQueueState(self: *Runtime, w: *std.Io.Writer, id: ?[]const u8, command: []const u8) !void {
         try writeResponseHead(w, id, command, true);
         try w.writeAll(",\"data\":{\"pendingMessageCount\":");
         try w.print("{d}", .{self.steering_queue.count + self.follow_up_queue.count});
@@ -1836,12 +1913,12 @@ const Runtime = struct {
         for (result.actions) |action| {
             if (started_prompt) return error.MultipleCommandPromptActionsUnsupported;
             switch (action) {
-                .send_user_message => |content| {
-                    try self.startPromptAsync(io, allocator, output, id, content, &.{});
+                .send_user_message => |user_message| {
+                    try self.startPromptAsync(io, allocator, output, id, user_message.content, &.{});
                     started_prompt = true;
                 },
                 .send_message => |custom_message| {
-                    if (custom_message.next_turn) {
+                    if (custom_message.deliver_as != null and custom_message.deliver_as.? == .next_turn) {
                         try self.next_turn_custom_queue.enqueue(custom_message.custom_type, custom_message.content, custom_message.display);
                     } else if (custom_message.trigger_turn) {
                         try self.startCustomPromptAsync(
@@ -1865,6 +1942,61 @@ const Runtime = struct {
         }
         if (started_prompt) return true;
         try writeSuccess(w, id, command);
+        return true;
+    }
+
+    fn handleQueuedExtensionPromptCommand(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
+        id: ?[]const u8,
+        command: []const u8,
+        message: []const u8,
+        target_delivery: extension_runner.Runner.CommandDelivery,
+        queue: *PendingMessageQueue,
+    ) !bool {
+        const invocation = parseSlashCommandInvocation(message) orelse return false;
+        if (self.run_options.extension_paths.len == 0) return false;
+        var runner = self.makeExtensionRunner(io, allocator);
+        const result = try runner.runRegisteredCommand(invocation.name, invocation.args);
+        defer result.deinit(allocator);
+        if (!result.handled) return false;
+
+        for (result.actions) |action| {
+            switch (action) {
+                .send_user_message => |user_message| {
+                    const delivery = user_message.deliver_as orelse {
+                        try writeError(w, id, command, "Queued extension sendUserMessage must use matching deliverAs");
+                        return true;
+                    };
+                    if (delivery != target_delivery) {
+                        try writeError(w, id, command, "Queued extension sendUserMessage must use matching deliverAs");
+                        return true;
+                    }
+                    queue.enqueue(allocator, user_message.content, &.{}) catch |err| {
+                        try writeError(w, id, command, @errorName(err));
+                        return true;
+                    };
+                },
+                .send_message => |custom_message| {
+                    const delivery = custom_message.deliver_as orelse .steer;
+                    if (delivery != target_delivery) {
+                        try writeError(w, id, command, "Queued extension sendMessage must use matching deliverAs");
+                        return true;
+                    }
+                    queue.enqueueCustom(custom_message.custom_type, custom_message.content, custom_message.display) catch |err| {
+                        try writeError(w, id, command, @errorName(err));
+                        return true;
+                    };
+                },
+                else => {
+                    try writeError(w, id, command, "Queued extension command action is not supported");
+                    return true;
+                },
+            }
+        }
+        try self.writePendingQueueState(w, id, command);
         return true;
     }
 
@@ -1921,8 +2053,8 @@ const Runtime = struct {
         var last_result: ?agent.RunResult = null;
         errdefer if (last_result) |result| result.deinit(allocator);
 
-        var initial_batch: [1 + max_pending_messages]UserBatchMessage = undefined;
-        initial_batch[0] = .{ .text = message, .image_parts = image_parts };
+        var initial_batch: [1 + max_pending_messages]QueuedBatchMessage = undefined;
+        initial_batch[0] = .{ .user = .{ .text = message, .image_parts = image_parts } };
         const steering_count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, initial_batch[1..]);
         var next_turn_custom_messages: [max_pending_messages]PendingCustomMessage = undefined;
         const next_turn_custom_count = self.next_turn_custom_queue.count;
@@ -1956,14 +2088,17 @@ const Runtime = struct {
         w: *std.Io.Writer,
         retry_event_output: ?*RpcOutput,
         prompt_job: ?*ActivePromptJob,
-        messages: []const UserBatchMessage,
+        messages: []const QueuedBatchMessage,
         custom_messages: []const PendingCustomMessage,
         last_result: *?agent.RunResult,
     ) !void {
         if (messages.len == 0) return;
         const history_limit = self.message_count;
         for (messages) |message| {
-            try self.addUserMessageWithImages(io, allocator, message.text, message.image_parts);
+            switch (message) {
+                .user => |user_message| try self.addUserMessageWithImages(io, allocator, user_message.text, user_message.image_parts),
+                .custom => |custom_message| try self.addCustomMessage(io, allocator, custom_message.custom_type, custom_message.content, custom_message.display),
+            }
         }
         for (custom_messages) |message| {
             try self.addCustomMessage(io, allocator, message.custom_type, message.content, message.display);
@@ -1979,8 +2114,8 @@ const Runtime = struct {
             history_limit,
             messages[0 .. messages.len - 1],
             custom_messages,
-            prompt_message.text,
-            prompt_message.image_parts,
+            prompt_message.text(),
+            prompt_message.imageParts(),
         ) catch |err| {
             if (err != error.RetryCancelled) {
                 const stop_reason: []const u8 = if (err == error.AgentAborted) "aborted" else "error";
@@ -2067,9 +2202,15 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "steer requires a string message");
             };
-            if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
-                return writeError(w, id, command, @errorName(err));
-            }) return;
+            if (self.isPromptRunning()) {
+                if (self.handleQueuedExtensionPromptCommand(io, allocator, w, id, command, message, .steer, &self.steering_queue) catch |err| {
+                    return writeError(w, id, command, @errorName(err));
+                }) return;
+            } else {
+                if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
+                    return writeError(w, id, command, @errorName(err));
+                }) return;
+            }
             const image_parts = parseRpcImages(allocator, value) catch {
                 return writeError(w, id, command, "steer images must be ImageContent objects with type=image, data, and mimeType");
             };
@@ -2081,9 +2222,15 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "follow_up requires a string message");
             };
-            if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
-                return writeError(w, id, command, @errorName(err));
-            }) return;
+            if (self.isPromptRunning()) {
+                if (self.handleQueuedExtensionPromptCommand(io, allocator, w, id, command, message, .follow_up, &self.follow_up_queue) catch |err| {
+                    return writeError(w, id, command, @errorName(err));
+                }) return;
+            } else {
+                if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
+                    return writeError(w, id, command, @errorName(err));
+                }) return;
+            }
             const image_parts = parseRpcImages(allocator, value) catch {
                 return writeError(w, id, command, "follow_up images must be ImageContent objects with type=image, data, and mimeType");
             };
@@ -2763,7 +2910,9 @@ pub fn run(
 fn isActivePromptNonBlockingCommand(value: std.json.Value) bool {
     const command = getStringField(value, "type") orelse return false;
     return std.mem.eql(u8, command, "abort") or
-        std.mem.eql(u8, command, "abort_retry");
+        std.mem.eql(u8, command, "abort_retry") or
+        std.mem.eql(u8, command, "steer") or
+        std.mem.eql(u8, command, "follow_up");
 }
 
 fn isActiveBashNonBlockingCommand(value: std.json.Value) bool {

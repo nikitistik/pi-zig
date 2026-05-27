@@ -103,17 +103,32 @@ pub const Runner = struct {
         }
     };
 
+    pub const CommandDelivery = enum {
+        steer,
+        follow_up,
+        next_turn,
+    };
+
     pub const CommandAction = union(enum) {
-        send_user_message: []u8,
+        send_user_message: CommandUserMessageAction,
         send_message: CommandCustomMessageAction,
         append_entry: CommandAppendEntryAction,
 
         pub fn deinit(self: CommandAction, allocator: std.mem.Allocator) void {
             switch (self) {
-                .send_user_message => |message| allocator.free(message),
+                .send_user_message => |message| message.deinit(allocator),
                 .send_message => |message| message.deinit(allocator),
                 .append_entry => |entry| entry.deinit(allocator),
             }
+        }
+    };
+
+    pub const CommandUserMessageAction = struct {
+        content: []u8,
+        deliver_as: ?CommandDelivery = null,
+
+        pub fn deinit(self: CommandUserMessageAction, allocator: std.mem.Allocator) void {
+            allocator.free(self.content);
         }
     };
 
@@ -122,7 +137,7 @@ pub const Runner = struct {
         content: []u8,
         display: bool = true,
         trigger_turn: bool = false,
-        next_turn: bool = false,
+        deliver_as: ?CommandDelivery = null,
 
         pub fn deinit(self: CommandCustomMessageAction, allocator: std.mem.Allocator) void {
             allocator.free(self.custom_type);
@@ -583,7 +598,17 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
                 .array => try textContentToOwnedString(allocator, content),
                 else => return error.ExtensionHookInvalidResponse,
             };
-            actions.append(allocator, .{ .send_user_message = owned_content }) catch |err| {
+            var deliver_as: ?Runner.CommandDelivery = null;
+            if (item.object.get("options")) |options| {
+                if (options != .object) return error.ExtensionHookInvalidResponse;
+                if (options.object.get("deliverAs")) |deliver_value| {
+                    deliver_as = try parseCommandDelivery(deliver_value, false);
+                }
+            }
+            actions.append(allocator, .{ .send_user_message = .{
+                .content = owned_content,
+                .deliver_as = deliver_as,
+            } }) catch |err| {
                 allocator.free(owned_content);
                 return err;
             };
@@ -610,16 +635,15 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
                 display = display_value.bool;
             }
             var trigger_turn = false;
-            var next_turn = false;
+            var deliver_as: ?Runner.CommandDelivery = null;
             if (item.object.get("options")) |options| {
                 if (options != .object) return error.ExtensionHookInvalidResponse;
                 if (options.object.get("triggerTurn")) |trigger_value| {
                     if (trigger_value != .bool) return error.ExtensionHookInvalidResponse;
                     trigger_turn = trigger_value.bool;
                 }
-                if (options.object.get("deliverAs")) |deliver_as| {
-                    if (deliver_as != .string) return error.ExtensionHookInvalidResponse;
-                    if (std.mem.eql(u8, deliver_as.string, "nextTurn")) next_turn = true;
+                if (options.object.get("deliverAs")) |deliver_value| {
+                    deliver_as = try parseCommandDelivery(deliver_value, true);
                 }
             }
             actions.append(allocator, .{ .send_message = .{
@@ -627,7 +651,7 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
                 .content = owned_content,
                 .display = display,
                 .trigger_turn = trigger_turn,
-                .next_turn = next_turn,
+                .deliver_as = deliver_as,
             } }) catch |err| {
                 allocator.free(owned_content);
                 allocator.free(owned_custom_type);
@@ -656,6 +680,14 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
     }
     if (actions.items.len == 0) return &.{};
     return actions.toOwnedSlice(allocator);
+}
+
+fn parseCommandDelivery(value: std.json.Value, allow_next_turn: bool) !Runner.CommandDelivery {
+    if (value != .string) return error.ExtensionHookInvalidResponse;
+    if (std.mem.eql(u8, value.string, "steer")) return .steer;
+    if (std.mem.eql(u8, value.string, "followUp")) return .follow_up;
+    if (std.mem.eql(u8, value.string, "nextTurn") and allow_next_turn) return .next_turn;
+    return error.ExtensionHookInvalidResponse;
 }
 
 fn freeContentParts(allocator: std.mem.Allocator, parts: []ai_client.ChatContentPart) void {
@@ -832,8 +864,7 @@ const hook_runner_script =
     \\    return undefined;
     \\  },
     \\  sendUserMessage(content, options = {}) {
-    \\    void options;
-    \\    actions.push({ type: "send_user_message", content });
+    \\    actions.push({ type: "send_user_message", content, options });
     \\  },
     \\  sendMessage(message, options = {}) {
     \\    actions.push({ type: "send_message", message, options });
@@ -1270,6 +1301,18 @@ test "extension runner returns send user message command actions" {
         \\      await pi.sendUserMessage(args);
         \\    }
         \\  });
+        \\  pi.registerCommand("send-user-steer", {
+        \\    description: "Queue a raw steering message",
+        \\    handler: async (args) => {
+        \\      await pi.sendUserMessage(args, { deliverAs: "steer" });
+        \\    }
+        \\  });
+        \\  pi.registerCommand("send-user-follow", {
+        \\    description: "Queue a raw follow-up message",
+        \\    handler: async (args) => {
+        \\      await pi.sendUserMessage(args, { deliverAs: "followUp" });
+        \\    }
+        \\  });
         \\}
     });
 
@@ -1279,7 +1322,34 @@ test "extension runner returns send user message command actions" {
     try std.testing.expect(result.handled);
     try std.testing.expectEqual(@as(usize, 1), result.actions.len);
     switch (result.actions[0]) {
-        .send_user_message => |message| try std.testing.expectEqualStrings("/write-marker raw user", message),
+        .send_user_message => |message| {
+            try std.testing.expectEqualStrings("/write-marker raw user", message.content);
+            try std.testing.expect(message.deliver_as == null);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+
+    const steer_result = try runner.runRegisteredCommand("send-user-steer", "queued steer");
+    defer steer_result.deinit(allocator);
+    try std.testing.expect(steer_result.handled);
+    try std.testing.expectEqual(@as(usize, 1), steer_result.actions.len);
+    switch (steer_result.actions[0]) {
+        .send_user_message => |message| {
+            try std.testing.expectEqualStrings("queued steer", message.content);
+            try std.testing.expect(message.deliver_as.? == .steer);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+
+    const follow_result = try runner.runRegisteredCommand("send-user-follow", "queued follow");
+    defer follow_result.deinit(allocator);
+    try std.testing.expect(follow_result.handled);
+    try std.testing.expectEqual(@as(usize, 1), follow_result.actions.len);
+    switch (follow_result.actions[0]) {
+        .send_user_message => |message| {
+            try std.testing.expectEqualStrings("queued follow", message.content);
+            try std.testing.expect(message.deliver_as.? == .follow_up);
+        },
         else => return error.UnexpectedCommandAction,
     }
 }
@@ -1310,6 +1380,18 @@ test "extension runner returns send custom message command actions" {
         \\      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { deliverAs: "nextTurn" });
         \\    }
         \\  });
+        \\  pi.registerCommand("steer-custom", {
+        \\    description: "Queue a custom steering message",
+        \\    handler: async (args) => {
+        \\      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { deliverAs: "steer" });
+        \\    }
+        \\  });
+        \\  pi.registerCommand("follow-custom", {
+        \\    description: "Queue a custom follow-up message",
+        \\    handler: async (args) => {
+        \\      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { deliverAs: "followUp" });
+        \\    }
+        \\  });
         \\}
     });
 
@@ -1324,6 +1406,7 @@ test "extension runner returns send custom message command actions" {
             try std.testing.expectEqualStrings("custom note", message.content);
             try std.testing.expect(!message.display);
             try std.testing.expect(!message.trigger_turn);
+            try std.testing.expect(message.deliver_as == null);
         },
         else => return error.UnexpectedCommandAction,
     }
@@ -1338,7 +1421,7 @@ test "extension runner returns send custom message command actions" {
             try std.testing.expectEqualStrings("custom prompt", message.content);
             try std.testing.expect(message.display);
             try std.testing.expect(message.trigger_turn);
-            try std.testing.expect(!message.next_turn);
+            try std.testing.expect(message.deliver_as == null);
         },
         else => return error.UnexpectedCommandAction,
     }
@@ -1353,7 +1436,33 @@ test "extension runner returns send custom message command actions" {
             try std.testing.expectEqualStrings("queued custom", message.content);
             try std.testing.expect(message.display);
             try std.testing.expect(!message.trigger_turn);
-            try std.testing.expect(message.next_turn);
+            try std.testing.expect(message.deliver_as.? == .next_turn);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+
+    const steer_result = try runner.runRegisteredCommand("steer-custom", "custom steer");
+    defer steer_result.deinit(allocator);
+    try std.testing.expect(steer_result.handled);
+    try std.testing.expectEqual(@as(usize, 1), steer_result.actions.len);
+    switch (steer_result.actions[0]) {
+        .send_message => |message| {
+            try std.testing.expectEqualStrings("test-extension", message.custom_type);
+            try std.testing.expectEqualStrings("custom steer", message.content);
+            try std.testing.expect(message.deliver_as.? == .steer);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+
+    const follow_result = try runner.runRegisteredCommand("follow-custom", "custom follow");
+    defer follow_result.deinit(allocator);
+    try std.testing.expect(follow_result.handled);
+    try std.testing.expectEqual(@as(usize, 1), follow_result.actions.len);
+    switch (follow_result.actions[0]) {
+        .send_message => |message| {
+            try std.testing.expectEqualStrings("test-extension", message.custom_type);
+            try std.testing.expectEqualStrings("custom follow", message.content);
+            try std.testing.expect(message.deliver_as.? == .follow_up);
         },
         else => return error.UnexpectedCommandAction,
     }

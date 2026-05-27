@@ -1775,6 +1775,72 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc queued follow image observed' } }] }));
       return;
     }
+    if (userMessages.includes('rpc active extension steer start')) {
+      if (userMessages.includes('/write-marker active raw steer') && userMessages.includes('rpc active custom steer')) {
+        const content = 'rpc active extension steer observed';
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        const started = process.cwd() + '/zig-out/pi-zig-rpc-provider-extension-active-steer.started';
+        const release = process.cwd() + '/zig-out/pi-zig-rpc-provider-extension-active-steer.release';
+        const command = 'printf started > ' + JSON.stringify(started) + '; while [ ! -f ' + JSON.stringify(release) + ' ]; do sleep 0.05; done; printf released';
+        const toolCall = { index: 0, id: 'call_rpc_active_extension_steer_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command }) } };
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { tool_calls: [toolCall] } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCall] } }] }));
+        return;
+      }
+      const content = 'rpc active extension steer base complete';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
+    if (userMessages.includes('rpc active extension follow start')) {
+      if (userMessages.includes('/write-marker active raw follow') && userMessages.includes('rpc active custom follow')) {
+        const content = 'rpc active extension follow observed';
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        const started = process.cwd() + '/zig-out/pi-zig-rpc-provider-extension-active-follow.started';
+        const release = process.cwd() + '/zig-out/pi-zig-rpc-provider-extension-active-follow.release';
+        const command = 'printf started > ' + JSON.stringify(started) + '; while [ ! -f ' + JSON.stringify(release) + ' ]; do sleep 0.05; done; printf released';
+        const toolCall = { index: 0, id: 'call_rpc_active_extension_follow_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command }) } };
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { tool_calls: [toolCall] } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCall] } }] }));
+        return;
+      }
+      const content = 'rpc active extension follow base complete';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
     if (userMessages.includes('rpc steer start')) {
       const content = userMessages.includes('rpc steer two')
         ? 'handled rpc steer two'
@@ -2352,6 +2418,30 @@ fs.writeFileSync(
     '    description: "Queue a custom message for the next provider-backed RPC turn",',
     '    handler: async (args) => {',
     '      await pi.sendMessage({ customType: "next-turn-extension", content: args, display: true }, { deliverAs: "nextTurn" });',
+    '    }',
+    '  });',
+    '  pi.registerCommand("send-user-steer-active", {',
+    '    description: "Queue a raw user steering message while active",',
+    '    handler: async (args) => {',
+    '      await pi.sendUserMessage(args, { deliverAs: "steer" });',
+    '    }',
+    '  });',
+    '  pi.registerCommand("send-user-follow-active", {',
+    '    description: "Queue a raw user follow-up message while active",',
+    '    handler: async (args) => {',
+    '      await pi.sendUserMessage(args, { deliverAs: "followUp" });',
+    '    }',
+    '  });',
+    '  pi.registerCommand("send-custom-steer-active", {',
+    '    description: "Queue a custom steering message while active",',
+    '    handler: async (args) => {',
+    '      await pi.sendMessage({ customType: "active-steer-extension", content: args, display: true }, { deliverAs: "steer" });',
+    '    }',
+    '  });',
+    '  pi.registerCommand("send-custom-follow-active", {',
+    '    description: "Queue a custom follow-up message while active",',
+    '    handler: async (args) => {',
+    '      await pi.sendMessage({ customType: "active-follow-extension", content: args, display: true }, { deliverAs: "followUp" });',
     '    }',
     '  });',
     '  pi.registerCommand("append-entry", {',
@@ -5934,6 +6024,176 @@ try {
       throw new Error(`rpc provider abort in-flight smoke did not cancel the active prompt\nstdout:\n${stdout}\nstderr:\n${stderr}`);
     }
   }
+
+  async function runRpcProviderActiveExtensionQueueSmoke(kind) {
+    const isFollow = kind === 'follow';
+    const rpcCommand = isFollow ? 'follow_up' : 'steer';
+    const sessionFile = path.resolve(`zig-out/pi-zig-rpc-provider-extension-active-${kind}-queue-smoke.jsonl`);
+    const markerFile = path.resolve(`zig-out/pi-zig-rpc-provider-extension-active-${kind}.started`);
+    const releaseFile = path.resolve(`zig-out/pi-zig-rpc-provider-extension-active-${kind}.release`);
+    fs.rmSync(sessionFile, { force: true });
+    fs.rmSync(markerFile, { force: true });
+    fs.rmSync(releaseFile, { force: true });
+    const child = spawn(
+      bin,
+      ['--mode', 'rpc', '--session', sessionFile, '--extension', 'extensions/command-exec.mjs'],
+      {
+        cwd: commandsFixtureRoot,
+        env: { ...rpcProviderEnv, HOME: commandsFixtureHome },
+        stdio: ['pipe', 'pipe', 'pipe']
+      }
+    );
+    let stdout = '';
+    let stderr = '';
+    let pending = '';
+    const lines = [];
+    const waiters = [];
+    function failWaiters(error) {
+      while (waiters.length > 0) {
+        const waiter = waiters.shift();
+        clearTimeout(waiter.timeout);
+        waiter.reject(error);
+      }
+    }
+    function resolveWaiters(line) {
+      for (let index = 0; index < waiters.length;) {
+        const waiter = waiters[index];
+        if (waiter.predicate(line)) {
+          waiters.splice(index, 1);
+          clearTimeout(waiter.timeout);
+          waiter.resolve(line);
+        } else {
+          index += 1;
+        }
+      }
+    }
+    function waitForLine(predicate, timeoutMs = 4000) {
+      const existing = lines.find(predicate);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          const error = new Error(`timed out waiting for active extension ${kind} RPC line\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+          const index = waiters.findIndex((waiter) => waiter.reject === reject);
+          if (index !== -1) waiters.splice(index, 1);
+          reject(error);
+        }, timeoutMs);
+        waiters.push({ predicate, resolve, reject, timeout });
+      });
+    }
+    function waitForFile(file, timeoutMs = 2500) {
+      return new Promise((resolve, reject) => {
+        const started = Date.now();
+        const interval = setInterval(() => {
+          if (fs.existsSync(file)) {
+            clearInterval(interval);
+            resolve();
+            return;
+          }
+          if (Date.now() - started > timeoutMs) {
+            clearInterval(interval);
+            reject(new Error(`timed out waiting for ${file}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          }
+        }, 25);
+      });
+    }
+    function writeCommand(command) {
+      child.stdin.write(`${JSON.stringify(command)}\n`);
+    }
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      pending += chunk;
+      while (pending.includes('\n')) {
+        const newline = pending.indexOf('\n');
+        const rawLine = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (rawLine.trim().length === 0) continue;
+        try {
+          const line = JSON.parse(rawLine);
+          lines.push(line);
+          resolveWaiters(line);
+        } catch (error) {
+          failWaiters(new Error(`failed to parse active extension ${kind} RPC JSON line: ${rawLine}\n${error.message}`));
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const exitPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`active extension ${kind} queue smoke timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      }, 9000);
+      child.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once('exit', (code, signal) => {
+        clearTimeout(timeout);
+        if (code !== 0) {
+          reject(new Error(`active extension ${kind} queue smoke exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          return;
+        }
+        resolve();
+      });
+    });
+
+    writeCommand({ id: `rpc-active-${kind}-model`, type: 'set_model', provider: 'openai', modelId: 'gpt-4o' });
+    await waitForLine((line) => line.id === `rpc-active-${kind}-model` && line.success === true);
+    writeCommand({ id: `rpc-active-${kind}-prompt`, type: 'prompt', message: `rpc active extension ${kind} start` });
+    await waitForFile(markerFile);
+    writeCommand({
+      id: `rpc-active-${kind}-user-command`,
+      type: rpcCommand,
+      message: isFollow
+        ? '/send-user-follow-active /write-marker active raw follow'
+        : '/send-user-steer-active /write-marker active raw steer'
+    });
+    const userCommandResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-user-command`, 1000);
+    writeCommand({
+      id: `rpc-active-${kind}-custom-command`,
+      type: rpcCommand,
+      message: isFollow
+        ? '/send-custom-follow-active rpc active custom follow'
+        : '/send-custom-steer-active rpc active custom steer'
+    });
+    const customCommandResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-custom-command`, 1000);
+    fs.writeFileSync(releaseFile, 'release');
+    const promptResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-prompt`, 5000);
+    writeCommand({ id: `rpc-active-${kind}-messages`, type: 'get_messages' });
+    const messagesResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-messages`, 2500);
+    child.stdin.end();
+    await exitPromise;
+
+    const messages = messagesResponse?.data?.messages ?? [];
+    const assistantTexts = messages.filter((message) => message.role === 'assistant').map((message) => message.content);
+    const rawUserText = isFollow ? '/write-marker active raw follow' : '/write-marker active raw steer';
+    const customType = isFollow ? 'active-follow-extension' : 'active-steer-extension';
+    const customText = isFollow ? 'rpc active custom follow' : 'rpc active custom steer';
+    const sessionText = fs.readFileSync(sessionFile, 'utf8');
+    const followBaseIndex = assistantTexts.indexOf('rpc active extension follow base complete');
+    const followObservedIndex = assistantTexts.indexOf('rpc active extension follow observed');
+    if (
+      !userCommandResponse?.success ||
+      !customCommandResponse?.success ||
+      customCommandResponse?.data?.pendingMessageCount !== 2 ||
+      customCommandResponse?.data?.steeringCount !== (isFollow ? 0 : 2) ||
+      customCommandResponse?.data?.followUpCount !== (isFollow ? 2 : 0) ||
+      promptResponse?.data?.text !== `rpc active extension ${kind} observed` ||
+      !messages.some((message) => message.role === 'user' && message.content === rawUserText) ||
+      !messages.some((message) => message.role === 'custom' && message.customType === customType && message.content === customText && message.display === true) ||
+      messages.some((message) => typeof message.content === 'string' && message.content.includes(`/send-user-${isFollow ? 'follow' : 'steer'}-active`)) ||
+      messages.some((message) => typeof message.content === 'string' && message.content.includes(`/send-custom-${isFollow ? 'follow' : 'steer'}-active`)) ||
+      !sessionText.includes('"type":"custom_message"') ||
+      !sessionText.includes(`"customType":"${customType}"`) ||
+      (isFollow && (followBaseIndex === -1 || followObservedIndex === -1 || followBaseIndex > followObservedIndex))
+    ) {
+      throw new Error(`active extension ${kind} queue smoke failed\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+  }
+
   const rpcExtensionHookFixture = path.resolve('zig-out/pi-zig-rpc-extension-hook-fixture');
   fs.rmSync(rpcExtensionHookFixture, { recursive: true, force: true });
   fs.mkdirSync(rpcExtensionHookFixture, { recursive: true });
@@ -6567,6 +6827,8 @@ export default function(pi) {
 
   await runRpcRetryAbortDelaySmoke();
   await runRpcProviderAbortInFlightSmoke();
+  await runRpcProviderActiveExtensionQueueSmoke('steer');
+  await runRpcProviderActiveExtensionQueueSmoke('follow');
 
   const rpcProviderOutput = run(
     ['rpc', rpcProviderSessionFile],

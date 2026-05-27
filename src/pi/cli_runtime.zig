@@ -455,14 +455,14 @@ fn runTopLevelRegisteredCommand(
     for (result.actions) |action| {
         if (command_prompt != null) return error.MultipleCommandPromptActionsUnsupported;
         switch (action) {
-            .send_user_message => |content| {
+            .send_user_message => |user_message| {
                 command_prompt = .{
-                    .content = try allocator.dupe(u8, content),
+                    .content = try allocator.dupe(u8, user_message.content),
                     .persist_user_message = true,
                 };
             },
             .send_message => |custom_message| {
-                if (custom_message.next_turn) return error.UnsupportedCommandActionNextTurn;
+                if (custom_message.deliver_as != null and custom_message.deliver_as.? == .next_turn) return error.UnsupportedCommandActionNextTurn;
                 if (store == null) store = try maybeOpenStore(io, allocator, env, parsed);
                 if (store) |*persistent| {
                     _ = try persistent.appendCustomMessage(
