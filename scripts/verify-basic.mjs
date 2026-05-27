@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -10057,6 +10057,46 @@ if (
   flow07MarkEntries[1]?.data?.marks !== 1
 ) {
   throw new Error('flow07 command-context appendEntry did not persist accumulating durable session state');
+}
+
+// ===== FLOW 10: tui =====
+// The interactive TUI requires a real terminal. Under the smoke harness stdin is
+// a pipe (non-TTY), so the entrypoint must take the non-interactive fallback:
+// emit a "requires a terminal" notice to stderr, fall back to the top-level help
+// on stdout, and exit cleanly (status 0) without blocking on stdin. (Live
+// interactive behavior — prompt composer, slash commands, streaming, tool panels,
+// permission dialogs, and abort — is proven by the pty transcript artifacts under
+// zig-out/tui-artifacts produced during development.)
+function runTuiCapture(args) {
+  // Capture stdout and stderr separately with an empty (pipe, non-TTY) stdin.
+  const result = spawnSync(bin, args, { encoding: 'utf8', input: '' });
+  if (result.error) throw result.error;
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+}
+
+{
+  const tuiNoArgs = runTuiCapture([]);
+  if (tuiNoArgs.status !== 0) {
+    throw new Error(`tui no-arg non-tty smoke expected clean exit, got ${tuiNoArgs.status}`);
+  }
+  if (!tuiNoArgs.stderr.includes('interactive TUI requires a terminal')) {
+    throw new Error('tui no-arg non-tty smoke did not emit the terminal-required notice on stderr');
+  }
+  if (!tuiNoArgs.stdout.includes('pi-zig - Zig + Preact port of earendil-works/pi')) {
+    throw new Error('tui no-arg non-tty smoke did not fall back to top-level help on stdout');
+  }
+
+  // With a provider/model configured but no prompt, the same non-tty fallback applies.
+  const tuiWithProvider = runTuiCapture(['--provider', 'openai', '--model', 'gpt-4o']);
+  if (!tuiWithProvider.stderr.includes('interactive TUI requires a terminal')) {
+    throw new Error('tui provider non-tty smoke did not emit the terminal-required notice');
+  }
+
+  // A prompt-mode invocation must NOT be diverted into the interactive path.
+  const tuiPrintMode = runTuiCapture(['-p', 'tui print mode bypass check']);
+  if (tuiPrintMode.stderr.includes('interactive TUI requires a terminal')) {
+    throw new Error('tui print-mode bypass smoke incorrectly entered the interactive path');
+  }
 }
 
 console.log('basic pi-zig smokes passed');

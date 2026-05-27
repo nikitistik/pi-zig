@@ -14,6 +14,7 @@ const session = @import("session.zig");
 const settings = @import("settings.zig");
 const system_prompt = @import("system_prompt.zig");
 const tools = @import("tools.zig");
+const tui = @import("tui.zig");
 
 const all_tool_names = [_][]const u8{ "read", "bash", "edit", "write", "grep", "find", "ls" };
 
@@ -136,8 +137,7 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     defer prompt.deinit(init.gpa);
 
     if (prompt.text.len == 0 and !parsed.print and parsed.messages_len == 0 and parsed.file_args_len == 0 and stdin_content == null) {
-        try writeStderr(init.io, "pi-zig interactive TUI mode is not implemented yet. Use -p, --mode json, or --mode rpc for the current foundation runtime.\n");
-        return writeTopLevelHelp(init.io);
+        return runInteractive(init, parsed);
     }
 
     return switch (mode) {
@@ -145,6 +145,202 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         .text => runTextPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text, prompt.image_parts),
         .rpc => unreachable,
     };
+}
+
+// =====================================================================
+// Interactive TUI entrypoint
+// =====================================================================
+
+/// Boot the interactive TUI. When stdin is not a TTY (pipes, CI, the
+/// verify-basic smokes) the loop reports `.not_a_tty`; we then fall back to the
+/// previous foundation guidance so non-interactive contracts are unchanged.
+fn runInteractive(init: std.process.Init, parsed: cli.ParsedArgs) !void {
+    var app = try tui.App.init(init.gpa, init.io, .{
+        .provider = parsed.provider,
+        .model = parsed.model,
+        .interactive = true,
+    });
+    defer app.deinit();
+
+    // Wire a provider-backed prompt runner when a provider+model are configured.
+    var runner_ctx = InteractivePromptRunner{
+        .io = init.io,
+        .allocator = init.gpa,
+        .env = init.environ_map,
+        .parsed = parsed,
+    };
+    if (parsed.provider != null and parsed.model != null) {
+        app.runner = .{ .ctx = &runner_ctx, .run = InteractivePromptRunner.run };
+    }
+
+    const reason = try app.run();
+    switch (reason) {
+        .user_quit, .eof => return,
+        .not_a_tty => {
+            try writeStderr(init.io, "pi-zig interactive TUI requires a terminal. Use -p, --mode json, or --mode rpc in non-interactive contexts.\n");
+            return writeTopLevelHelp(init.io);
+        },
+    }
+}
+
+/// Bridges the TUI prompt-runner seam to the existing agent runtime. Holds the
+/// context `buildPrintResponse` needs and adapts agent streaming/permission
+/// callbacks onto the TUI `PromptCallbacks`.
+const InteractivePromptRunner = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+    callbacks: tui.PromptCallbacks = undefined,
+    /// Extension hook runner, when extensions are loaded. The agent shares one
+    /// tool-hook context, so the runner chains the extension hooks with its own
+    /// permission gate.
+    extension_hooks: ?*extension_runner.Runner = null,
+
+    fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, prompt: []const u8, callbacks: tui.PromptCallbacks) anyerror![]u8 {
+        const self: *InteractivePromptRunner = @ptrCast(@alignCast(ctx_ptr));
+        self.callbacks = callbacks;
+
+        const result = try interactiveBuildResponse(
+            self.io,
+            allocator,
+            self.env,
+            self.parsed,
+            prompt,
+            self,
+        );
+        defer result.deinit(allocator);
+        return allocator.dupe(u8, result.final_text);
+    }
+
+    fn onTextDelta(ctx_ptr: *anyopaque, delta: []const u8) anyerror!void {
+        const self: *InteractivePromptRunner = @ptrCast(@alignCast(ctx_ptr));
+        if (self.callbacks.on_text) |cb| try cb(self.callbacks.ctx, delta);
+    }
+
+    fn onToolEnd(ctx_ptr: *anyopaque, tool_result: agent.ToolResult) anyerror!void {
+        const self: *InteractivePromptRunner = @ptrCast(@alignCast(ctx_ptr));
+        if (self.callbacks.on_tool_result) |cb| {
+            try cb(self.callbacks.ctx, tool_result.tool_name, tool_result.content, tool_result.is_error);
+        }
+    }
+
+    fn shouldCancel(ctx_ptr: *anyopaque) bool {
+        const self: *InteractivePromptRunner = @ptrCast(@alignCast(ctx_ptr));
+        if (self.callbacks.should_cancel) |cb| return cb(self.callbacks.ctx);
+        return false;
+    }
+
+    fn beforeToolCall(ctx_ptr: *anyopaque, call: ai_client.ChatToolCall) anyerror!agent.BeforeToolCallResult {
+        const self: *InteractivePromptRunner = @ptrCast(@alignCast(ctx_ptr));
+
+        // Extension tool-call hook first (may block or rewrite arguments).
+        var effective_call = call;
+        var ext_result: agent.BeforeToolCallResult = .{};
+        if (self.extension_hooks) |hooks| {
+            ext_result = try extension_runner.Runner.beforeToolCall(hooks, call);
+            if (ext_result.block) return ext_result;
+            if (ext_result.arguments_json) |args| effective_call.arguments_json = args;
+        }
+
+        // Then the TUI permission prompt.
+        if (self.callbacks.on_tool_permission) |cb| {
+            const decision = try cb(self.callbacks.ctx, effective_call.name, effective_call.arguments_json);
+            if (decision == .deny) {
+                ext_result.deinit(self.allocator);
+                return .{ .block = true, .reason = try self.allocator.dupe(u8, "User denied tool execution.") };
+            }
+        }
+        return ext_result;
+    }
+
+    fn afterToolCall(
+        ctx_ptr: *anyopaque,
+        call: ai_client.ChatToolCall,
+        result: agent.ToolResult,
+    ) anyerror!agent.AfterToolCallResult {
+        const self: *InteractivePromptRunner = @ptrCast(@alignCast(ctx_ptr));
+        if (self.extension_hooks) |hooks| {
+            return extension_runner.Runner.afterToolCall(hooks, call, result);
+        }
+        return .{};
+    }
+};
+
+/// Mirror of `buildPrintResponse` for the interactive loop: same provider/auth/
+/// extension setup, but routes agent streaming, tool-end, cancellation, and a
+/// permission gate through the `InteractivePromptRunner`.
+fn interactiveBuildResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+    prompt: []const u8,
+    runner: *InteractivePromptRunner,
+) !agent.RunResult {
+    const provider = parsed.provider.?;
+    const model = parsed.model.?;
+    const api_key = if (parsed.api_key) |key|
+        try allocator.dupe(u8, key)
+    else
+        try auth.resolveProviderApiKey(io, allocator, env, provider) orelse return error.ProviderAuthMissing;
+    defer allocator.free(api_key);
+
+    const runtime_system_prompt = try buildRuntimeSystemPrompt(io, allocator, env, parsed);
+    defer allocator.free(runtime_system_prompt);
+    const shell_settings = try settings.loadShellSettings(io, allocator, env);
+    defer shell_settings.deinit(allocator);
+
+    // Discover extension tools so the TUI can execute registered extension tools
+    // (and run extension tool-call hooks) mid-conversation, mirroring the
+    // print-mode wiring in buildPrintResponse.
+    var runtime_extensions = try discoverRuntimeExtensionPaths(io, allocator, env, parsed);
+    defer runtime_extensions.deinit(allocator);
+    const extension_flag_values = try extensionFlagValuesFromParsed(allocator, parsed);
+    defer if (extension_flag_values.len > 0) allocator.free(extension_flag_values);
+    var hooks = extension_runner.Runner{
+        .io = io,
+        .allocator = allocator,
+        .extension_paths = runtime_extensions.paths,
+        .flag_values = extension_flag_values,
+    };
+    const has_extension_hooks = hooks.hasExtensions();
+    var extension_tool_definitions: []ai_client.ChatToolDefinition = if (has_extension_hooks)
+        try hooks.discoverToolDefinitions()
+    else
+        &.{};
+    extension_tool_definitions = try filterExtensionToolDefinitions(allocator, parsed, extension_tool_definitions);
+    defer if (extension_tool_definitions.len > 0) hooks.deinitToolDefinitions(extension_tool_definitions);
+
+    // The agent invokes a single before_tool_call hook. The TUI needs its
+    // permission gate AND extension hooks need their tool_call rewrite, so the
+    // runner chains them: extension hook first, then the TUI permission prompt.
+    runner.extension_hooks = if (has_extension_hooks) &hooks else null;
+
+    return agent.runPrompt(io, allocator, env, .{
+        .provider = provider,
+        .model = model,
+        .api_key = api_key,
+        .prompt = prompt,
+        .system_prompt = runtime_system_prompt,
+        .env = env,
+        .shell_path = shell_settings.shell_path,
+        .shell_command_prefix = shell_settings.shell_command_prefix,
+        .tool_set = toolSetFromParsed(parsed),
+        .custom_tools = extension_tool_definitions,
+        .custom_tool_context = if (extension_tool_definitions.len > 0) &hooks else null,
+        .execute_custom_tool = if (extension_tool_definitions.len > 0) extension_runner.Runner.executeRegisteredTool else null,
+        .stream_turns = true,
+        .text_event_context = runner,
+        .on_text_delta = InteractivePromptRunner.onTextDelta,
+        .tool_event_context = runner,
+        .on_tool_end = InteractivePromptRunner.onToolEnd,
+        .tool_hook_context = runner,
+        .before_tool_call = InteractivePromptRunner.beforeToolCall,
+        .after_tool_call = if (has_extension_hooks) InteractivePromptRunner.afterToolCall else null,
+        .cancellation_context = runner,
+        .should_cancel = InteractivePromptRunner.shouldCancel,
+    });
 }
 
 pub fn writeTopLevelHelp(io: std.Io) !void {

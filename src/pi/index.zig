@@ -18,6 +18,12 @@ pub const settings = @import("settings.zig");
 pub const system_prompt = @import("system_prompt.zig");
 pub const themes = @import("themes.zig");
 pub const tools = @import("tools.zig");
+pub const tui = @import("tui.zig");
+pub const tui_editor = @import("tui_editor.zig");
+pub const tui_fuzzy = @import("tui_fuzzy.zig");
+pub const tui_keys = @import("tui_keys.zig");
+pub const tui_render = @import("tui_render.zig");
+pub const tui_terminal = @import("tui_terminal.zig");
 pub const types = @import("types.zig");
 pub const upstream = @import("upstream.zig");
 
@@ -42,6 +48,12 @@ test {
     _ = system_prompt;
     _ = themes;
     _ = tools;
+    _ = tui;
+    _ = tui_editor;
+    _ = tui_fuzzy;
+    _ = tui_keys;
+    _ = tui_render;
+    _ = tui_terminal;
     _ = types;
     _ = upstream;
 }
