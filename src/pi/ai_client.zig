@@ -1112,15 +1112,29 @@ fn googleVertexAuthHeader(
     env: *const std.process.Environ.Map,
     api_key: []const u8,
 ) !GoogleVertexAuthHeader {
+    if (isGoogleVertexOAuthAccessToken(api_key)) {
+        return .{ .authorization = try googleVertexBearerHeader(allocator, api_key) };
+    }
     if (!isGoogleVertexPlaceholderApiKey(api_key)) {
         return .{ .api_key = api_key };
     }
     if (env.get("GOOGLE_CLOUD_ACCESS_TOKEN")) |access_token| {
-        if (access_token.len > 0) {
-            return .{ .authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token}) };
+        const trimmed = std.mem.trim(u8, access_token, " \t\r\n");
+        if (trimmed.len > 0) {
+            return .{ .authorization = try googleVertexBearerHeader(allocator, trimmed) };
         }
     }
     return error.ProviderClientError;
+}
+
+fn googleVertexBearerHeader(allocator: std.mem.Allocator, access_token: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, access_token, " \t\r\n");
+    return std.fmt.allocPrint(allocator, "Bearer {s}", .{trimmed});
+}
+
+fn isGoogleVertexOAuthAccessToken(api_key: []const u8) bool {
+    const trimmed = std.mem.trim(u8, api_key, " \t\r\n");
+    return std.mem.startsWith(u8, trimmed, "ya29.");
 }
 
 fn isGoogleVertexPlaceholderApiKey(api_key: []const u8) bool {
@@ -4300,6 +4314,11 @@ test "Google Vertex auth uses API key or explicit access token for placeholders"
     defer bearer_auth.deinit(std.testing.allocator);
     try std.testing.expect(bearer_auth.api_key == null);
     try std.testing.expectEqualStrings("Bearer ya29.vertex-token", bearer_auth.authorization.?);
+
+    var oauth_auth = try googleVertexAuthHeader(std.testing.allocator, &env, "ya29.stored-oauth-token");
+    defer oauth_auth.deinit(std.testing.allocator);
+    try std.testing.expect(oauth_auth.api_key == null);
+    try std.testing.expectEqualStrings("Bearer ya29.stored-oauth-token", oauth_auth.authorization.?);
 }
 
 test "Mistral provider base URL appends chat completions endpoint once" {

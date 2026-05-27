@@ -29,6 +29,30 @@ pub const ShellSettings = struct {
     }
 };
 
+pub const RetrySettings = struct {
+    enabled: bool = true,
+    max_retries: usize = 3,
+    base_delay_ms: usize = 2_000,
+};
+
+pub fn loadRetrySettings(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !RetrySettings {
+    const cwd = try currentPathOwned(io, allocator);
+    defer allocator.free(cwd);
+    const paths = try settingsPaths(allocator, env, cwd);
+    defer paths.deinit(allocator);
+
+    var global = try loadSettings(io, allocator, paths.global);
+    defer global.deinit();
+    var project = try loadSettings(io, allocator, paths.project);
+    defer project.deinit();
+
+    return .{
+        .enabled = nestedBool(project.parsed.value, &.{ "retry", "enabled" }) orelse nestedBool(global.parsed.value, &.{ "retry", "enabled" }) orelse true,
+        .max_retries = positiveUsize(numberAt(project.parsed.value, &.{ "retry", "maxRetries" })) orelse positiveUsize(numberAt(global.parsed.value, &.{ "retry", "maxRetries" })) orelse 3,
+        .base_delay_ms = positiveUsize(numberAt(project.parsed.value, &.{ "retry", "baseDelayMs" })) orelse positiveUsize(numberAt(global.parsed.value, &.{ "retry", "baseDelayMs" })) orelse 2_000,
+    };
+}
+
 pub fn loadShellSettings(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !ShellSettings {
     const cwd = try currentPathOwned(io, allocator);
     defer allocator.free(cwd);
@@ -513,6 +537,12 @@ fn nestedBool(value: std.json.Value, path: []const []const u8) ?bool {
 fn numberAt(value: std.json.Value, path: []const []const u8) ?i64 {
     const found = nestedValue(value, path) orelse return null;
     return numberToI64(found);
+}
+
+fn positiveUsize(value: ?i64) ?usize {
+    const number = value orelse return null;
+    if (number < 0) return null;
+    return @intCast(number);
 }
 
 fn nestedObjectValue(value: std.json.Value, path: []const []const u8) ?std.json.Value {

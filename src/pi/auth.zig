@@ -484,6 +484,9 @@ fn hasAmbientProviderAuth(env: *const std.process.Environ.Map, provider: []const
     if (std.mem.eql(u8, provider, "google-vertex")) {
         const has_project = hasAnyEnv(env, &.{ "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT" });
         const has_location = hasAnyEnv(env, &.{"GOOGLE_CLOUD_LOCATION"});
+        if (has_project and has_location and hasAnyEnv(env, &.{"GOOGLE_CLOUD_ACCESS_TOKEN"})) {
+            return "GOOGLE_CLOUD_ACCESS_TOKEN";
+        }
         if (has_project and has_location and hasAnyEnv(env, &.{"GOOGLE_APPLICATION_CREDENTIALS"})) {
             return "GOOGLE_APPLICATION_CREDENTIALS";
         }
@@ -630,4 +633,40 @@ test "provider env map participates in auth status" {
     try std.testing.expect(!status.configured);
     try std.testing.expectEqualStrings("environment", status.source.?);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", status.label.?);
+}
+
+test "Google Vertex access token participates in ambient auth status" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GOOGLE_CLOUD_PROJECT", "test-project");
+    try env.put("GOOGLE_CLOUD_LOCATION", "us-central1");
+    try env.put("GOOGLE_CLOUD_ACCESS_TOKEN", "ya29.vertex-token");
+    const value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer value.deinit();
+
+    const status = authStatus(&env, value.value, "google-vertex");
+    try std.testing.expect(status.has_auth);
+    try std.testing.expect(!status.configured);
+    try std.testing.expectEqualStrings("environment", status.source.?);
+    try std.testing.expectEqualStrings("GOOGLE_CLOUD_ACCESS_TOKEN", status.label.?);
+
+    const resolved = try resolveApiKey(std.testing.io, std.testing.allocator, &env, value.value, "google-vertex");
+    defer if (resolved) |api_key| std.testing.allocator.free(api_key);
+    try std.testing.expectEqualStrings("<authenticated>", resolved.?);
+}
+
+test "stored Google Vertex OAuth resolves to access token for bearer routing" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    const value = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"google-vertex\":{\"type\":\"oauth\",\"access\":\"ya29.stored-oauth-token\",\"refresh\":\"refresh-token\",\"expires\":4102444800000}}",
+        .{},
+    );
+    defer value.deinit();
+
+    const resolved = try resolveApiKey(std.testing.io, std.testing.allocator, &env, value.value, "google-vertex");
+    defer if (resolved) |api_key| std.testing.allocator.free(api_key);
+    try std.testing.expectEqualStrings("ya29.stored-oauth-token", resolved.?);
 }

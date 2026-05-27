@@ -1705,6 +1705,23 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
       return;
     }
+    if (user.includes('json retry transient')) {
+      const count = (requestCounts.get(user) ?? 0) + 1;
+      requestCounts.set(user, count);
+      if (count === 1) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'temporary json provider failure' }));
+        return;
+      }
+      const content = user.includes('tool-capable') ? 'json retry tool-capable recovered' : 'json retry stream recovered';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
     if (user.includes('rpc retry transient')) {
       const count = (requestCounts.get(user) ?? 0) + 1;
       requestCounts.set(user, count);
@@ -3544,6 +3561,7 @@ try {
   const providerRuntimeAgentDir = path.resolve('zig-out/pi-zig-provider-runtime-agent');
   fs.rmSync(providerRuntimeAgentDir, { recursive: true, force: true });
   fs.mkdirSync(providerRuntimeAgentDir, { recursive: true });
+  fs.writeFileSync(path.join(providerRuntimeAgentDir, 'settings.json'), JSON.stringify({ retry: { enabled: true, maxRetries: 2, baseDelayMs: 0 } }));
   const providerEnv = {
     ...process.env,
     OPENAI_API_KEY: 'fake-provider-key',
@@ -3771,6 +3789,65 @@ export default function(pi: any): void {
   ) {
     throw new Error('top-level JSON mode smoke did not stream provider text deltas');
   }
+
+  const assertJsonRetryEvents = (lines, label, expectedDelta) => {
+    const summary = lines
+      .filter((line) => ['agent_end', 'auto_retry_start', 'auto_retry_end'].includes(line.type))
+      .map((line) => {
+        if (line.type === 'agent_end') return `agent_end:${line.willRetry}`;
+        if (line.type === 'auto_retry_start') return `auto_retry_start:${line.attempt}:${line.maxAttempts}:${line.delayMs}:${line.errorMessage}`;
+        return `auto_retry_end:${line.success}:${line.attempt}:${line.finalError ?? ''}`;
+      });
+    if (
+      JSON.stringify(summary) !== JSON.stringify([
+        'agent_end:true',
+        'auto_retry_start:1:2:0:ProviderRequestFailed',
+        'auto_retry_end:true:1:',
+        'agent_end:false'
+      ]) ||
+      !lines.some((line) => line.type === 'message_update' && line.assistantMessageEvent?.delta === expectedDelta)
+    ) {
+      throw new Error(label + ' did not emit upstream-shaped JSON retry events');
+    }
+    const failedAgentEndIndex = lines.findIndex((line) => line.type === 'agent_end' && line.willRetry === true);
+    const retryStartIndex = lines.findIndex((line) => line.type === 'auto_retry_start');
+    const finalMessageEndIndex = lines.findIndex((line) => line.type === 'message_end' && JSON.stringify(line.message).includes(expectedDelta));
+    const retryEndIndex = lines.findIndex((line) => line.type === 'auto_retry_end' && line.success === true);
+    const finalTurnEndIndex = lines.findIndex((line) => line.type === 'turn_end' && JSON.stringify(line.message).includes(expectedDelta));
+    const finalAgentEndIndex = lines.findIndex((line) => line.type === 'agent_end' && line.willRetry === false);
+    if (
+      !(failedAgentEndIndex >= 0 &&
+        failedAgentEndIndex < retryStartIndex &&
+        retryStartIndex < finalMessageEndIndex &&
+        finalMessageEndIndex < retryEndIndex &&
+        retryEndIndex < finalTurnEndIndex &&
+        finalTurnEndIndex < finalAgentEndIndex)
+    ) {
+      throw new Error(label + ' JSON retry event order regressed');
+    }
+  };
+
+  const providerJsonRetryStreamLines = run(
+    ['--mode', 'json', '--no-session', '--no-tools', '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json retry transient stream'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assertJsonRetryEvents(providerJsonRetryStreamLines, 'top-level JSON text-stream retry', 'json retry stream recovered');
+
+  const providerJsonRetryToolLines = run(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json retry transient tool-capable'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assertJsonRetryEvents(providerJsonRetryToolLines, 'top-level JSON tool-capable retry', 'json retry tool-capable recovered');
 
   const assertJsonProviderErrorLifecycle = (lines, label) => {
     const assistantStartCount = lines.filter((line) => line.type === 'message_start' && line.message?.role === 'assistant').length;

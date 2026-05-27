@@ -232,43 +232,68 @@ fn runJsonPrintFoundation(
         .allocator = allocator,
         .final_text = &streamed_final_text,
     };
+    const retry_settings = try settings.loadRetrySettings(io, allocator, env);
+    var retry_attempts: usize = 0;
 
-    const response = buildPrintResponse(
-        io,
-        allocator,
-        env,
-        parsed,
-        prompt,
-        image_parts,
-        true,
-        &tool_event_context,
-        handleJsonToolStart,
-        handleJsonToolUpdate,
-        handleJsonToolEnd,
-        &tool_event_context,
-        handleJsonAgentTextDelta,
-    ) catch |err| {
-        const status = assistantStatusForError(err);
-        if (store) |*persistent| {
-            try appendJsonAssistantStatusMessage(
+    const response = retry_build: while (true) {
+        const result = buildPrintResponse(
+            io,
+            allocator,
+            env,
+            parsed,
+            prompt,
+            image_parts,
+            true,
+            &tool_event_context,
+            handleJsonToolStart,
+            handleJsonToolUpdate,
+            handleJsonToolEnd,
+            &tool_event_context,
+            handleJsonAgentTextDelta,
+        ) catch |err| {
+            if (shouldRetryJsonProviderError(retry_settings, retry_attempts, err, !tool_event_context.assistant_started and streamed_final_text.written().len == 0)) {
+                retry_attempts += 1;
+                const delay_ms = jsonRetryDelayMs(retry_settings, retry_attempts);
+                try emitJsonAssistantStatusLifecycle(
+                    io,
+                    allocator,
+                    streamed_final_text.written(),
+                    "error",
+                    @errorName(err),
+                    !tool_event_context.assistant_started,
+                    true,
+                );
+                try emitJsonAutoRetryStart(io, allocator, retry_attempts, retry_settings.max_retries, delay_ms, @errorName(err));
+                try sleepMilliseconds(io, delay_ms);
+                continue;
+            }
+            const status = assistantStatusForError(err);
+            if (store) |*persistent| {
+                try appendJsonAssistantStatusMessage(
+                    io,
+                    allocator,
+                    persistent,
+                    parsed,
+                    streamed_final_text.written(),
+                    status.stop_reason,
+                    status.error_message,
+                );
+            }
+            try emitJsonAssistantStatusLifecycle(
                 io,
                 allocator,
-                persistent,
-                parsed,
                 streamed_final_text.written(),
                 status.stop_reason,
                 status.error_message,
+                !tool_event_context.assistant_started,
+                false,
             );
-        }
-        try emitJsonAssistantStatusLifecycle(
-            io,
-            allocator,
-            streamed_final_text.written(),
-            status.stop_reason,
-            status.error_message,
-            !tool_event_context.assistant_started,
-        );
-        return err;
+            if (retry_attempts > 0) {
+                try emitJsonAutoRetryEnd(io, allocator, false, retry_attempts, @errorName(err));
+            }
+            return err;
+        };
+        break :retry_build result;
     };
     defer response.deinit(allocator);
 
@@ -291,6 +316,10 @@ fn runJsonPrintFoundation(
     try w.writeAll("{\"type\":\"message_end\",\"message\":");
     try writeAssistantMessageJson(w, response.final_text);
     try w.writeAll("}\n");
+    if (retry_attempts > 0) {
+        try writeJsonAutoRetryEnd(w, true, retry_attempts, null);
+        try w.writeByte('\n');
+    }
     try w.writeAll("{\"type\":\"turn_end\",\"message\":");
     try writeAssistantMessageJson(w, response.final_text);
     try w.writeAll(",\"toolResults\":[");
@@ -301,7 +330,7 @@ fn runJsonPrintFoundation(
     try w.writeAll("]}\n");
     try w.writeAll("{\"type\":\"agent_end\",\"messages\":[");
     try writeAssistantMessageJson(w, response.final_text);
-    try w.writeAll("]}\n");
+    try w.writeAll("],\"willRetry\":false}\n");
     try w.flush();
 }
 
@@ -359,36 +388,61 @@ fn runJsonProviderTextStream(
         .allocator = allocator,
         .final_text = &final_text,
     };
+    const retry_settings = try settings.loadRetrySettings(io, allocator, env);
+    var retry_attempts: usize = 0;
 
-    ai_client.streamChatTurnText(io, allocator, env, .{
-        .provider = provider,
-        .model = model,
-        .api_key = api_key,
-        .messages = messages_buf[0..messages_len],
-        .tools = &.{},
-    }, &stream_context, handleJsonStreamTextDelta) catch |err| {
-        const status = assistantStatusForError(err);
-        if (store) |*persistent| {
-            try appendJsonAssistantStatusMessage(
+    while (true) {
+        ai_client.streamChatTurnText(io, allocator, env, .{
+            .provider = provider,
+            .model = model,
+            .api_key = api_key,
+            .messages = messages_buf[0..messages_len],
+            .tools = &.{},
+        }, &stream_context, handleJsonStreamTextDelta) catch |err| {
+            if (shouldRetryJsonProviderError(retry_settings, retry_attempts, err, !stream_context.assistant_started and final_text.written().len == 0)) {
+                retry_attempts += 1;
+                const delay_ms = jsonRetryDelayMs(retry_settings, retry_attempts);
+                try emitJsonAssistantStatusLifecycle(
+                    io,
+                    allocator,
+                    final_text.written(),
+                    "error",
+                    @errorName(err),
+                    !stream_context.assistant_started,
+                    true,
+                );
+                try emitJsonAutoRetryStart(io, allocator, retry_attempts, retry_settings.max_retries, delay_ms, @errorName(err));
+                try sleepMilliseconds(io, delay_ms);
+                continue;
+            }
+            const status = assistantStatusForError(err);
+            if (store) |*persistent| {
+                try appendJsonAssistantStatusMessage(
+                    io,
+                    allocator,
+                    persistent,
+                    parsed,
+                    final_text.written(),
+                    status.stop_reason,
+                    status.error_message,
+                );
+            }
+            try emitJsonAssistantStatusLifecycle(
                 io,
                 allocator,
-                persistent,
-                parsed,
                 final_text.written(),
                 status.stop_reason,
                 status.error_message,
+                !stream_context.assistant_started,
+                false,
             );
-        }
-        try emitJsonAssistantStatusLifecycle(
-            io,
-            allocator,
-            final_text.written(),
-            status.stop_reason,
-            status.error_message,
-            !stream_context.assistant_started,
-        );
-        return err;
-    };
+            if (retry_attempts > 0) {
+                try emitJsonAutoRetryEnd(io, allocator, false, retry_attempts, @errorName(err));
+            }
+            return err;
+        };
+        break;
+    }
 
     if (final_text.written().len == 0) {
         if (store) |*persistent| {
@@ -409,6 +463,7 @@ fn runJsonProviderTextStream(
             "error",
             "ProviderResponseInvalid",
             !stream_context.assistant_started,
+            false,
         );
         return error.ProviderResponseInvalid;
     }
@@ -422,12 +477,16 @@ fn runJsonProviderTextStream(
     try w.writeAll("{\"type\":\"message_end\",\"message\":");
     try writeAssistantMessageJson(w, final_text.written());
     try w.writeAll("}\n");
+    if (retry_attempts > 0) {
+        try writeJsonAutoRetryEnd(w, true, retry_attempts, null);
+        try w.writeByte('\n');
+    }
     try w.writeAll("{\"type\":\"turn_end\",\"message\":");
     try writeAssistantMessageJson(w, final_text.written());
     try w.writeAll(",\"toolResults\":[]}\n");
     try w.writeAll("{\"type\":\"agent_end\",\"messages\":[");
     try writeAssistantMessageJson(w, final_text.written());
-    try w.writeAll("]}\n");
+    try w.writeAll("],\"willRetry\":false}\n");
     try writeStreamingJsonLine(io, allocator, line.written());
 }
 
@@ -441,6 +500,75 @@ fn emitJsonPrelude(io: std.Io, allocator: std.mem.Allocator, session_id: []const
     try w.writeAll("{\"type\":\"agent_start\"}\n");
     try w.writeAll("{\"type\":\"turn_start\"}\n");
     try writeStreamingJsonLine(io, allocator, line.written());
+}
+
+fn shouldRetryJsonProviderError(retry_settings: settings.RetrySettings, retry_attempts: usize, err: anyerror, clean_turn: bool) bool {
+    if (!clean_turn) return false;
+    if (!retry_settings.enabled) return false;
+    if (retry_attempts >= retry_settings.max_retries) return false;
+    return err == error.ProviderRequestFailed;
+}
+
+fn jsonRetryDelayMs(retry_settings: settings.RetrySettings, attempt: usize) usize {
+    if (retry_settings.base_delay_ms == 0) return 0;
+    const shift: std.math.Log2Int(usize) = @intCast(@min(attempt - 1, @bitSizeOf(usize) - 2));
+    const multiplier = @as(usize, 1) << shift;
+    return std.math.mul(usize, retry_settings.base_delay_ms, multiplier) catch std.math.maxInt(usize);
+}
+
+fn sleepMilliseconds(io: std.Io, milliseconds: usize) !void {
+    if (milliseconds == 0) return;
+    const bounded = @min(milliseconds, @as(usize, @intCast(std.math.maxInt(i64))));
+    try std.Io.sleep(io, .fromMilliseconds(@intCast(bounded)), .awake);
+}
+
+fn emitJsonAutoRetryStart(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    attempt: usize,
+    max_attempts: usize,
+    delay_ms: usize,
+    error_message: []const u8,
+) !void {
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    try w.writeAll("{\"type\":\"auto_retry_start\",\"attempt\":");
+    try w.print("{d}", .{attempt});
+    try w.writeAll(",\"maxAttempts\":");
+    try w.print("{d}", .{max_attempts});
+    try w.writeAll(",\"delayMs\":");
+    try w.print("{d}", .{delay_ms});
+    try w.writeAll(",\"errorMessage\":");
+    try writeJsonString(w, error_message);
+    try w.writeAll("}\n");
+    try writeStreamingJsonLine(io, allocator, line.written());
+}
+
+fn emitJsonAutoRetryEnd(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    success: bool,
+    attempt: usize,
+    final_error: ?[]const u8,
+) !void {
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    try writeJsonAutoRetryEnd(&line.writer, success, attempt, final_error);
+    try line.writer.writeByte('\n');
+    try writeStreamingJsonLine(io, allocator, line.written());
+}
+
+fn writeJsonAutoRetryEnd(w: *std.Io.Writer, success: bool, attempt: usize, final_error: ?[]const u8) !void {
+    try w.writeAll("{\"type\":\"auto_retry_end\",\"success\":");
+    try w.writeAll(if (success) "true" else "false");
+    try w.writeAll(",\"attempt\":");
+    try w.print("{d}", .{attempt});
+    if (final_error) |message| {
+        try w.writeAll(",\"finalError\":");
+        try writeJsonString(w, message);
+    }
+    try w.writeByte('}');
 }
 
 fn assistantStatusForError(err: anyerror) AssistantStatus {
@@ -485,6 +613,7 @@ fn emitJsonAssistantStatusLifecycle(
     stop_reason: []const u8,
     error_message: ?[]const u8,
     emit_start: bool,
+    will_retry: bool,
 ) !void {
     var line: std.Io.Writer.Allocating = .init(allocator);
     defer line.deinit();
@@ -502,7 +631,9 @@ fn emitJsonAssistantStatusLifecycle(
     try w.writeAll(",\"toolResults\":[]}\n");
     try w.writeAll("{\"type\":\"agent_end\",\"messages\":[");
     try writeAssistantStatusMessageJson(w, text, stop_reason, error_message);
-    try w.writeAll("]}\n");
+    try w.writeAll("],\"willRetry\":");
+    try w.writeAll(if (will_retry) "true" else "false");
+    try w.writeAll("}\n");
     try writeStreamingJsonLine(io, allocator, line.written());
 }
 
