@@ -43,7 +43,10 @@ pub fn resolveProviderApiKey(
 ) !?[]u8 {
     var parsed = try loadAuth(io, allocator, env);
     defer parsed.deinit();
-    return resolveApiKey(io, allocator, env, parsed.value, provider);
+    var refreshed = false;
+    const resolved = try resolveApiKeyMutable(io, allocator, env, &parsed.value, provider, &refreshed);
+    if (refreshed) writeAuth(io, allocator, env, parsed.value) catch {};
+    return resolved;
 }
 
 pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, args: []const []const u8) !bool {
@@ -262,8 +265,10 @@ fn writeStatus(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
 fn resolveCommand(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, provider: []const u8, json: bool) !void {
     var parsed = try loadAuth(io, allocator, env);
     defer parsed.deinit();
-    const resolved = try resolveApiKey(io, allocator, env, parsed.value, provider);
+    var refreshed = false;
+    const resolved = try resolveApiKeyMutable(io, allocator, env, &parsed.value, provider, &refreshed);
     defer if (resolved) |value| allocator.free(value);
+    if (refreshed) writeAuth(io, allocator, env, parsed.value) catch {};
 
     if (json) {
         try writeStdout(io, "{\"provider\":");
@@ -345,14 +350,9 @@ fn removeProvider(io: std.Io, allocator: std.mem.Allocator, env: *const std.proc
 }
 
 fn listOAuthProviders(io: std.Io, json: bool) !void {
-    const ids = [_]struct { id: []const u8, name: []const u8 }{
-        .{ .id = "anthropic", .name = "Anthropic Console OAuth" },
-        .{ .id = "github-copilot", .name = "GitHub Copilot" },
-        .{ .id = "openai-codex", .name = "ChatGPT Plus/Pro (Codex Subscription)" },
-    };
     if (json) {
         try writeStdout(io, "{\"providers\":[");
-        for (ids, 0..) |provider, i| {
+        for (oauth_provider_specs, 0..) |provider, i| {
             if (i != 0) try writeStdout(io, ",");
             try writeStdout(io, "{\"id\":");
             try writeJsonString(io, provider.id);
@@ -363,7 +363,7 @@ fn listOAuthProviders(io: std.Io, json: bool) !void {
         try writeStdout(io, "]}\n");
         return;
     }
-    for (ids) |provider| {
+    for (oauth_provider_specs) |provider| {
         try writeStdout(io, provider.id);
         try writeStdout(io, " - ");
         try writeStdout(io, provider.name);
@@ -398,6 +398,23 @@ fn resolveApiKey(
     root: std.json.Value,
     provider: []const u8,
 ) !?[]u8 {
+    var root_copy = root;
+    return resolveApiKeyMutable(io, allocator, env, &root_copy, provider, null);
+}
+
+/// Resolve a provider API key, optionally refreshing expired OAuth tokens.
+/// When `refreshed_out` is non-null and a refresh succeeds, the parsed `root`
+/// object is updated in place and `refreshed_out.*` is set so the caller can
+/// persist the new credentials back to auth.json.
+fn resolveApiKeyMutable(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    root_ptr: *std.json.Value,
+    provider: []const u8,
+    refreshed_out: ?*bool,
+) !?[]u8 {
+    const root = root_ptr.*;
     if (root == .object) {
         if (root.object.get(provider)) |credential| {
             if (credential == .object) {
@@ -411,13 +428,10 @@ fn resolveApiKey(
                     const access = credential.object.get("access") orelse return null;
                     const expires = credential.object.get("expires") orelse return null;
                     if (access != .string or expires != .integer) return null;
-                    if (expires.integer <= std.Io.Clock.real.now(io).toMilliseconds()) {
-                        try writeStderr(io, "OAuth credential for ");
-                        try writeStderr(io, provider);
-                        try writeStderr(io, " is expired; refresh is not implemented yet.\n");
-                        return null;
+                    if (expires.integer > std.Io.Clock.real.now(io).toMilliseconds()) {
+                        return try allocator.dupe(u8, access.string);
                     }
-                    return try allocator.dupe(u8, access.string);
+                    return resolveExpiredOAuth(io, allocator, env, root_ptr, provider, credential, refreshed_out);
                 }
             }
         }
@@ -427,6 +441,66 @@ fn resolveApiKey(
     }
     if (hasAmbientProviderAuth(env, provider) != null) return try allocator.dupe(u8, "<authenticated>");
     return null;
+}
+
+fn resolveExpiredOAuth(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    root_ptr: *std.json.Value,
+    provider: []const u8,
+    credential: std.json.Value,
+    refreshed_out: ?*bool,
+) !?[]u8 {
+    // Only the disk-backed callers (which pass refreshed_out) may perform a network
+    // refresh and persist the result; the pure resolveApiKey path stays side-effect free.
+    const flag = refreshed_out orelse {
+        try writeStderr(io, "OAuth credential for ");
+        try writeStderr(io, provider);
+        try writeStderr(io, " is expired.\n");
+        return null;
+    };
+
+    if (oauthProviderSpec(provider) == null) {
+        try writeStderr(io, "OAuth credential for ");
+        try writeStderr(io, provider);
+        try writeStderr(io, " is expired and no refresh provider is registered.\n");
+        return null;
+    }
+
+    var refreshed = refreshOAuthCredential(io, allocator, env, provider, credential) catch {
+        try writeStderr(io, "OAuth token refresh failed for ");
+        try writeStderr(io, provider);
+        try writeStderr(io, "; credential preserved for retry.\n");
+        return null;
+    } orelse return null;
+    defer refreshed.deinit(allocator);
+
+    const access_copy = try allocator.dupe(u8, refreshed.access);
+    errdefer allocator.free(access_copy);
+
+    // Update the in-memory credential so the caller can persist it back to auth.json.
+    try updateStoredOAuthCredential(allocator, root_ptr, provider, refreshed);
+    flag.* = true;
+    return access_copy;
+}
+
+fn updateStoredOAuthCredential(
+    allocator: std.mem.Allocator,
+    root_ptr: *std.json.Value,
+    provider: []const u8,
+    refreshed: RefreshedOAuth,
+) !void {
+    if (root_ptr.* != .object) return;
+    var credential: std.json.ObjectMap = .empty;
+    try credential.put(allocator, "type", .{ .string = "oauth" });
+    try credential.put(allocator, "access", .{ .string = try allocator.dupe(u8, refreshed.access) });
+    try credential.put(allocator, "refresh", .{ .string = try allocator.dupe(u8, refreshed.refresh) });
+    try credential.put(allocator, "expires", .{ .integer = refreshed.expires });
+    if (refreshed.account_id) |account_id| {
+        try credential.put(allocator, "accountId", .{ .string = try allocator.dupe(u8, account_id) });
+    }
+    try root_ptr.object.put(allocator, provider, .{ .object = credential });
 }
 
 fn resolveConfigValue(
@@ -461,6 +535,230 @@ fn executeShellConfig(io: std.Io, allocator: std.mem.Allocator, command: []const
     const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
     if (trimmed.len == 0) return null;
     return try allocator.dupe(u8, trimmed);
+}
+
+const max_oauth_response_bytes = 64 * 1024;
+
+const OAuthGrant = enum { post_json, post_form, copilot_bearer };
+
+const OAuthProviderSpec = struct {
+    id: []const u8,
+    name: []const u8,
+    client_id: []const u8,
+    token_url: []const u8,
+    grant: OAuthGrant,
+    /// Subtracted from the absolute expiry to refresh slightly ahead of the deadline.
+    expiry_skew_ms: i64,
+    requires_account_id: bool = false,
+};
+
+// Mirrors upstream BUILT_IN_OAUTH_PROVIDERS (packages/ai/src/utils/oauth/index.ts).
+// Refresh request shapes match the provider modules under utils/oauth/*.ts.
+const oauth_provider_specs = [_]OAuthProviderSpec{
+    .{
+        .id = "anthropic",
+        .name = "Anthropic (Claude Pro/Max)",
+        .client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        .token_url = "https://platform.claude.com/v1/oauth/token",
+        .grant = .post_json,
+        .expiry_skew_ms = 5 * 60 * 1000,
+    },
+    .{
+        .id = "github-copilot",
+        .name = "GitHub Copilot",
+        .client_id = "Iv1.b507a08c87ecfe98",
+        .token_url = "https://api.github.com/copilot_internal/v2/token",
+        .grant = .copilot_bearer,
+        .expiry_skew_ms = 5 * 60 * 1000,
+    },
+    .{
+        .id = "openai-codex",
+        .name = "ChatGPT Plus/Pro (Codex Subscription)",
+        .client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
+        .token_url = "https://auth.openai.com/oauth/token",
+        .grant = .post_form,
+        .expiry_skew_ms = 0,
+        .requires_account_id = true,
+    },
+};
+
+fn oauthProviderSpec(provider: []const u8) ?OAuthProviderSpec {
+    for (oauth_provider_specs) |spec| {
+        if (std.mem.eql(u8, spec.id, provider)) return spec;
+    }
+    return null;
+}
+
+const RefreshedOAuth = struct {
+    access: []u8,
+    refresh: []u8,
+    expires: i64,
+    account_id: ?[]u8 = null,
+
+    fn deinit(self: *RefreshedOAuth, allocator: std.mem.Allocator) void {
+        allocator.free(self.access);
+        allocator.free(self.refresh);
+        if (self.account_id) |value| allocator.free(value);
+    }
+};
+
+/// Refresh an OAuth access token using the provider's documented token endpoint.
+/// Returns freshly allocated credentials, or null when the provider is unknown.
+/// Errors propagate as visible refresh failures (parity with upstream throwing).
+fn refreshOAuthCredential(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    provider: []const u8,
+    credential: std.json.Value,
+) !?RefreshedOAuth {
+    const spec = oauthProviderSpec(provider) orelse return null;
+    if (credential != .object) return error.OAuthRefreshFailed;
+    const refresh_value = credential.object.get("refresh") orelse return error.OAuthRefreshFailed;
+    if (refresh_value != .string) return error.OAuthRefreshFailed;
+    const refresh_token = refresh_value.string;
+
+    // Test/integration override mirrors PI_ZIG_PROVIDER_BASE_URL used by ai_client transports.
+    const token_url = env.get("PI_ZIG_OAUTH_TOKEN_URL") orelse spec.token_url;
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const result = switch (spec.grant) {
+        .post_json => blk: {
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"grant_type\":\"refresh_token\",\"client_id\":\"{s}\",\"refresh_token\":\"{s}\"}}",
+                .{ spec.client_id, refresh_token },
+            );
+            defer allocator.free(payload);
+            break :blk try client.fetch(.{
+                .location = .{ .url = token_url },
+                .method = .POST,
+                .payload = payload,
+                .response_writer = &response_body.writer,
+                .headers = .{
+                    .content_type = .{ .override = "application/json" },
+                    .accept_encoding = .{ .override = "identity" },
+                },
+                .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
+            });
+        },
+        .post_form => blk: {
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "grant_type=refresh_token&refresh_token={s}&client_id={s}",
+                .{ refresh_token, spec.client_id },
+            );
+            defer allocator.free(payload);
+            break :blk try client.fetch(.{
+                .location = .{ .url = token_url },
+                .method = .POST,
+                .payload = payload,
+                .response_writer = &response_body.writer,
+                .headers = .{
+                    .content_type = .{ .override = "application/x-www-form-urlencoded" },
+                    .accept_encoding = .{ .override = "identity" },
+                },
+            });
+        },
+        .copilot_bearer => blk: {
+            const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{refresh_token});
+            defer allocator.free(authorization);
+            break :blk try client.fetch(.{
+                .location = .{ .url = token_url },
+                .method = .GET,
+                .response_writer = &response_body.writer,
+                .headers = .{
+                    .authorization = .{ .override = authorization },
+                    .user_agent = .{ .override = "GitHubCopilotChat/0.35.0" },
+                    .accept_encoding = .{ .override = "identity" },
+                },
+                .extra_headers = &.{
+                    .{ .name = "accept", .value = "application/json" },
+                    .{ .name = "editor-version", .value = "vscode/1.107.0" },
+                    .{ .name = "editor-plugin-version", .value = "copilot-chat/0.35.0" },
+                    .{ .name = "copilot-integration-id", .value = "vscode-chat" },
+                },
+            });
+        },
+    };
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        return error.OAuthRefreshFailed;
+    }
+
+    return try parseRefreshResponse(io, allocator, spec, refresh_token, response_body.written());
+}
+
+fn parseRefreshResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    spec: OAuthProviderSpec,
+    refresh_token: []const u8,
+    body: []const u8,
+) !RefreshedOAuth {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.OAuthRefreshFailed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.OAuthRefreshFailed;
+    const root = parsed.value.object;
+
+    if (spec.grant == .copilot_bearer) {
+        // GitHub Copilot returns {token, expires_at}; the GitHub access token doubles as the refresh token.
+        const token = root.get("token") orelse return error.OAuthRefreshFailed;
+        const expires_at = root.get("expires_at") orelse return error.OAuthRefreshFailed;
+        if (token != .string or expires_at != .integer) return error.OAuthRefreshFailed;
+        return .{
+            .access = try allocator.dupe(u8, token.string),
+            .refresh = try allocator.dupe(u8, refresh_token),
+            .expires = expires_at.integer * 1000 - spec.expiry_skew_ms,
+        };
+    }
+
+    const access = root.get("access_token") orelse return error.OAuthRefreshFailed;
+    const refresh = root.get("refresh_token") orelse return error.OAuthRefreshFailed;
+    const expires_in = root.get("expires_in") orelse return error.OAuthRefreshFailed;
+    if (access != .string or refresh != .string or expires_in != .integer) return error.OAuthRefreshFailed;
+
+    var account_id: ?[]u8 = null;
+    errdefer if (account_id) |value| allocator.free(value);
+    if (spec.requires_account_id) {
+        account_id = (try chatGptAccountIdFromAccessToken(allocator, access.string)) orelse return error.OAuthRefreshFailed;
+    }
+
+    return .{
+        .access = try allocator.dupe(u8, access.string),
+        .refresh = try allocator.dupe(u8, refresh.string),
+        .expires = std.Io.Clock.real.now(io).toMilliseconds() + expires_in.integer * 1000 - spec.expiry_skew_ms,
+        .account_id = account_id,
+    };
+}
+
+/// Extract the chatgpt_account_id claim from an OpenAI Codex JWT access token.
+/// Mirrors upstream getAccountId (packages/ai/src/utils/oauth/openai-codex.ts).
+fn chatGptAccountIdFromAccessToken(allocator: std.mem.Allocator, access_token: []const u8) !?[]u8 {
+    var parts = std.mem.splitScalar(u8, access_token, '.');
+    _ = parts.next() orelse return null;
+    const payload_b64 = parts.next() orelse return null;
+    if (parts.next() == null) return null;
+
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const trimmed = std.mem.trimEnd(u8, payload_b64, "=");
+    const decoded_len = decoder.calcSizeForSlice(trimmed) catch return null;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    decoder.decode(decoded, trimmed) catch return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const auth_claim = parsed.value.object.get("https://api.openai.com/auth") orelse return null;
+    if (auth_claim != .object) return null;
+    const account_id = auth_claim.object.get("chatgpt_account_id") orelse return null;
+    if (account_id != .string or account_id.string.len == 0) return null;
+    return try allocator.dupe(u8, account_id.string);
 }
 
 fn credentialType(value: std.json.Value) ?[]const u8 {
@@ -669,4 +967,109 @@ test "stored Google Vertex OAuth resolves to access token for bearer routing" {
     const resolved = try resolveApiKey(std.testing.io, std.testing.allocator, &env, value.value, "google-vertex");
     defer if (resolved) |api_key| std.testing.allocator.free(api_key);
     try std.testing.expectEqualStrings("ya29.stored-oauth-token", resolved.?);
+}
+
+test "OAuth provider registry matches upstream built-ins" {
+    try std.testing.expectEqual(@as(usize, 3), oauth_provider_specs.len);
+    try std.testing.expectEqualStrings("anthropic", oauthProviderSpec("anthropic").?.id);
+    try std.testing.expectEqualStrings("9d1c250a-e61b-44d9-88ed-5944d1962f5e", oauthProviderSpec("anthropic").?.client_id);
+    try std.testing.expect(oauthProviderSpec("anthropic").?.grant == .post_json);
+    try std.testing.expectEqualStrings("Iv1.b507a08c87ecfe98", oauthProviderSpec("github-copilot").?.client_id);
+    try std.testing.expect(oauthProviderSpec("github-copilot").?.grant == .copilot_bearer);
+    try std.testing.expectEqualStrings("app_EMoamEEZ73f0CkXaXp7hrann", oauthProviderSpec("openai-codex").?.client_id);
+    try std.testing.expect(oauthProviderSpec("openai-codex").?.grant == .post_form);
+    try std.testing.expect(oauthProviderSpec("openai-codex").?.requires_account_id);
+    try std.testing.expect(oauthProviderSpec("google-vertex") == null);
+}
+
+test "Anthropic refresh response applies five minute expiry skew" {
+    const spec = oauthProviderSpec("anthropic").?;
+    const now = std.Io.Clock.real.now(std.testing.io).toMilliseconds();
+    var refreshed = try parseRefreshResponse(
+        std.testing.io,
+        std.testing.allocator,
+        spec,
+        "old-refresh",
+        "{\"access_token\":\"new-anthropic-access\",\"refresh_token\":\"new-anthropic-refresh\",\"expires_in\":3600}",
+    );
+    defer refreshed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("new-anthropic-access", refreshed.access);
+    try std.testing.expectEqualStrings("new-anthropic-refresh", refreshed.refresh);
+    try std.testing.expect(refreshed.account_id == null);
+    // expires ~= now + 3600s - 5min, allow a small window for clock movement during the test.
+    const expected = now + 3600 * 1000 - 5 * 60 * 1000;
+    try std.testing.expect(refreshed.expires >= expected - 2000 and refreshed.expires <= expected + 2000);
+}
+
+test "GitHub Copilot refresh response uses expires_at seconds and preserves refresh token" {
+    const spec = oauthProviderSpec("github-copilot").?;
+    var refreshed = try parseRefreshResponse(
+        std.testing.io,
+        std.testing.allocator,
+        spec,
+        "github-access-token",
+        "{\"token\":\"copilot-session-token\",\"expires_at\":1893456000}",
+    );
+    defer refreshed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("copilot-session-token", refreshed.access);
+    // Copilot reuses the GitHub access token as the refresh token.
+    try std.testing.expectEqualStrings("github-access-token", refreshed.refresh);
+    try std.testing.expectEqual(@as(i64, 1893456000 * 1000 - 5 * 60 * 1000), refreshed.expires);
+}
+
+test "OpenAI Codex refresh extracts chatgpt account id from JWT" {
+    const spec = oauthProviderSpec("openai-codex").?;
+    // JWT with payload {"https://api.openai.com/auth":{"chatgpt_account_id":"acct_codex_123"}}
+    const header = "eyJhbGciOiJSUzI1NiJ9";
+    const payload = blk: {
+        const json = "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_codex_123\"}}";
+        const encoder = std.base64.url_safe_no_pad.Encoder;
+        const buf = try std.testing.allocator.alloc(u8, encoder.calcSize(json.len));
+        _ = encoder.encode(buf, json);
+        break :blk buf;
+    };
+    defer std.testing.allocator.free(payload);
+    const jwt = try std.fmt.allocPrint(std.testing.allocator, "{s}.{s}.signature", .{ header, payload });
+    defer std.testing.allocator.free(jwt);
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"codex-refresh\",\"expires_in\":3600}}",
+        .{jwt},
+    );
+    defer std.testing.allocator.free(body);
+
+    var refreshed = try parseRefreshResponse(std.testing.io, std.testing.allocator, spec, "old", body);
+    defer refreshed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(jwt, refreshed.access);
+    try std.testing.expectEqualStrings("codex-refresh", refreshed.refresh);
+    try std.testing.expectEqualStrings("acct_codex_123", refreshed.account_id.?);
+}
+
+test "OpenAI Codex refresh fails when JWT lacks account id" {
+    const spec = oauthProviderSpec("openai-codex").?;
+    try std.testing.expectError(error.OAuthRefreshFailed, parseRefreshResponse(
+        std.testing.io,
+        std.testing.allocator,
+        spec,
+        "old",
+        "{\"access_token\":\"not-a-jwt\",\"refresh_token\":\"codex-refresh\",\"expires_in\":3600}",
+    ));
+}
+
+test "refresh response rejects malformed token bodies" {
+    const spec = oauthProviderSpec("anthropic").?;
+    try std.testing.expectError(error.OAuthRefreshFailed, parseRefreshResponse(
+        std.testing.io,
+        std.testing.allocator,
+        spec,
+        "old",
+        "not json",
+    ));
+    try std.testing.expectError(error.OAuthRefreshFailed, parseRefreshResponse(
+        std.testing.io,
+        std.testing.allocator,
+        spec,
+        "old",
+        "{\"access_token\":\"only-access\"}",
+    ));
 }

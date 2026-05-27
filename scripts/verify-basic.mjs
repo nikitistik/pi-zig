@@ -8572,4 +8572,248 @@ if (!cloneJsonl.includes(`"parentSession":"${cloneSessionFile}"`) || !cloneJsonl
   throw new Error('rpc clone JSONL did not record parent session and copied prompt');
 }
 
+// ===== FLOW 04: providers/auth =====
+// Provider registry, native transport auth shapes, env-var resolution, and OAuth refresh.
+{
+  // Provider registry must list exactly the upstream KnownProvider ids (packages/ai/src/types.ts).
+  const expectedProviderIds = [
+    'amazon-bedrock', 'anthropic', 'azure-openai-responses', 'cerebras',
+    'cloudflare-ai-gateway', 'cloudflare-workers-ai', 'deepseek', 'fireworks',
+    'github-copilot', 'google', 'google-vertex', 'groq', 'huggingface',
+    'kimi-coding', 'minimax', 'minimax-cn', 'mistral', 'moonshotai',
+    'moonshotai-cn', 'openai', 'openai-codex', 'opencode', 'opencode-go',
+    'openrouter', 'together', 'vercel-ai-gateway', 'xai', 'xiaomi',
+    'xiaomi-token-plan-ams', 'xiaomi-token-plan-cn', 'xiaomi-token-plan-sgp', 'zai'
+  ];
+  const providerList = JSON.parse(run(['providers'])).providers;
+  for (const id of expectedProviderIds) {
+    if (!providerList.includes(id)) {
+      throw new Error(`providers command missing upstream provider id: ${id}`);
+    }
+  }
+
+  // provider-env must mirror env-api-keys.ts getApiKeyEnvVars for every provider.
+  const expectedEnvKeys = {
+    anthropic: ['ANTHROPIC_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'],
+    'github-copilot': ['COPILOT_GITHUB_TOKEN'],
+    openai: ['OPENAI_API_KEY'],
+    'azure-openai-responses': ['AZURE_OPENAI_API_KEY'],
+    'amazon-bedrock': ['AWS_BEARER_TOKEN_BEDROCK'],
+    google: ['GEMINI_API_KEY'],
+    'google-vertex': ['GOOGLE_CLOUD_API_KEY'],
+    mistral: ['MISTRAL_API_KEY'],
+    'moonshotai-cn': ['MOONSHOT_API_KEY'],
+    'xiaomi-token-plan-sgp': ['XIAOMI_TOKEN_PLAN_SGP_API_KEY'],
+    'vercel-ai-gateway': ['AI_GATEWAY_API_KEY']
+  };
+  for (const [provider, keys] of Object.entries(expectedEnvKeys)) {
+    const out = JSON.parse(run(['provider-env', provider]));
+    if (out.provider !== provider || JSON.stringify(out.envKeys) !== JSON.stringify(keys)) {
+      throw new Error(`provider-env ${provider} did not match upstream env keys: ${JSON.stringify(out)}`);
+    }
+  }
+  // Unknown providers resolve to an empty env-key list (upstream returns undefined → no keys).
+  const unknownEnv = JSON.parse(run(['provider-env', 'not-a-provider']));
+  if (unknownEnv.envKeys.length !== 0) {
+    throw new Error('provider-env smoke did not return an empty list for an unknown provider');
+  }
+
+  // auth providers must expose exactly the three upstream built-in OAuth providers in order.
+  const oauthProviders = JSON.parse(run(['auth', 'providers', '--json'])).providers;
+  if (
+    oauthProviders.length !== 3 ||
+    oauthProviders[0].id !== 'anthropic' ||
+    oauthProviders[1].id !== 'github-copilot' ||
+    oauthProviders[2].id !== 'openai-codex'
+  ) {
+    throw new Error(`auth providers smoke did not match upstream BUILT_IN_OAUTH_PROVIDERS: ${JSON.stringify(oauthProviders)}`);
+  }
+
+  // Ambient Bedrock and Vertex credential sources participate in auth status without exposing values.
+  const bedrockAmbient = JSON.parse(run(['auth', 'status', 'amazon-bedrock', '--json'], undefined, {
+    env: { ...process.env, AWS_PROFILE: 'fixture-profile' }
+  }));
+  if (bedrockAmbient.hasAuth !== true || bedrockAmbient.source !== 'environment') {
+    throw new Error('auth status smoke did not detect ambient AWS profile for Bedrock');
+  }
+  const vertexAmbient = JSON.parse(run(['auth', 'status', 'google-vertex', '--json'], undefined, {
+    env: {
+      ...process.env,
+      GOOGLE_CLOUD_PROJECT: 'fixture-project',
+      GOOGLE_CLOUD_LOCATION: 'us-central1',
+      GOOGLE_CLOUD_ACCESS_TOKEN: 'ya29.fixture-token'
+    }
+  }));
+  if (vertexAmbient.hasAuth !== true || vertexAmbient.label !== 'GOOGLE_CLOUD_ACCESS_TOKEN') {
+    throw new Error('auth status smoke did not detect ambient Vertex access token');
+  }
+
+  // OAuth refresh: prove the token-endpoint request shape for every refreshable provider with a fake server.
+  const oauthCaptureFile = path.resolve('zig-out/pi-zig-oauth-capture.jsonl');
+  fs.rmSync(oauthCaptureFile, { force: true });
+  const startFakeOAuthServer = async () => {
+    const child = spawn(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+import http from 'node:http';
+import fs from 'node:fs';
+const captureFile = ${JSON.stringify(oauthCaptureFile)};
+const codexJwt = (() => {
+  const payload = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct_flow04' } })).toString('base64url');
+  return 'eyJhbGciOiJSUzI1NiJ9.' + payload + '.signature';
+})();
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    const body = Buffer.concat(chunks).toString('utf8');
+    fs.appendFileSync(captureFile, JSON.stringify({
+      method: req.method,
+      url: req.url,
+      contentType: req.headers['content-type'] ?? null,
+      accept: req.headers['accept'] ?? null,
+      authorization: req.headers['authorization'] ?? null,
+      userAgent: req.headers['user-agent'] ?? null,
+      copilotIntegrationId: req.headers['copilot-integration-id'] ?? null,
+      body
+    }) + '\\n');
+    res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+    if (req.url.includes('/codex/')) {
+      res.end(JSON.stringify({ access_token: codexJwt, refresh_token: 'codex-rotated-refresh', expires_in: 3600 }));
+    } else if (req.url.includes('/copilot/')) {
+      res.end(JSON.stringify({ token: 'copilot-session-token', expires_at: 1893456000 }));
+    } else {
+      res.end(JSON.stringify({ access_token: 'sk-ant-oat-rotated', refresh_token: 'anthropic-rotated-refresh', expires_in: 3600 }));
+    }
+  });
+});
+server.listen(0, '127.0.0.1', () => {
+  console.log('http://127.0.0.1:' + server.address().port);
+});
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`
+      ],
+      { stdio: ['ignore', 'pipe', 'inherit'] }
+    );
+    const origin = await new Promise((resolve, reject) => {
+      let text = '';
+      child.stdout.on('data', (chunk) => {
+        text += chunk.toString('utf8');
+        const newline = text.indexOf('\n');
+        if (newline >= 0) resolve(text.slice(0, newline).trim());
+      });
+      child.once('error', reject);
+      child.once('exit', (code) => {
+        if (code !== 0) reject(new Error(`fake oauth server exited early with ${code}`));
+      });
+    });
+    return { origin, stop() { child.kill('SIGTERM'); } };
+  };
+
+  const readCaptures = () => fs.existsSync(oauthCaptureFile)
+    ? fs.readFileSync(oauthCaptureFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    : [];
+
+  const oauthFixtureRoot = path.resolve('zig-out/pi-zig-oauth-refresh-fixture');
+  const oauthFixtureHome = path.join(oauthFixtureRoot, 'home');
+  fs.rmSync(oauthFixtureRoot, { recursive: true, force: true });
+  fs.mkdirSync(oauthFixtureHome, { recursive: true });
+  const oauthServer = await startFakeOAuthServer();
+  try {
+    const oauthEnv = (tokenUrl) => ({ ...process.env, HOME: oauthFixtureHome, PI_ZIG_OAUTH_TOKEN_URL: tokenUrl });
+    const authPath = path.join(oauthFixtureHome, '.pi/agent/auth.json');
+
+    // Anthropic: POST JSON refresh_token grant; expired credential is refreshed and persisted.
+    const anthropicEnv = oauthEnv(`${oauthServer.origin}/v1/oauth/token`);
+    run(['auth', 'set-oauth', 'anthropic', 'stale-access', 'anthropic-refresh', '1'], undefined, { env: anthropicEnv });
+    const anthropicResolved = JSON.parse(run(['auth', 'resolve', 'anthropic', '--json'], undefined, { env: anthropicEnv }));
+    if (anthropicResolved.resolved !== true || anthropicResolved.value !== 'sk-ant-oat-rotated') {
+      throw new Error('OAuth refresh smoke did not return refreshed Anthropic access token');
+    }
+    const anthropicStored = JSON.parse(fs.readFileSync(authPath, 'utf8')).anthropic;
+    if (
+      anthropicStored.access !== 'sk-ant-oat-rotated' ||
+      anthropicStored.refresh !== 'anthropic-rotated-refresh' ||
+      typeof anthropicStored.expires !== 'number' ||
+      anthropicStored.expires <= Date.now()
+    ) {
+      throw new Error('OAuth refresh smoke did not persist rotated Anthropic credential with a future expiry');
+    }
+
+    // OpenAI Codex: POST form refresh_token grant; accountId is parsed from the JWT access token.
+    const codexEnv = oauthEnv(`${oauthServer.origin}/codex/oauth/token`);
+    run(['auth', 'set-oauth', 'openai-codex', 'stale-access', 'codex-refresh', '1'], undefined, { env: codexEnv });
+    const codexResolved = JSON.parse(run(['auth', 'resolve', 'openai-codex', '--json'], undefined, { env: codexEnv }));
+    if (codexResolved.resolved !== true || !codexResolved.value.startsWith('eyJ')) {
+      throw new Error('OAuth refresh smoke did not return refreshed Codex JWT access token');
+    }
+    const codexStored = JSON.parse(fs.readFileSync(authPath, 'utf8'))['openai-codex'];
+    if (codexStored.refresh !== 'codex-rotated-refresh' || codexStored.accountId !== 'acct_flow04') {
+      throw new Error('OAuth refresh smoke did not persist rotated Codex credential with chatgpt account id');
+    }
+
+    // GitHub Copilot: GET with Bearer refresh token; response token/expires_at map to the new credential.
+    const copilotEnv = oauthEnv(`${oauthServer.origin}/copilot/v2/token`);
+    run(['auth', 'set-oauth', 'github-copilot', 'gh-access', 'gh-access', '1'], undefined, { env: copilotEnv });
+    const copilotResolved = JSON.parse(run(['auth', 'resolve', 'github-copilot', '--json'], undefined, { env: copilotEnv }));
+    if (copilotResolved.resolved !== true || copilotResolved.value !== 'copilot-session-token') {
+      throw new Error('OAuth refresh smoke did not return refreshed Copilot session token');
+    }
+    const copilotStored = JSON.parse(fs.readFileSync(authPath, 'utf8'))['github-copilot'];
+    if (copilotStored.access !== 'copilot-session-token' || copilotStored.refresh !== 'gh-access') {
+      throw new Error('OAuth refresh smoke did not persist Copilot session token while preserving the GitHub access token');
+    }
+
+    const captures = readCaptures();
+    const anthropicReq = captures.find((c) => c.url.includes('/v1/oauth/token'));
+    if (
+      !anthropicReq ||
+      anthropicReq.method !== 'POST' ||
+      anthropicReq.contentType !== 'application/json' ||
+      anthropicReq.accept !== 'application/json' ||
+      JSON.parse(anthropicReq.body).grant_type !== 'refresh_token' ||
+      JSON.parse(anthropicReq.body).client_id !== '9d1c250a-e61b-44d9-88ed-5944d1962f5e' ||
+      JSON.parse(anthropicReq.body).refresh_token !== 'anthropic-refresh'
+    ) {
+      throw new Error(`OAuth refresh smoke captured wrong Anthropic token request: ${JSON.stringify(anthropicReq)}`);
+    }
+    const codexReq = captures.find((c) => c.url.includes('/codex/'));
+    if (
+      !codexReq ||
+      codexReq.method !== 'POST' ||
+      codexReq.contentType !== 'application/x-www-form-urlencoded' ||
+      codexReq.body !== 'grant_type=refresh_token&refresh_token=codex-refresh&client_id=app_EMoamEEZ73f0CkXaXp7hrann'
+    ) {
+      throw new Error(`OAuth refresh smoke captured wrong Codex token request: ${JSON.stringify(codexReq)}`);
+    }
+    const copilotReq = captures.find((c) => c.url.includes('/copilot/'));
+    if (
+      !copilotReq ||
+      copilotReq.method !== 'GET' ||
+      copilotReq.authorization !== 'Bearer gh-access' ||
+      copilotReq.userAgent !== 'GitHubCopilotChat/0.35.0' ||
+      copilotReq.copilotIntegrationId !== 'vscode-chat'
+    ) {
+      throw new Error(`OAuth refresh smoke captured wrong Copilot token request: ${JSON.stringify(copilotReq)}`);
+    }
+
+    // A failed refresh (server returns 4xx/invalid) preserves the credential and reports a visible gap.
+    const failEnv = oauthEnv('http://127.0.0.1:1/unreachable');
+    run(['auth', 'set-oauth', 'anthropic', 'stale-access', 'anthropic-refresh', '1'], undefined, { env: failEnv });
+    const failResolved = run(['auth', 'resolve', 'anthropic', '--json'], undefined, { env: failEnv });
+    if (!failResolved.includes('"resolved":false') || !failResolved.includes('"value":null')) {
+      throw new Error('OAuth refresh failure smoke did not report a visible gap');
+    }
+    const preservedAfterFailure = JSON.parse(fs.readFileSync(authPath, 'utf8')).anthropic;
+    if (preservedAfterFailure.refresh !== 'anthropic-refresh') {
+      throw new Error('OAuth refresh failure smoke did not preserve the credential for retry');
+    }
+  } finally {
+    oauthServer.stop();
+  }
+}
+
 console.log('basic pi-zig smokes passed');
