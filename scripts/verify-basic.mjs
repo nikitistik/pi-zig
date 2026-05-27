@@ -8572,4 +8572,69 @@ if (!cloneJsonl.includes(`"parentSession":"${cloneSessionFile}"`) || !cloneJsonl
   throw new Error('rpc clone JSONL did not record parent session and copied prompt');
 }
 
+// ===== FLOW 01: inventory =====
+// Guard the upstream inventory script so it cannot silently miss a package or
+// surface. We run the script, assert it exits 0 (its own self-checks pass), then
+// cross-check the reported package count against the package.json files actually
+// on disk and confirm the machine-readable artifact was written.
+{
+  const inventoryStdout = execFileSync('node', ['scripts/upstream-inventory.mjs'], { encoding: 'utf8' });
+  let inventory;
+  try {
+    inventory = JSON.parse(inventoryStdout).upstream;
+  } catch (error) {
+    throw new Error(`upstream-inventory.mjs did not emit valid JSON: ${error.message}`);
+  }
+
+  // Count package.json files on disk under upstream/pi/packages (excluding node_modules).
+  function countPackageManifests(dir) {
+    let total = 0;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'dist') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        total += countPackageManifests(full);
+      } else if (entry.name === 'package.json') {
+        total += 1;
+      }
+    }
+    return total;
+  }
+  const onDiskPackages = countPackageManifests(path.resolve('upstream/pi/packages'));
+
+  if (inventory.packageCount !== onDiskPackages) {
+    throw new Error(
+      `inventory reported ${inventory.packageCount} packages but ${onDiskPackages} package.json files exist on disk`,
+    );
+  }
+  if (inventory.packages.length !== onDiskPackages) {
+    throw new Error('inventory packages array length does not match the reported package count');
+  }
+  if (inventory.primaryPackageCount !== 4) {
+    throw new Error(`inventory expected 4 primary packages, reported ${inventory.primaryPackageCount}`);
+  }
+  if (inventory.rpcCommands.length !== 29) {
+    throw new Error(`inventory expected 29 inbound RPC commands, reported ${inventory.rpcCommands.length}`);
+  }
+  if (inventory.providers.transportApis.length !== 9) {
+    throw new Error(`inventory expected 9 transport APIs, reported ${inventory.providers.transportApis.length}`);
+  }
+  if (inventory.providers.oauthProviders.length !== 3) {
+    throw new Error(`inventory expected 3 OAuth providers, reported ${inventory.providers.oauthProviders.length}`);
+  }
+  if (inventory.extensions.events.length !== 29) {
+    throw new Error(`inventory expected 29 extension events, reported ${inventory.extensions.events.length}`);
+  }
+
+  const artifactPath = path.resolve('docs/inventory/upstream-inventory.json');
+  if (!fs.existsSync(artifactPath)) {
+    throw new Error('upstream-inventory.mjs did not write docs/inventory/upstream-inventory.json');
+  }
+  const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+  if (artifact.counts.packages !== onDiskPackages) {
+    throw new Error('inventory artifact package count does not match on-disk package.json files');
+  }
+}
+console.log('flow 01 upstream inventory smoke passed');
+
 console.log('basic pi-zig smokes passed');
