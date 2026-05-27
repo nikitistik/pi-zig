@@ -2005,6 +2005,92 @@ const Runtime = struct {
         return true;
     }
 
+    fn handleActiveExtensionPromptCommand(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
+        id: ?[]const u8,
+        command: []const u8,
+        message: []const u8,
+    ) !bool {
+        const invocation = parseSlashCommandInvocation(message) orelse return false;
+        if (self.run_options.extension_paths.len == 0) return false;
+        var runner = self.makeExtensionRunner(io, allocator);
+        const result = try runner.runRegisteredCommand(invocation.name, invocation.args);
+        defer result.deinit(allocator);
+        if (!result.handled) return false;
+
+        var queued = false;
+        for (result.actions) |action| {
+            switch (action) {
+                .send_user_message => |user_message| {
+                    const delivery = user_message.deliver_as orelse {
+                        try writeError(w, id, command, "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+                        return true;
+                    };
+                    switch (delivery) {
+                        .steer => {
+                            self.steering_queue.enqueue(allocator, user_message.content, &.{}) catch |err| {
+                                try writeError(w, id, command, @errorName(err));
+                                return true;
+                            };
+                            queued = true;
+                        },
+                        .follow_up => {
+                            self.follow_up_queue.enqueue(allocator, user_message.content, &.{}) catch |err| {
+                                try writeError(w, id, command, @errorName(err));
+                                return true;
+                            };
+                            queued = true;
+                        },
+                        .next_turn => unreachable,
+                    }
+                },
+                .send_message => |custom_message| {
+                    if (custom_message.deliver_as) |delivery| {
+                        switch (delivery) {
+                            .steer => {
+                                self.steering_queue.enqueueCustom(custom_message.custom_type, custom_message.content, custom_message.display) catch |err| {
+                                    try writeError(w, id, command, @errorName(err));
+                                    return true;
+                                };
+                                queued = true;
+                            },
+                            .follow_up => {
+                                self.follow_up_queue.enqueueCustom(custom_message.custom_type, custom_message.content, custom_message.display) catch |err| {
+                                    try writeError(w, id, command, @errorName(err));
+                                    return true;
+                                };
+                                queued = true;
+                            },
+                            .next_turn => {
+                                self.next_turn_custom_queue.enqueue(custom_message.custom_type, custom_message.content, custom_message.display) catch |err| {
+                                    try writeError(w, id, command, @errorName(err));
+                                    return true;
+                                };
+                            },
+                        }
+                    } else if (custom_message.trigger_turn) {
+                        try writeError(w, id, command, "PromptAlreadyRunning");
+                        return true;
+                    } else {
+                        try self.addCustomMessage(io, allocator, custom_message.custom_type, custom_message.content, custom_message.display);
+                    }
+                },
+                .append_entry => |entry| {
+                    try self.addCustomEntry(io, allocator, entry.custom_type, entry.data_json);
+                },
+            }
+        }
+        if (queued) {
+            try self.writePendingQueueState(w, id, command);
+        } else {
+            try writeSuccess(w, id, command);
+        }
+        return true;
+    }
+
     fn rejectQueuedExtensionCommand(
         self: *Runtime,
         io: std.Io,
@@ -2190,11 +2276,12 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "prompt requires a string message");
             };
-            const streaming_delivery = promptStreamingDelivery(value) catch {
-                return writeError(w, id, command, "prompt streamingBehavior must be \"steer\" or \"followUp\"");
-            };
             self.collectActivePrompt(allocator, false);
             if (self.isPromptRunning()) {
+                if (self.handleActiveExtensionPromptCommand(io, allocator, w, id, command, message) catch |err| {
+                    return writeError(w, id, command, @errorName(err));
+                }) return;
+                const streaming_delivery = promptStreamingDelivery(value);
                 const delivery = streaming_delivery orelse {
                     return writeError(w, id, command, "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
                 };
@@ -2950,7 +3037,7 @@ fn isActivePromptNonBlockingCommand(value: std.json.Value) bool {
     const command = getStringField(value, "type") orelse return false;
     return std.mem.eql(u8, command, "abort") or
         std.mem.eql(u8, command, "abort_retry") or
-        (std.mem.eql(u8, command, "prompt") and hasPromptStreamingBehavior(value)) or
+        std.mem.eql(u8, command, "prompt") or
         std.mem.eql(u8, command, "steer") or
         std.mem.eql(u8, command, "follow_up");
 }
@@ -2960,18 +3047,22 @@ fn isActiveBashNonBlockingCommand(value: std.json.Value) bool {
     return std.mem.eql(u8, command, "abort_bash") or std.mem.eql(u8, command, "get_state");
 }
 
-fn promptStreamingDelivery(value: std.json.Value) !?extension_runner.Runner.CommandDelivery {
+fn promptStreamingDelivery(value: std.json.Value) ?extension_runner.Runner.CommandDelivery {
     if (value != .object) return null;
     const field = value.object.get("streamingBehavior") orelse return null;
-    if (field != .string) return error.InvalidPromptStreamingBehavior;
-    if (std.mem.eql(u8, field.string, "steer")) return .steer;
-    if (std.mem.eql(u8, field.string, "followUp")) return .follow_up;
-    return error.InvalidPromptStreamingBehavior;
-}
-
-fn hasPromptStreamingBehavior(value: std.json.Value) bool {
-    if (value != .object) return false;
-    return value.object.get("streamingBehavior") != null;
+    return switch (field) {
+        .null => null,
+        .bool => |value_bool| if (value_bool) .steer else null,
+        .integer => |value_int| if (value_int == 0) null else .steer,
+        .float => |value_float| if (value_float == 0) null else .steer,
+        .string => |value_string| if (value_string.len == 0)
+            null
+        else if (std.mem.eql(u8, value_string, "followUp"))
+            .follow_up
+        else
+            .steer,
+        else => .steer,
+    };
 }
 
 fn toolListContains(value: []const u8, needle: []const u8) bool {

@@ -27,6 +27,106 @@ function jsonLines(text) {
   return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
 
+async function runRpcSequential(args, commands, options = {}) {
+  const child = spawn(bin, args, {
+    cwd: options.cwd,
+    env: options.env,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  let stdout = '';
+  let stderr = '';
+  let pending = '';
+  const lines = [];
+  const waiters = [];
+  function failWaiters(error) {
+    while (waiters.length > 0) {
+      const waiter = waiters.shift();
+      clearTimeout(waiter.timeout);
+      waiter.reject(error);
+    }
+  }
+  function resolveWaiters(line) {
+    for (let index = 0; index < waiters.length;) {
+      const waiter = waiters[index];
+      if (waiter.predicate(line)) {
+        waiters.splice(index, 1);
+        clearTimeout(waiter.timeout);
+        waiter.resolve(line);
+      } else {
+        index += 1;
+      }
+    }
+  }
+  function waitForLine(predicate, timeoutMs = options.timeoutMs ?? 10000) {
+    const existing = lines.find(predicate);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const error = new Error(`timed out waiting for sequential RPC line\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+        const index = waiters.findIndex((waiter) => waiter.reject === reject);
+        if (index !== -1) waiters.splice(index, 1);
+        reject(error);
+      }, timeoutMs);
+      waiters.push({ predicate, resolve, reject, timeout });
+    });
+  }
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+    pending += chunk;
+    while (pending.includes('\n')) {
+      const newline = pending.indexOf('\n');
+      const rawLine = pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+      if (rawLine.trim().length === 0) continue;
+      try {
+        const line = JSON.parse(rawLine);
+        lines.push(line);
+        resolveWaiters(line);
+      } catch (error) {
+        failWaiters(new Error(`failed to parse sequential RPC JSON line: ${rawLine}\n${error.message}`));
+      }
+    }
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  const exitPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`sequential RPC run timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, options.exitTimeoutMs ?? 30000);
+    child.once('error', (error) => {
+      clearTimeout(timeout);
+      failWaiters(error);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        const error = new Error(`sequential RPC run exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+        failWaiters(error);
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+  try {
+    for (const command of commands) {
+      child.stdin.write(`${JSON.stringify(command)}\n`);
+      if (command.id) await waitForLine((line) => line.id === command.id);
+    }
+    child.stdin.end();
+    await exitPromise;
+  } catch (error) {
+    child.kill('SIGKILL');
+    throw error;
+  }
+  return { stdout, stderr, lines };
+}
+
 function envWithoutAnthropicAuth(extra = {}) {
   const cleanAgentDir = path.resolve('zig-out/pi-zig-clean-agent');
   fs.mkdirSync(cleanAgentDir, { recursive: true });
@@ -6081,10 +6181,11 @@ try {
     }
   }
 
-  async function runRpcProviderActiveExtensionQueueSmoke(kind) {
+  async function runRpcProviderActiveExtensionQueueSmoke(kind, viaPrompt = false) {
     const isFollow = kind === 'follow';
-    const rpcCommand = isFollow ? 'follow_up' : 'steer';
-    const sessionFile = path.resolve(`zig-out/pi-zig-rpc-provider-extension-active-${kind}-queue-smoke.jsonl`);
+    const rpcCommand = viaPrompt ? 'prompt' : isFollow ? 'follow_up' : 'steer';
+    const modeLabel = viaPrompt ? 'prompt-command' : 'queue';
+    const sessionFile = path.resolve(`zig-out/pi-zig-rpc-provider-extension-active-${kind}-${modeLabel}-smoke.jsonl`);
     const markerFile = path.resolve(`zig-out/pi-zig-rpc-provider-extension-active-${kind}.started`);
     const releaseFile = path.resolve(`zig-out/pi-zig-rpc-provider-extension-active-${kind}.release`);
     fs.rmSync(sessionFile, { force: true });
@@ -6128,7 +6229,7 @@ try {
       if (existing) return Promise.resolve(existing);
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
-          const error = new Error(`timed out waiting for active extension ${kind} RPC line\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+          const error = new Error(`timed out waiting for active extension ${kind} ${modeLabel} RPC line\nstdout:\n${stdout}\nstderr:\n${stderr}`);
           const index = waiters.findIndex((waiter) => waiter.reject === reject);
           if (index !== -1) waiters.splice(index, 1);
           reject(error);
@@ -6170,7 +6271,7 @@ try {
           lines.push(line);
           resolveWaiters(line);
         } catch (error) {
-          failWaiters(new Error(`failed to parse active extension ${kind} RPC JSON line: ${rawLine}\n${error.message}`));
+          failWaiters(new Error(`failed to parse active extension ${kind} ${modeLabel} RPC JSON line: ${rawLine}\n${error.message}`));
         }
       }
     });
@@ -6180,7 +6281,7 @@ try {
     const exitPromise = new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         child.kill('SIGKILL');
-        reject(new Error(`active extension ${kind} queue smoke timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+        reject(new Error(`active extension ${kind} ${modeLabel} smoke timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
       }, 9000);
       child.once('error', (error) => {
         clearTimeout(timeout);
@@ -6189,37 +6290,39 @@ try {
       child.once('exit', (code, signal) => {
         clearTimeout(timeout);
         if (code !== 0) {
-          reject(new Error(`active extension ${kind} queue smoke exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          reject(new Error(`active extension ${kind} ${modeLabel} smoke exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
           return;
         }
         resolve();
       });
     });
 
-    writeCommand({ id: `rpc-active-${kind}-model`, type: 'set_model', provider: 'openai', modelId: 'gpt-4o' });
-    await waitForLine((line) => line.id === `rpc-active-${kind}-model` && line.success === true);
-    writeCommand({ id: `rpc-active-${kind}-prompt`, type: 'prompt', message: `rpc active extension ${kind} start` });
+    writeCommand({ id: `rpc-active-${kind}-${modeLabel}-model`, type: 'set_model', provider: 'openai', modelId: 'gpt-4o' });
+    await waitForLine((line) => line.id === `rpc-active-${kind}-${modeLabel}-model` && line.success === true);
+    writeCommand({ id: `rpc-active-${kind}-${modeLabel}-prompt`, type: 'prompt', message: `rpc active extension ${kind} start` });
     await waitForFile(markerFile);
     writeCommand({
-      id: `rpc-active-${kind}-user-command`,
+      id: `rpc-active-${kind}-${modeLabel}-user-command`,
       type: rpcCommand,
       message: isFollow
         ? '/send-user-follow-active /write-marker active raw follow'
         : '/send-user-steer-active /write-marker active raw steer'
     });
-    const userCommandResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-user-command`, 1000);
+    const userCommandResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-${modeLabel}-user-command`, 1000);
     writeCommand({
-      id: `rpc-active-${kind}-custom-command`,
+      id: `rpc-active-${kind}-${modeLabel}-custom-command`,
       type: rpcCommand,
       message: isFollow
         ? '/send-custom-follow-active rpc active custom follow'
         : '/send-custom-steer-active rpc active custom steer'
     });
-    const customCommandResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-custom-command`, 1000);
+    const customCommandResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-${modeLabel}-custom-command`, 1000);
     fs.writeFileSync(releaseFile, 'release');
-    const promptResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-prompt`, 5000);
-    writeCommand({ id: `rpc-active-${kind}-messages`, type: 'get_messages' });
-    const messagesResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-messages`, 2500);
+    const promptResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-${modeLabel}-prompt`, 5000);
+    writeCommand({ id: `rpc-active-${kind}-${modeLabel}-messages`, type: 'get_messages' });
+    const messagesResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-${modeLabel}-messages`, 2500);
+    writeCommand({ id: `rpc-active-${kind}-${modeLabel}-state`, type: 'get_state' });
+    const stateResponse = await waitForLine((line) => line.id === `rpc-active-${kind}-${modeLabel}-state`, 2500);
     child.stdin.end();
     await exitPromise;
 
@@ -6239,6 +6342,9 @@ try {
       customCommandResponse?.data?.steeringCount !== (isFollow ? 0 : 2) ||
       customCommandResponse?.data?.followUpCount !== (isFollow ? 2 : 0) ||
       promptResponse?.data?.text !== `rpc active extension ${kind} observed` ||
+      stateResponse?.data?.pendingMessageCount !== 0 ||
+      stateResponse?.data?.pendingSteeringCount !== 0 ||
+      stateResponse?.data?.pendingFollowUpCount !== 0 ||
       !messages.some((message) => message.role === 'user' && message.content === rawUserText) ||
       !messages.some((message) => message.role === 'custom' && message.customType === customType && message.content === customText && message.display === true) ||
       messages.some((message) => typeof message.content === 'string' && message.content.includes(`/send-user-${isFollow ? 'follow' : 'steer'}-active`)) ||
@@ -6248,7 +6354,7 @@ try {
       (!isFollow && steerBaseIndex !== -1) ||
       (isFollow && (followBaseIndex === -1 || followObservedIndex === -1 || followBaseIndex > followObservedIndex))
     ) {
-      throw new Error(`active extension ${kind} queue smoke failed\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+      throw new Error(`active extension ${kind} ${modeLabel} smoke failed\nstdout:\n${stdout}\nstderr:\n${stderr}`);
     }
   }
 
@@ -6366,12 +6472,21 @@ try {
     writeCommand({ id: `rpc-prompt-streaming-${kind}-start`, type: 'prompt', message: `rpc active prompt streaming ${kind} start` });
     await waitForFile(markerFile);
     writeCommand({
-      id: `rpc-prompt-streaming-${kind}-invalid`,
+      id: `rpc-prompt-streaming-${kind}-missing`,
       type: 'prompt',
-      message: `rpc active prompt streaming ${kind} invalid behavior`,
-      streamingBehavior: 'later'
+      message: `rpc active prompt streaming ${kind} missing behavior`
     });
-    const invalidResponse = await waitForLine((line) => line.id === `rpc-prompt-streaming-${kind}-invalid`, 1000);
+    const missingResponse = await waitForLine((line) => line.id === `rpc-prompt-streaming-${kind}-missing`, 1000);
+    let truthyFallbackResponse = null;
+    if (!isFollow) {
+      writeCommand({
+        id: `rpc-prompt-streaming-${kind}-truthy-fallback`,
+        type: 'prompt',
+        message: `rpc active prompt streaming ${kind} truthy fallback`,
+        streamingBehavior: 'later'
+      });
+      truthyFallbackResponse = await waitForLine((line) => line.id === `rpc-prompt-streaming-${kind}-truthy-fallback`, 1000);
+    }
     writeCommand({
       id: `rpc-prompt-streaming-${kind}-queued`,
       type: 'prompt',
@@ -6391,13 +6506,18 @@ try {
     const baseIndex = assistantTexts.indexOf(`rpc active prompt streaming ${kind} base complete`);
     const observedIndex = assistantTexts.indexOf(`rpc active prompt streaming ${kind} observed`);
     if (
-      invalidResponse?.success !== false ||
-      !String(invalidResponse?.error ?? '').includes('streamingBehavior') ||
+      missingResponse?.success !== false ||
+      !String(missingResponse?.error ?? '').includes('streamingBehavior') ||
+      (!isFollow && (!truthyFallbackResponse?.success ||
+        truthyFallbackResponse?.data?.pendingMessageCount !== 1 ||
+        truthyFallbackResponse?.data?.steeringCount !== 1 ||
+        truthyFallbackResponse?.data?.followUpCount !== 0)) ||
       !queuedResponse?.success ||
-      queuedResponse?.data?.pendingMessageCount !== 1 ||
-      queuedResponse?.data?.steeringCount !== (isFollow ? 0 : 1) ||
+      queuedResponse?.data?.pendingMessageCount !== (isFollow ? 1 : 2) ||
+      queuedResponse?.data?.steeringCount !== (isFollow ? 0 : 2) ||
       queuedResponse?.data?.followUpCount !== (isFollow ? 1 : 0) ||
       promptResponse?.data?.text !== `rpc active prompt streaming ${kind} observed` ||
+      (!isFollow && !messages.some((message) => message.role === 'user' && message.content === `rpc active prompt streaming ${kind} truthy fallback`)) ||
       !messages.some((message) => message.role === 'user' && message.content === `rpc active prompt streaming ${kind} queued`) ||
       (!isFollow && baseIndex !== -1) ||
       (isFollow && (baseIndex === -1 || observedIndex === -1 || baseIndex > observedIndex))
@@ -6696,18 +6816,17 @@ export default function(pi) {
 
   const rpcProviderHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-history-smoke.jsonl');
   fs.rmSync(rpcProviderHistorySessionFile, { force: true });
-  const rpcProviderHistoryOutput = run(
+  const rpcProviderHistoryRun = await runRpcSequential(
     ['rpc', rpcProviderHistorySessionFile],
     [
-      JSON.stringify({ id: 'rpc-provider-history-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
-      JSON.stringify({ id: 'rpc-provider-history-first', type: 'prompt', message: 'first rpc history' }),
-      JSON.stringify({ id: 'rpc-provider-history-second', type: 'prompt', message: 'second rpc history' }),
-      JSON.stringify({ id: 'rpc-provider-history-messages', type: 'get_messages' }),
-      ''
-    ].join('\n'),
+      { id: 'rpc-provider-history-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' },
+      { id: 'rpc-provider-history-first', type: 'prompt', message: 'first rpc history' },
+      { id: 'rpc-provider-history-second', type: 'prompt', message: 'second rpc history' },
+      { id: 'rpc-provider-history-messages', type: 'get_messages' }
+    ],
     { env: rpcProviderEnv }
   );
-  const rpcProviderHistoryResponses = rpcProviderHistoryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderHistoryResponses = rpcProviderHistoryRun.lines;
   const rpcProviderHistorySecond = rpcProviderHistoryResponses.find((response) => response.id === 'rpc-provider-history-second');
   if (!rpcProviderHistorySecond?.success || rpcProviderHistorySecond?.data?.text !== 'rpc history observed') {
     throw new Error('rpc provider prompt smoke did not send prior user/assistant history to the provider');
@@ -7043,6 +7162,8 @@ export default function(pi) {
   await runRpcProviderPromptStreamingBehaviorSmoke('follow');
   await runRpcProviderActiveExtensionQueueSmoke('steer');
   await runRpcProviderActiveExtensionQueueSmoke('follow');
+  await runRpcProviderActiveExtensionQueueSmoke('steer', true);
+  await runRpcProviderActiveExtensionQueueSmoke('follow', true);
 
   const rpcProviderOutput = run(
     ['rpc', rpcProviderSessionFile],
@@ -7111,17 +7232,16 @@ export default function(pi) {
 
   const rpcProviderToolHistorySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-tool-history-smoke.jsonl');
   fs.rmSync(rpcProviderToolHistorySessionFile, { force: true });
-  const rpcProviderToolHistoryOutput = run(
+  const rpcProviderToolHistoryRun = await runRpcSequential(
     ['rpc', rpcProviderToolHistorySessionFile],
     [
-      JSON.stringify({ id: 'rpc-tool-history-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
-      JSON.stringify({ id: 'rpc-tool-history-first', type: 'prompt', message: 'please run the tool loop' }),
-      JSON.stringify({ id: 'rpc-tool-history-check', type: 'prompt', message: 'rpc tool history check' }),
-      ''
-    ].join('\n'),
+      { id: 'rpc-tool-history-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' },
+      { id: 'rpc-tool-history-first', type: 'prompt', message: 'please run the tool loop' },
+      { id: 'rpc-tool-history-check', type: 'prompt', message: 'rpc tool history check' }
+    ],
     { env: rpcProviderEnv }
   );
-  const rpcProviderToolHistoryResponses = rpcProviderToolHistoryOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderToolHistoryResponses = rpcProviderToolHistoryRun.lines;
   const rpcProviderToolHistoryCheck = rpcProviderToolHistoryResponses.find((response) => response.id === 'rpc-tool-history-check');
   if (!rpcProviderToolHistoryCheck?.success || rpcProviderToolHistoryCheck?.data?.text !== 'rpc tool history observed') {
     throw new Error('rpc provider prompt smoke did not send prior assistant tool-call and tool result history to the provider');
@@ -7926,18 +8046,17 @@ if (!cycleModel?.success || !cycleModel?.data?.model?.id || cycleModel?.data?.is
 const forkSessionFile = 'zig-out/pi-zig-rpc-fork-source.jsonl';
 fs.rmSync(forkSessionFile, { force: true });
 fs.rmSync(`${forkSessionFile}.fork-2.jsonl`, { force: true });
-const forkOutput = run(
+const forkRunResult = await runRpcSequential(
   ['rpc', forkSessionFile],
   [
-    JSON.stringify({ id: 'fork-prompt-1', type: 'prompt', message: 'first fork prompt' }),
-    JSON.stringify({ id: 'fork-prompt-2', type: 'prompt', message: 'second fork prompt' }),
-    JSON.stringify({ id: 'fork-list', type: 'get_fork_messages' }),
-    JSON.stringify({ id: 'fork-run', type: 'fork', entryId: 'm-2' }),
-    JSON.stringify({ id: 'fork-state', type: 'get_state' }),
-    ''
-  ].join('\n')
+    { id: 'fork-prompt-1', type: 'prompt', message: 'first fork prompt' },
+    { id: 'fork-prompt-2', type: 'prompt', message: 'second fork prompt' },
+    { id: 'fork-list', type: 'get_fork_messages' },
+    { id: 'fork-run', type: 'fork', entryId: 'm-2' },
+    { id: 'fork-state', type: 'get_state' }
+  ]
 );
-const forkResponses = forkOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const forkResponses = forkRunResult.lines;
 const forkList = forkResponses.find((response) => response.id === 'fork-list');
 if (
   forkList?.data?.messages?.length !== 2 ||
