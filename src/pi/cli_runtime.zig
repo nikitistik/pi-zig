@@ -65,6 +65,11 @@ const JsonToolEventContext = struct {
     assistant_started: bool = false,
 };
 
+const AssistantStatus = struct {
+    stop_reason: []const u8,
+    error_message: []const u8,
+};
+
 pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     const parsed = cli.parse(argv);
 
@@ -227,7 +232,7 @@ fn runJsonPrintFoundation(
         .final_text = &streamed_final_text,
     };
 
-    const response = try buildPrintResponse(
+    const response = buildPrintResponse(
         io,
         allocator,
         env,
@@ -241,7 +246,29 @@ fn runJsonPrintFoundation(
         handleJsonToolEnd,
         &tool_event_context,
         handleJsonAgentTextDelta,
-    );
+    ) catch |err| {
+        const status = assistantStatusForError(err);
+        if (store) |*persistent| {
+            try appendJsonAssistantStatusMessage(
+                io,
+                allocator,
+                persistent,
+                parsed,
+                streamed_final_text.written(),
+                status.stop_reason,
+                status.error_message,
+            );
+        }
+        try emitJsonAssistantStatusLifecycle(
+            io,
+            allocator,
+            streamed_final_text.written(),
+            status.stop_reason,
+            status.error_message,
+            !tool_event_context.assistant_started,
+        );
+        return err;
+    };
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -333,15 +360,58 @@ fn runJsonProviderTextStream(
         .final_text = &final_text,
     };
 
-    try ai_client.streamChatTurnText(io, allocator, env, .{
+    ai_client.streamChatTurnText(io, allocator, env, .{
         .provider = provider,
         .model = model,
         .api_key = api_key,
         .messages = messages_buf[0..messages_len],
         .tools = &.{},
-    }, &stream_context, handleJsonStreamTextDelta);
+    }, &stream_context, handleJsonStreamTextDelta) catch |err| {
+        const status = assistantStatusForError(err);
+        if (store) |*persistent| {
+            try appendJsonAssistantStatusMessage(
+                io,
+                allocator,
+                persistent,
+                parsed,
+                final_text.written(),
+                status.stop_reason,
+                status.error_message,
+            );
+        }
+        try emitJsonAssistantStatusLifecycle(
+            io,
+            allocator,
+            final_text.written(),
+            status.stop_reason,
+            status.error_message,
+            false,
+        );
+        return err;
+    };
 
-    if (final_text.written().len == 0) return error.ProviderResponseInvalid;
+    if (final_text.written().len == 0) {
+        if (store) |*persistent| {
+            try appendJsonAssistantStatusMessage(
+                io,
+                allocator,
+                persistent,
+                parsed,
+                final_text.written(),
+                "error",
+                "ProviderResponseInvalid",
+            );
+        }
+        try emitJsonAssistantStatusLifecycle(
+            io,
+            allocator,
+            final_text.written(),
+            "error",
+            "ProviderResponseInvalid",
+            false,
+        );
+        return error.ProviderResponseInvalid;
+    }
     if (store) |*persistent| {
         _ = try persistent.appendMessage(io, allocator, .assistant, final_text.written());
     }
@@ -370,6 +440,67 @@ fn emitJsonPrelude(io: std.Io, allocator: std.mem.Allocator, session_id: []const
     try w.writeAll(",\"timestamp\":\"local-foundation\",\"cwd\":\".\"}\n");
     try w.writeAll("{\"type\":\"agent_start\"}\n");
     try w.writeAll("{\"type\":\"turn_start\"}\n");
+    try writeStreamingJsonLine(io, allocator, line.written());
+}
+
+fn assistantStatusForError(err: anyerror) AssistantStatus {
+    if (err == error.AgentAborted) {
+        return .{ .stop_reason = "aborted", .error_message = "Request was aborted" };
+    }
+    return .{ .stop_reason = "error", .error_message = @errorName(err) };
+}
+
+fn appendJsonAssistantStatusMessage(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    persistent: *session.PersistentStore,
+    parsed: cli.ParsedArgs,
+    text: []const u8,
+    stop_reason: []const u8,
+    error_message: ?[]const u8,
+) !void {
+    const api: ?[]const u8 = if (parsed.provider) |provider|
+        if (parsed.model) |model|
+            if (models.find(provider, model)) |entry| entry.api else null
+        else
+            null
+    else
+        null;
+    _ = try persistent.appendAssistantStatusMessage(
+        io,
+        allocator,
+        text,
+        api,
+        parsed.provider,
+        parsed.model,
+        stop_reason,
+        error_message,
+    );
+}
+
+fn emitJsonAssistantStatusLifecycle(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    stop_reason: []const u8,
+    error_message: ?[]const u8,
+    emit_start: bool,
+) !void {
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    if (emit_start) {
+        try w.writeAll("{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n");
+    }
+    try w.writeAll("{\"type\":\"message_end\",\"message\":");
+    try writeAssistantStatusMessageJson(w, text, stop_reason, error_message);
+    try w.writeAll("}\n");
+    try w.writeAll("{\"type\":\"turn_end\",\"message\":");
+    try writeAssistantStatusMessageJson(w, text, stop_reason, error_message);
+    try w.writeAll(",\"toolResults\":[]}\n");
+    try w.writeAll("{\"type\":\"agent_end\",\"messages\":[");
+    try writeAssistantStatusMessageJson(w, text, stop_reason, error_message);
+    try w.writeAll("]}\n");
     try writeStreamingJsonLine(io, allocator, line.written());
 }
 
@@ -935,9 +1066,24 @@ fn selectedToolNamesFromParsed(allocator: std.mem.Allocator, parsed: cli.ParsedA
 }
 
 fn writeAssistantMessageJson(w: *std.Io.Writer, text: []const u8) !void {
+    try writeAssistantStatusMessageJson(w, text, "end", null);
+}
+
+fn writeAssistantStatusMessageJson(
+    w: *std.Io.Writer,
+    text: []const u8,
+    stop_reason: []const u8,
+    error_message: ?[]const u8,
+) !void {
     try w.writeAll("{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":");
     try writeJsonString(w, text);
-    try w.writeAll("}],\"stopReason\":\"end\"}");
+    try w.writeAll("}],\"stopReason\":");
+    try writeJsonString(w, stop_reason);
+    if (error_message) |message| {
+        try w.writeAll(",\"errorMessage\":");
+        try writeJsonString(w, message);
+    }
+    try w.writeByte('}');
 }
 
 fn writeToolExecutionStartJson(w: *std.Io.Writer, tool_result: agent.ToolResult) !void {

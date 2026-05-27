@@ -23,6 +23,10 @@ function runFail(args, input, options = {}) {
   }
 }
 
+function jsonLines(text) {
+  return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
 function envWithoutAnthropicAuth(extra = {}) {
   const cleanAgentDir = path.resolve('zig-out/pi-zig-clean-agent');
   fs.mkdirSync(cleanAgentDir, { recursive: true });
@@ -396,6 +400,11 @@ const server = http.createServer((req, res) => {
       }
       res.end('data: [DONE]\\n\\n');
     };
+    if (user.includes('json provider client error')) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'json provider client error fixture' }));
+      return;
+    }
     if (user.includes('native mistral stream tool events')) {
       if (
         body.stream !== true ||
@@ -3709,6 +3718,61 @@ export default function(pi: any): void {
   ) {
     throw new Error('top-level JSON mode smoke did not stream provider text deltas');
   }
+
+  const assertJsonProviderErrorLifecycle = (lines, label) => {
+    const assistantStartCount = lines.filter((line) => line.type === 'message_start' && line.message?.role === 'assistant').length;
+    const messageEnd = lines.find((line) => line.type === 'message_end' && line.message?.role === 'assistant');
+    const turnEnd = lines.find((line) => line.type === 'turn_end' && line.message?.role === 'assistant');
+    const agentEnd = lines.find((line) => line.type === 'agent_end');
+    if (
+      assistantStartCount !== 1 ||
+      messageEnd?.message?.stopReason !== 'error' ||
+      messageEnd?.message?.errorMessage !== 'ProviderClientError' ||
+      turnEnd?.message?.stopReason !== 'error' ||
+      turnEnd?.message?.errorMessage !== 'ProviderClientError' ||
+      !Array.isArray(turnEnd?.toolResults) ||
+      turnEnd.toolResults.length !== 0 ||
+      agentEnd?.messages?.at(-1)?.stopReason !== 'error' ||
+      agentEnd?.messages?.at(-1)?.errorMessage !== 'ProviderClientError'
+    ) {
+      throw new Error(label + ' did not emit an upstream-shaped assistant error lifecycle');
+    }
+  };
+
+  const assertJsonProviderErrorSession = (sessionFile, label) => {
+    const records = jsonLines(fs.readFileSync(sessionFile, 'utf8'));
+    const assistant = records
+      .filter((record) => record.type === 'message' && record.message?.role === 'assistant')
+      .at(-1);
+    if (
+      assistant?.message?.stopReason !== 'error' ||
+      assistant?.message?.errorMessage !== 'ProviderClientError' ||
+      assistant?.message?.provider !== 'openai' ||
+      assistant?.message?.model !== 'gpt-4o'
+    ) {
+      throw new Error(label + ' did not persist the provider error assistant turn');
+    }
+  };
+
+  const providerJsonStreamErrorSessionFile = path.resolve('zig-out/pi-zig-json-stream-provider-error-smoke.jsonl');
+  fs.rmSync(providerJsonStreamErrorSessionFile, { force: true });
+  const providerJsonStreamError = runFail(
+    ['--mode', 'json', '--session', providerJsonStreamErrorSessionFile, '--no-tools', '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json provider client error streamed'],
+    undefined,
+    { env: providerEnv }
+  );
+  assertJsonProviderErrorLifecycle(jsonLines(providerJsonStreamError.stdout), 'top-level JSON no-tools provider failure');
+  assertJsonProviderErrorSession(providerJsonStreamErrorSessionFile, 'top-level JSON no-tools provider failure');
+
+  const providerJsonToolErrorSessionFile = path.resolve('zig-out/pi-zig-json-tool-provider-error-smoke.jsonl');
+  fs.rmSync(providerJsonToolErrorSessionFile, { force: true });
+  const providerJsonToolProviderError = runFail(
+    ['--mode', 'json', '--session', providerJsonToolErrorSessionFile, '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json provider client error tool-capable'],
+    undefined,
+    { env: providerEnv }
+  );
+  assertJsonProviderErrorLifecycle(jsonLines(providerJsonToolProviderError.stdout), 'top-level JSON tool-capable provider failure');
+  assertJsonProviderErrorSession(providerJsonToolErrorSessionFile, 'top-level JSON tool-capable provider failure');
 
   const providerImageFixture = path.resolve('zig-out/pi-zig-provider-image-fixture');
   fs.rmSync(providerImageFixture, { recursive: true, force: true });
