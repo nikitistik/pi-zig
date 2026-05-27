@@ -60,6 +60,44 @@ pub fn writeCommandsDataJsonWithOptions(
     try w.writeAll("]}");
 }
 
+pub fn expandSlashResourceCommand(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    options: Options,
+) !?[]u8 {
+    const invocation = parseSlashInvocation(text) orelse return null;
+    var commands_out: std.Io.Writer.Allocating = .init(allocator);
+    defer commands_out.deinit();
+    var resource_options = options;
+    resource_options.extension_paths = &.{};
+    try writeCommandsDataJsonWithOptions(io, allocator, &commands_out.writer, resource_options);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, commands_out.written(), .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const command_entries = parsed.value.object.get("commands") orelse return null;
+    if (command_entries != .array) return null;
+
+    for (command_entries.array.items) |entry| {
+        if (entry != .object) continue;
+        const name = objectString(entry, "name") orelse continue;
+        if (!std.mem.eql(u8, name, invocation.name)) continue;
+        const source = objectString(entry, "source") orelse continue;
+        const source_info = entry.object.get("sourceInfo") orelse return null;
+        const path = objectString(source_info, "path") orelse return null;
+        if (std.mem.eql(u8, source, "prompt")) {
+            return try expandPromptTemplateFile(io, allocator, path, invocation.args);
+        }
+        if (std.mem.eql(u8, source, "skill")) {
+            const base_dir = objectString(source_info, "baseDir") orelse std.fs.path.dirname(path) orelse ".";
+            return try expandSkillFile(io, allocator, path, base_dir, invocation.name, invocation.args);
+        }
+        return null;
+    }
+    return null;
+}
+
 fn writeExtensionCommands(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1333,6 +1371,219 @@ fn parseFrontmatter(content: []const u8) Frontmatter {
         }
     }
     return .{ .header = "", .body = content };
+}
+
+const SlashInvocation = struct {
+    name: []const u8,
+    args: []const u8,
+};
+
+fn parseSlashInvocation(text: []const u8) ?SlashInvocation {
+    if (text.len < 2 or text[0] != '/') return null;
+    const rest = text[1..];
+    var index: usize = 0;
+    while (index < rest.len and !isAsciiWhitespace(rest[index])) index += 1;
+    const name = rest[0..index];
+    if (name.len == 0) return null;
+    while (index < rest.len and isAsciiWhitespace(rest[index])) index += 1;
+    const args = rest[index..];
+    return .{ .name = name, .args = args };
+}
+
+fn isAsciiWhitespace(char: u8) bool {
+    return switch (char) {
+        ' ', '\t', '\r', '\n' => true,
+        else => false,
+    };
+}
+
+fn objectString(value: std.json.Value, field_name: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const field = value.object.get(field_name) orelse return null;
+    return if (field == .string) field.string else null;
+}
+
+fn expandPromptTemplateFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    args_text: []const u8,
+) ![]u8 {
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_resource_bytes));
+    defer allocator.free(content);
+    const frontmatter = parseFrontmatter(content);
+    const args = try parseTemplateArgs(allocator, args_text);
+    defer freeStringList(allocator, args);
+    return substituteTemplateArgs(allocator, frontmatter.body, args_text, args);
+}
+
+fn expandSkillFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    base_dir: []const u8,
+    command_name: []const u8,
+    args_text: []const u8,
+) ![]u8 {
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_resource_bytes));
+    defer allocator.free(content);
+    const frontmatter = parseFrontmatter(content);
+    const skill_name = if (std.mem.startsWith(u8, command_name, "skill:")) command_name["skill:".len..] else command_name;
+    const body = std.mem.trim(u8, frontmatter.body, " \t\r\n");
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.print("<skill name=\"{s}\" location=\"{s}\">\nReferences are relative to {s}.\n\n{s}\n</skill>", .{
+        skill_name,
+        path,
+        base_dir,
+        body,
+    });
+    if (args_text.len > 0) try out.writer.print("\n\n{s}", .{args_text});
+    return out.toOwnedSlice();
+}
+
+fn parseTemplateArgs(allocator: std.mem.Allocator, args_text: []const u8) ![][]u8 {
+    var args: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (args.items) |value| allocator.free(value);
+        args.deinit(allocator);
+    }
+    var current: std.ArrayList(u8) = .empty;
+    defer current.deinit(allocator);
+    var quote: ?u8 = null;
+    var escaped = false;
+    var arg_started = false;
+    for (args_text) |char| {
+        if (escaped) {
+            try current.append(allocator, char);
+            escaped = false;
+            arg_started = true;
+        } else if (char == '\\') {
+            escaped = true;
+            arg_started = true;
+        } else if (quote) |quote_char| {
+            if (char == quote_char) {
+                quote = null;
+                arg_started = true;
+            } else {
+                try current.append(allocator, char);
+                arg_started = true;
+            }
+        } else if (char == '"' or char == '\'') {
+            quote = char;
+            arg_started = true;
+        } else if (isAsciiWhitespace(char)) {
+            if (arg_started) {
+                try appendTemplateArg(allocator, &args, current.items);
+                current.clearRetainingCapacity();
+                arg_started = false;
+            }
+        } else {
+            try current.append(allocator, char);
+            arg_started = true;
+        }
+    }
+    if (escaped) try current.append(allocator, '\\');
+    if (arg_started) {
+        try appendTemplateArg(allocator, &args, current.items);
+        current.clearRetainingCapacity();
+    }
+    return args.toOwnedSlice(allocator);
+}
+
+fn appendTemplateArg(allocator: std.mem.Allocator, args: *std.ArrayList([]u8), value: []const u8) !void {
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try args.append(allocator, owned);
+}
+
+fn freeStringList(allocator: std.mem.Allocator, values: []const []u8) void {
+    for (values) |value| allocator.free(value);
+    if (values.len > 0) allocator.free(values);
+}
+
+fn substituteTemplateArgs(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    raw_args: []const u8,
+    args: []const []u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var index: usize = 0;
+    while (index < content.len) {
+        if (content[index] != '$') {
+            try out.writer.writeByte(content[index]);
+            index += 1;
+            continue;
+        }
+        if (index + "$ARGUMENTS".len <= content.len and std.mem.eql(u8, content[index .. index + "$ARGUMENTS".len], "$ARGUMENTS")) {
+            try out.writer.writeAll(raw_args);
+            index += "$ARGUMENTS".len;
+            continue;
+        }
+        if (index + 2 <= content.len and content[index + 1] == '@') {
+            try out.writer.writeAll(raw_args);
+            index += 2;
+            continue;
+        }
+        if (parseSlicePlaceholder(content[index..])) |placeholder| {
+            try appendJoinedArgs(&out.writer, args, placeholder.start, placeholder.end);
+            index += placeholder.len;
+            continue;
+        }
+        if (index + 1 < content.len and std.ascii.isDigit(content[index + 1])) {
+            var end = index + 1;
+            while (end < content.len and std.ascii.isDigit(content[end])) end += 1;
+            const raw_number = std.fmt.parseUnsigned(usize, content[index + 1 .. end], 10) catch 0;
+            if (raw_number > 0 and raw_number <= args.len) try out.writer.writeAll(args[raw_number - 1]);
+            index = end;
+            continue;
+        }
+        try out.writer.writeByte(content[index]);
+        index += 1;
+    }
+    return out.toOwnedSlice();
+}
+
+const SlicePlaceholder = struct {
+    start: usize,
+    end: usize,
+    len: usize,
+};
+
+fn parseSlicePlaceholder(text: []const u8) ?SlicePlaceholder {
+    if (!std.mem.startsWith(u8, text, "${@:")) return null;
+    var index: usize = "${@:".len;
+    const start_begin = index;
+    while (index < text.len and std.ascii.isDigit(text[index])) index += 1;
+    if (index == start_begin) return null;
+    const raw_start = std.fmt.parseUnsigned(usize, text[start_begin..index], 10) catch return null;
+    var length: ?usize = null;
+    if (index < text.len and text[index] == ':') {
+        index += 1;
+        const length_begin = index;
+        while (index < text.len and std.ascii.isDigit(text[index])) index += 1;
+        if (index == length_begin) return null;
+        length = std.fmt.parseUnsigned(usize, text[length_begin..index], 10) catch return null;
+    }
+    if (index >= text.len or text[index] != '}') return null;
+    const start = if (raw_start == 0) 0 else raw_start - 1;
+    const end = if (length) |value| std.math.add(usize, start, value) catch std.math.maxInt(usize) else std.math.maxInt(usize);
+    return .{
+        .start = start,
+        .end = end,
+        .len = index + 1,
+    };
+}
+
+fn appendJoinedArgs(w: *std.Io.Writer, args: []const []u8, start: usize, raw_end: usize) !void {
+    if (start >= args.len) return;
+    const end = @min(raw_end, args.len);
+    for (args[start..end], 0..) |arg, index| {
+        if (index != 0) try w.writeByte(' ');
+        try w.writeAll(arg);
+    }
 }
 
 fn writeCommandHead(w: *std.Io.Writer, name: []const u8, description: []const u8, source: []const u8) !void {

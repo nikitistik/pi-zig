@@ -683,6 +683,45 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc image history observed' } }] }));
       return;
     }
+    if (
+      user.includes('rpc slash prompt template expansion') &&
+      !userMessages.includes('rpc active slash resource steer start') &&
+      !userMessages.includes('rpc active slash resource follow start')
+    ) {
+      const expected = 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta';
+      if (user !== expected) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'slash prompt template expansion mismatch', user, expected }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc slash prompt template expansion observed' } }] }));
+      return;
+    }
+    if (user.includes('rpc slash skill expansion body')) {
+      const expected = [
+        '<skill name="resource-skill" location=".pi/skills/resource-skill/SKILL.md">',
+        'References are relative to .pi/skills/resource-skill.',
+        '',
+        'rpc slash skill expansion body',
+        '</skill>',
+        '',
+        'Focus on loaded instructions'
+      ].join('\\n');
+      if (user !== expected) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'slash skill expansion mismatch', user, expected }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc slash skill expansion observed' } }] }));
+      return;
+    }
+    if (user.includes('rpc slash resource follow start')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc slash resource follow base complete' } }] }));
+      return;
+    }
     if (user.includes('expect no tools')) {
       if ((body.tools?.length ?? 0) !== 0) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -1875,6 +1914,67 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc queued follow image observed' } }] }));
       return;
     }
+    if (userMessages.includes('rpc active slash resource steer start')) {
+      if (userMessages.includes('rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta')) {
+        const content = 'rpc active slash resource steer observed';
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        const started = process.cwd() + '/zig-out/pi-zig-rpc-provider-active-resource-steer.started';
+        const release = process.cwd() + '/zig-out/pi-zig-rpc-provider-active-resource-steer.release';
+        const command = 'printf started > ' + JSON.stringify(started) + '; while [ ! -f ' + JSON.stringify(release) + ' ]; do sleep 0.05; done; printf released';
+        const toolCall = { index: 0, id: 'call_rpc_active_resource_steer_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command }) } };
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { tool_calls: [toolCall] } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCall] } }] }));
+        return;
+      }
+      res.writeHead(409, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'active slash resource steer was not drained before tool-result continuation', userMessages, toolMessages }));
+      return;
+    }
+    if (userMessages.includes('rpc active slash resource follow start')) {
+      if (userMessages.includes('rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta')) {
+        const content = 'rpc active slash resource follow observed';
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        const started = process.cwd() + '/zig-out/pi-zig-rpc-provider-active-resource-follow.started';
+        const release = process.cwd() + '/zig-out/pi-zig-rpc-provider-active-resource-follow.release';
+        const command = 'printf started > ' + JSON.stringify(started) + '; while [ ! -f ' + JSON.stringify(release) + ' ]; do sleep 0.05; done; printf released';
+        const toolCall = { index: 0, id: 'call_rpc_active_resource_follow_1', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command }) } };
+        if (body.stream === true) {
+          writeStreamEvents([{ choices: [{ delta: { tool_calls: [toolCall] } }] }]);
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCall] } }] }));
+        return;
+      }
+      const content = 'rpc active slash resource follow base complete';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
     if (userMessages.includes('rpc active prompt streaming steer start')) {
       if (userMessages.includes('rpc active prompt streaming steer queued')) {
         const content = 'rpc active prompt streaming steer observed';
@@ -2299,6 +2399,7 @@ fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/agent/prompts'), { recursive: t
 fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/agent/skills/brave-search'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/prompts'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/skills/project-skill'), { recursive: true });
+fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/skills/resource-skill'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/settings-prompts'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/settings-plus-prompts'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/settings-skills/project-settings-skill'), { recursive: true });
@@ -2395,6 +2496,15 @@ fs.writeFileSync(
   ['---', 'description: Review code changes', '---', 'Review code for bugs.'].join('\n')
 );
 fs.writeFileSync(
+  path.join(commandsFixtureRoot, '.pi/prompts/resource-check.md'),
+  [
+    '---',
+    'description: Resource expansion prompt',
+    '---',
+    'rpc slash prompt template expansion: first=$1 rest=${@:2} all=$ARGUMENTS'
+  ].join('\n')
+);
+fs.writeFileSync(
   path.join(commandsFixtureRoot, '.pi/settings-prompts/project-settings.md'),
   ['---', 'description: Project settings prompt', '---', 'Prompt from .pi/settings.json.'].join('\n')
 );
@@ -2425,6 +2535,10 @@ fs.writeFileSync(
 fs.writeFileSync(
   path.join(commandsFixtureRoot, '.pi/skills/project-skill/SKILL.md'),
   ['---', 'name: project-skill', 'description: Project skill command', '---', 'Use the project skill.'].join('\n')
+);
+fs.writeFileSync(
+  path.join(commandsFixtureRoot, '.pi/skills/resource-skill/SKILL.md'),
+  ['---', 'name: resource-skill', 'description: Resource expansion skill', '---', 'rpc slash skill expansion body'].join('\n')
 );
 fs.writeFileSync(
   path.join(commandsFixtureRoot, '.pi/settings-skills/project-settings-skill/SKILL.md'),
@@ -2732,6 +2846,12 @@ if (
     command.sourceInfo?.baseDir?.endsWith('.pi/prompts')
   ) ||
   !fixtureCommands.commands.some((command) =>
+    command.name === 'resource-check' &&
+    command.description === 'Resource expansion prompt' &&
+    command.source === 'prompt' &&
+    command.sourceInfo?.baseDir?.endsWith('.pi/prompts')
+  ) ||
+  !fixtureCommands.commands.some((command) =>
     command.name === 'global-review' &&
     command.source === 'prompt' &&
     command.sourceInfo?.scope === 'user'
@@ -2803,6 +2923,11 @@ if (
     command.name === 'skill:project-skill' &&
     command.description === 'Project skill command' &&
     command.sourceInfo?.baseDir?.endsWith('.pi/skills/project-skill')
+  ) ||
+  !fixtureCommands.commands.some((command) =>
+    command.name === 'skill:resource-skill' &&
+    command.description === 'Resource expansion skill' &&
+    command.sourceInfo?.baseDir?.endsWith('.pi/skills/resource-skill')
   ) ||
   !fixtureCommands.commands.some((command) =>
     command.name === 'skill:global-skill' &&
@@ -2938,6 +3063,7 @@ if (
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'review' && command.source === 'extension') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'deploy:2' && command.source === 'extension') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'fix-tests' && command.source === 'prompt') ||
+  !rpcCommandsResponse.data.commands.some((command) => command.name === 'resource-check' && command.source === 'prompt') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'global-review' && command.sourceInfo?.scope === 'user') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'project-settings' && command.sourceInfo?.scope === 'project') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'project-reincluded' && command.sourceInfo?.scope === 'project') ||
@@ -2947,6 +3073,7 @@ if (
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'global-package-review' && command.sourceInfo?.origin === 'package') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'ship' && command.sourceInfo?.scope === 'temporary') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'skill:brave-search' && command.source === 'skill') ||
+  !rpcCommandsResponse.data.commands.some((command) => command.name === 'skill:resource-skill' && command.source === 'skill') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'skill:project-settings-skill' && command.sourceInfo?.scope === 'project') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'skill:project-reincluded-skill' && command.sourceInfo?.scope === 'project') ||
   !rpcCommandsResponse.data.commands.some((command) => command.name === 'skill:project-package-skill' && command.sourceInfo?.origin === 'package') ||
@@ -6526,6 +6653,153 @@ try {
     }
   }
 
+  async function runRpcProviderActiveResourcePromptSmoke(kind) {
+    const isFollow = kind === 'follow';
+    const sessionFile = path.resolve(`zig-out/pi-zig-rpc-provider-active-resource-${kind}-smoke.jsonl`);
+    const markerFile = path.resolve(`zig-out/pi-zig-rpc-provider-active-resource-${kind}.started`);
+    const releaseFile = path.resolve(`zig-out/pi-zig-rpc-provider-active-resource-${kind}.release`);
+    fs.rmSync(sessionFile, { force: true });
+    fs.rmSync(markerFile, { force: true });
+    fs.rmSync(releaseFile, { force: true });
+    const child = spawn(bin, ['--mode', 'rpc', '--session', sessionFile], {
+      cwd: commandsFixtureRoot,
+      env: { ...rpcProviderEnv, HOME: commandsFixtureHome },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    let pending = '';
+    const lines = [];
+    const waiters = [];
+    function failWaiters(error) {
+      while (waiters.length > 0) {
+        const waiter = waiters.shift();
+        clearTimeout(waiter.timeout);
+        waiter.reject(error);
+      }
+    }
+    function resolveWaiters(line) {
+      for (let index = 0; index < waiters.length;) {
+        const waiter = waiters[index];
+        if (waiter.predicate(line)) {
+          waiters.splice(index, 1);
+          clearTimeout(waiter.timeout);
+          waiter.resolve(line);
+        } else {
+          index += 1;
+        }
+      }
+    }
+    function waitForLine(predicate, timeoutMs = 4000) {
+      const existing = lines.find(predicate);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          const error = new Error(`timed out waiting for active resource ${kind} RPC line\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+          const index = waiters.findIndex((waiter) => waiter.reject === reject);
+          if (index !== -1) waiters.splice(index, 1);
+          reject(error);
+        }, timeoutMs);
+        waiters.push({ predicate, resolve, reject, timeout });
+      });
+    }
+    function waitForFile(file, timeoutMs = 2500) {
+      return new Promise((resolve, reject) => {
+        const started = Date.now();
+        const interval = setInterval(() => {
+          if (fs.existsSync(file)) {
+            clearInterval(interval);
+            resolve();
+            return;
+          }
+          if (Date.now() - started > timeoutMs) {
+            clearInterval(interval);
+            reject(new Error(`timed out waiting for ${file}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          }
+        }, 25);
+      });
+    }
+    function writeCommand(command) {
+      child.stdin.write(`${JSON.stringify(command)}\n`);
+    }
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      pending += chunk;
+      while (pending.includes('\n')) {
+        const newline = pending.indexOf('\n');
+        const rawLine = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (rawLine.trim().length === 0) continue;
+        try {
+          const line = JSON.parse(rawLine);
+          lines.push(line);
+          resolveWaiters(line);
+        } catch (error) {
+          failWaiters(new Error(`failed to parse active resource ${kind} RPC JSON line: ${rawLine}\n${error.message}`));
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const exitPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`active resource ${kind} smoke timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      }, 9000);
+      child.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once('exit', (code, signal) => {
+        clearTimeout(timeout);
+        if (code !== 0) {
+          reject(new Error(`active resource ${kind} smoke exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          return;
+        }
+        resolve();
+      });
+    });
+
+    writeCommand({ id: `rpc-active-resource-${kind}-model`, type: 'set_model', provider: 'openai', modelId: 'gpt-4o' });
+    await waitForLine((line) => line.id === `rpc-active-resource-${kind}-model` && line.success === true);
+    writeCommand({ id: `rpc-active-resource-${kind}-start`, type: 'prompt', message: `rpc active slash resource ${kind} start` });
+    await waitForFile(markerFile);
+    writeCommand({
+      id: `rpc-active-resource-${kind}-queued`,
+      type: 'prompt',
+      message: '/resource-check alpha "beta gamma" delta',
+      streamingBehavior: isFollow ? 'followUp' : 'steer'
+    });
+    const queuedResponse = await waitForLine((line) => line.id === `rpc-active-resource-${kind}-queued`, 1000);
+    fs.writeFileSync(releaseFile, 'release');
+    const promptResponse = await waitForLine((line) => line.id === `rpc-active-resource-${kind}-start`, 5000);
+    writeCommand({ id: `rpc-active-resource-${kind}-messages`, type: 'get_messages' });
+    const messagesResponse = await waitForLine((line) => line.id === `rpc-active-resource-${kind}-messages`, 2500);
+    child.stdin.end();
+    await exitPromise;
+
+    const messages = messagesResponse?.data?.messages ?? [];
+    const assistantTexts = messages.filter((message) => message.role === 'assistant').map((message) => message.content);
+    const baseIndex = assistantTexts.indexOf(`rpc active slash resource ${kind} base complete`);
+    const observedIndex = assistantTexts.indexOf(`rpc active slash resource ${kind} observed`);
+    if (
+      !queuedResponse?.success ||
+      queuedResponse?.data?.pendingMessageCount !== 1 ||
+      queuedResponse?.data?.steeringCount !== (isFollow ? 0 : 1) ||
+      queuedResponse?.data?.followUpCount !== (isFollow ? 1 : 0) ||
+      promptResponse?.data?.text !== `rpc active slash resource ${kind} observed` ||
+      !messages.some((message) => message.role === 'user' && message.content === 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta') ||
+      messages.some((message) => typeof message.content === 'string' && message.content.includes('/resource-check')) ||
+      (!isFollow && baseIndex !== -1) ||
+      (isFollow && (baseIndex === -1 || observedIndex === -1 || baseIndex > observedIndex))
+    ) {
+      throw new Error(`active resource ${kind} smoke failed\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+  }
+
   const rpcExtensionHookFixture = path.resolve('zig-out/pi-zig-rpc-extension-hook-fixture');
   fs.rmSync(rpcExtensionHookFixture, { recursive: true, force: true });
   fs.mkdirSync(rpcExtensionHookFixture, { recursive: true });
@@ -6701,6 +6975,92 @@ export default function(pi) {
     !rpcProviderContextPrompt?.data?.text?.includes('rpc provider project context sentinel')
   ) {
     throw new Error('rpc provider prompt smoke did not build a runtime system prompt with context and tool metadata');
+  }
+
+  const rpcProviderResourceExpansionSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-resource-expansion-smoke.jsonl');
+  fs.rmSync(rpcProviderResourceExpansionSessionFile, { force: true });
+  const expectedPromptExpansion = 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta';
+  const expectedSkillExpansion = [
+    '<skill name="resource-skill" location=".pi/skills/resource-skill/SKILL.md">',
+    'References are relative to .pi/skills/resource-skill.',
+    '',
+    'rpc slash skill expansion body',
+    '</skill>',
+    '',
+    'Focus on loaded instructions'
+  ].join('\n');
+  const { lines: rpcProviderResourceExpansionResponses } = await runRpcSequential(
+    ['--mode', 'rpc', '--session', rpcProviderResourceExpansionSessionFile],
+    [
+      { id: 'rpc-resource-expansion-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' },
+      { id: 'rpc-resource-expansion-prompt-template', type: 'prompt', message: '/resource-check alpha "beta gamma" delta' },
+      { id: 'rpc-resource-expansion-skill', type: 'prompt', message: '/skill:resource-skill Focus on loaded instructions' },
+      { id: 'rpc-resource-expansion-messages', type: 'get_messages' }
+    ],
+    { cwd: commandsFixtureRoot, env: { ...rpcProviderEnv, HOME: commandsFixtureHome } }
+  );
+  const rpcProviderResourceExpansionPrompt = rpcProviderResourceExpansionResponses.find(
+    (response) => response.id === 'rpc-resource-expansion-prompt-template'
+  );
+  const rpcProviderResourceExpansionSkill = rpcProviderResourceExpansionResponses.find(
+    (response) => response.id === 'rpc-resource-expansion-skill'
+  );
+  const rpcProviderResourceExpansionMessages = rpcProviderResourceExpansionResponses.find(
+    (response) => response.id === 'rpc-resource-expansion-messages'
+  );
+  const rpcResourceUserMessages = rpcProviderResourceExpansionMessages?.data?.messages
+    ?.filter((message) => message.role === 'user')
+    ?.map((message) => message.content) ?? [];
+  if (
+    !rpcProviderResourceExpansionPrompt?.success ||
+    rpcProviderResourceExpansionPrompt?.data?.text !== 'rpc slash prompt template expansion observed' ||
+    !rpcProviderResourceExpansionSkill?.success ||
+    rpcProviderResourceExpansionSkill?.data?.text !== 'rpc slash skill expansion observed' ||
+    !rpcResourceUserMessages.includes(expectedPromptExpansion) ||
+    !rpcResourceUserMessages.includes(expectedSkillExpansion) ||
+    rpcResourceUserMessages.some((content) =>
+      typeof content === 'string' &&
+      (content.includes('/resource-check') || content.includes('/skill:resource-skill'))
+    )
+  ) {
+    throw new Error('rpc provider slash resource expansion smoke did not expand prompt templates and skills before provider execution');
+  }
+
+  const rpcProviderQueuedResourceSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-queued-resource-expansion-smoke.jsonl');
+  fs.rmSync(rpcProviderQueuedResourceSessionFile, { force: true });
+  const { lines: rpcProviderQueuedResourceResponses } = await runRpcSequential(
+    ['rpc', rpcProviderQueuedResourceSessionFile],
+    [
+      { id: 'rpc-queued-resource-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' },
+      { id: 'rpc-queued-resource-steer', type: 'steer', message: '/resource-check alpha "beta gamma" delta' },
+      { id: 'rpc-queued-resource-steer-prompt', type: 'prompt', message: 'rpc slash resource steer start' },
+      { id: 'rpc-queued-resource-follow', type: 'follow_up', message: '/resource-check alpha "beta gamma" delta' },
+      { id: 'rpc-queued-resource-follow-prompt', type: 'prompt', message: 'rpc slash resource follow start' },
+      { id: 'rpc-queued-resource-messages', type: 'get_messages' }
+    ],
+    { cwd: commandsFixtureRoot, env: { ...rpcProviderEnv, HOME: commandsFixtureHome } }
+  );
+  const rpcProviderQueuedResourceSteer = rpcProviderQueuedResourceResponses.find((response) => response.id === 'rpc-queued-resource-steer');
+  const rpcProviderQueuedResourceSteerPrompt = rpcProviderQueuedResourceResponses.find((response) => response.id === 'rpc-queued-resource-steer-prompt');
+  const rpcProviderQueuedResourceFollow = rpcProviderQueuedResourceResponses.find((response) => response.id === 'rpc-queued-resource-follow');
+  const rpcProviderQueuedResourceFollowPrompt = rpcProviderQueuedResourceResponses.find((response) => response.id === 'rpc-queued-resource-follow-prompt');
+  const rpcProviderQueuedResourceMessages = rpcProviderQueuedResourceResponses.find((response) => response.id === 'rpc-queued-resource-messages');
+  const rpcQueuedResourceUserMessages = rpcProviderQueuedResourceMessages?.data?.messages
+    ?.filter((message) => message.role === 'user')
+    ?.map((message) => message.content) ?? [];
+  if (
+    !rpcProviderQueuedResourceSteer?.success ||
+    rpcProviderQueuedResourceSteerPrompt?.data?.text !== 'rpc slash prompt template expansion observed' ||
+    !rpcProviderQueuedResourceFollow?.success ||
+    rpcProviderQueuedResourceFollowPrompt?.data?.text !== 'rpc slash prompt template expansion observed' ||
+    JSON.stringify(rpcQueuedResourceUserMessages) !== JSON.stringify([
+      'rpc slash resource steer start',
+      expectedPromptExpansion,
+      'rpc slash resource follow start',
+      expectedPromptExpansion
+    ])
+  ) {
+    throw new Error('rpc provider queued slash resource expansion smoke did not expand direct steer/follow_up resources before queue drain');
   }
 
   const rpcProviderImageSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-image-smoke.jsonl');
@@ -7160,8 +7520,8 @@ export default function(pi) {
   await runRpcProviderAbortInFlightSmoke();
   await runRpcProviderPromptStreamingBehaviorSmoke('steer');
   await runRpcProviderPromptStreamingBehaviorSmoke('follow');
-  await runRpcProviderActiveExtensionQueueSmoke('steer');
-  await runRpcProviderActiveExtensionQueueSmoke('follow');
+  await runRpcProviderActiveResourcePromptSmoke('steer');
+  await runRpcProviderActiveResourcePromptSmoke('follow');
   await runRpcProviderActiveExtensionQueueSmoke('steer', true);
   await runRpcProviderActiveExtensionQueueSmoke('follow', true);
 

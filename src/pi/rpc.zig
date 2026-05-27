@@ -2112,6 +2112,15 @@ const Runtime = struct {
         return true;
     }
 
+    fn expandSlashResourceCommand(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        message: []const u8,
+    ) !?[]u8 {
+        return commands.expandSlashResourceCommand(io, allocator, message, self.run_options.command_options);
+    }
+
     fn handlePromptCommand(
         self: *Runtime,
         io: std.Io,
@@ -2290,23 +2299,30 @@ const Runtime = struct {
                     .follow_up => &self.follow_up_queue,
                     .next_turn => unreachable,
                 };
-                if (self.handleQueuedExtensionPromptCommand(io, allocator, w, id, command, message, delivery, queue) catch |err| {
+                const expanded_message = self.expandSlashResourceCommand(io, allocator, message) catch |err| {
                     return writeError(w, id, command, @errorName(err));
-                }) return;
+                };
+                defer if (expanded_message) |owned| allocator.free(owned);
+                const queue_message = expanded_message orelse message;
                 const image_parts = parseRpcImages(allocator, value) catch {
                     return writeError(w, id, command, "prompt images must be ImageContent objects with type=image, data, and mimeType");
                 };
                 defer freeRpcImages(allocator, image_parts);
-                return self.enqueuePendingMessage(allocator, w, id, command, queue, message, image_parts);
+                return self.enqueuePendingMessage(allocator, w, id, command, queue, queue_message, image_parts);
             }
             if (self.handleExtensionPromptCommand(io, allocator, output, w, id, command, message) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             }) return;
+            const expanded_message = self.expandSlashResourceCommand(io, allocator, message) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            };
+            defer if (expanded_message) |owned| allocator.free(owned);
+            const prompt_message = expanded_message orelse message;
             const image_parts = parseRpcImages(allocator, value) catch {
                 return writeError(w, id, command, "prompt images must be ImageContent objects with type=image, data, and mimeType");
             };
             defer freeRpcImages(allocator, image_parts);
-            self.startPromptAsync(io, allocator, output, id, message, image_parts) catch |err| {
+            self.startPromptAsync(io, allocator, output, id, prompt_message, image_parts) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             };
             return;
@@ -2316,40 +2332,38 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "steer requires a string message");
             };
-            if (self.isPromptRunning()) {
-                if (self.handleQueuedExtensionPromptCommand(io, allocator, w, id, command, message, .steer, &self.steering_queue) catch |err| {
-                    return writeError(w, id, command, @errorName(err));
-                }) return;
-            } else {
-                if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
-                    return writeError(w, id, command, @errorName(err));
-                }) return;
-            }
+            if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            }) return;
+            const expanded_message = self.expandSlashResourceCommand(io, allocator, message) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            };
+            defer if (expanded_message) |owned| allocator.free(owned);
+            const queue_message = expanded_message orelse message;
             const image_parts = parseRpcImages(allocator, value) catch {
                 return writeError(w, id, command, "steer images must be ImageContent objects with type=image, data, and mimeType");
             };
             defer freeRpcImages(allocator, image_parts);
-            return self.enqueuePendingMessage(allocator, w, id, command, &self.steering_queue, message, image_parts);
+            return self.enqueuePendingMessage(allocator, w, id, command, &self.steering_queue, queue_message, image_parts);
         }
 
         if (std.mem.eql(u8, command, "follow_up")) {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "follow_up requires a string message");
             };
-            if (self.isPromptRunning()) {
-                if (self.handleQueuedExtensionPromptCommand(io, allocator, w, id, command, message, .follow_up, &self.follow_up_queue) catch |err| {
-                    return writeError(w, id, command, @errorName(err));
-                }) return;
-            } else {
-                if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
-                    return writeError(w, id, command, @errorName(err));
-                }) return;
-            }
+            if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            }) return;
+            const expanded_message = self.expandSlashResourceCommand(io, allocator, message) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            };
+            defer if (expanded_message) |owned| allocator.free(owned);
+            const queue_message = expanded_message orelse message;
             const image_parts = parseRpcImages(allocator, value) catch {
                 return writeError(w, id, command, "follow_up images must be ImageContent objects with type=image, data, and mimeType");
             };
             defer freeRpcImages(allocator, image_parts);
-            return self.enqueuePendingMessage(allocator, w, id, command, &self.follow_up_queue, message, image_parts);
+            return self.enqueuePendingMessage(allocator, w, id, command, &self.follow_up_queue, queue_message, image_parts);
         }
 
         if (std.mem.eql(u8, command, "abort")) {
