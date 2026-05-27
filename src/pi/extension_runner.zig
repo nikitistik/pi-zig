@@ -120,6 +120,7 @@ pub const Runner = struct {
         content: []u8,
         display: bool = true,
         trigger_turn: bool = false,
+        next_turn: bool = false,
 
         pub fn deinit(self: CommandCustomMessageAction, allocator: std.mem.Allocator) void {
             allocator.free(self.custom_type);
@@ -597,11 +598,16 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
                 display = display_value.bool;
             }
             var trigger_turn = false;
+            var next_turn = false;
             if (item.object.get("options")) |options| {
                 if (options != .object) return error.ExtensionHookInvalidResponse;
                 if (options.object.get("triggerTurn")) |trigger_value| {
                     if (trigger_value != .bool) return error.ExtensionHookInvalidResponse;
                     trigger_turn = trigger_value.bool;
+                }
+                if (options.object.get("deliverAs")) |deliver_as| {
+                    if (deliver_as != .string) return error.ExtensionHookInvalidResponse;
+                    if (std.mem.eql(u8, deliver_as.string, "nextTurn")) next_turn = true;
                 }
             }
             actions.append(allocator, .{ .send_message = .{
@@ -609,6 +615,7 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
                 .content = owned_content,
                 .display = display,
                 .trigger_turn = trigger_turn,
+                .next_turn = next_turn,
             } }) catch |err| {
                 allocator.free(owned_content);
                 allocator.free(owned_custom_type);
@@ -1260,6 +1267,18 @@ test "extension runner returns send custom message command actions" {
         \\      await pi.sendMessage({ customType: "test-extension", content: args, display: false });
         \\    }
         \\  });
+        \\  pi.registerCommand("trigger-custom", {
+        \\    description: "Send a custom message and trigger a turn",
+        \\    handler: async (args) => {
+        \\      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { triggerTurn: true });
+        \\    }
+        \\  });
+        \\  pi.registerCommand("next-turn-custom", {
+        \\    description: "Queue a custom message for the next turn",
+        \\    handler: async (args) => {
+        \\      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { deliverAs: "nextTurn" });
+        \\    }
+        \\  });
         \\}
     });
 
@@ -1274,6 +1293,36 @@ test "extension runner returns send custom message command actions" {
             try std.testing.expectEqualStrings("custom note", message.content);
             try std.testing.expect(!message.display);
             try std.testing.expect(!message.trigger_turn);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+
+    const trigger_result = try runner.runRegisteredCommand("trigger-custom", "custom prompt");
+    defer trigger_result.deinit(allocator);
+    try std.testing.expect(trigger_result.handled);
+    try std.testing.expectEqual(@as(usize, 1), trigger_result.actions.len);
+    switch (trigger_result.actions[0]) {
+        .send_message => |message| {
+            try std.testing.expectEqualStrings("test-extension", message.custom_type);
+            try std.testing.expectEqualStrings("custom prompt", message.content);
+            try std.testing.expect(message.display);
+            try std.testing.expect(message.trigger_turn);
+            try std.testing.expect(!message.next_turn);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
+
+    const next_turn_result = try runner.runRegisteredCommand("next-turn-custom", "queued custom");
+    defer next_turn_result.deinit(allocator);
+    try std.testing.expect(next_turn_result.handled);
+    try std.testing.expectEqual(@as(usize, 1), next_turn_result.actions.len);
+    switch (next_turn_result.actions[0]) {
+        .send_message => |message| {
+            try std.testing.expectEqualStrings("test-extension", message.custom_type);
+            try std.testing.expectEqualStrings("queued custom", message.content);
+            try std.testing.expect(message.display);
+            try std.testing.expect(!message.trigger_turn);
+            try std.testing.expect(message.next_turn);
         },
         else => return error.UnexpectedCommandAction,
     }

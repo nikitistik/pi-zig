@@ -106,13 +106,21 @@ const ActiveBashJob = struct {
 };
 
 const ActivePromptJob = struct {
+    const Kind = enum {
+        user,
+        custom_message,
+    };
+
     runtime: *Runtime,
     output: *RpcOutput,
     io: std.Io,
     allocator: std.mem.Allocator,
     id: ?[]u8 = null,
+    kind: Kind = .user,
     message: []u8,
     image_parts: []ai_client.ChatContentPart = &.{},
+    custom_type: ?[]u8 = null,
+    custom_display: bool = true,
     thread: ?std.Thread = null,
     mutex: Mutex = .{},
     cancel_requested: bool = false,
@@ -123,6 +131,7 @@ const ActivePromptJob = struct {
     fn deinit(self: *ActivePromptJob) void {
         if (self.id) |id| self.allocator.free(id);
         self.allocator.free(self.message);
+        if (self.custom_type) |custom_type| self.allocator.free(custom_type);
         freeRpcContentParts(self.allocator, self.image_parts);
     }
 
@@ -511,6 +520,41 @@ const Runtime = struct {
             .id = owned_id,
             .message = owned_message,
             .image_parts = owned_image_parts,
+        };
+        job.thread = try std.Thread.spawn(.{}, promptThreadMain, .{job});
+        self.active_prompt = job;
+    }
+
+    fn startCustomPromptAsync(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        output: *RpcOutput,
+        id: ?[]const u8,
+        custom_type: []const u8,
+        content: []const u8,
+        display: bool,
+    ) !void {
+        if (self.active_prompt != null) return error.PromptAlreadyRunning;
+        const owned_id = if (id) |request_id| try allocator.dupe(u8, request_id) else null;
+        errdefer if (owned_id) |request_id| allocator.free(request_id);
+        const owned_message = try allocator.dupe(u8, content);
+        errdefer allocator.free(owned_message);
+        const owned_custom_type = try allocator.dupe(u8, custom_type);
+        errdefer allocator.free(owned_custom_type);
+
+        var job = try allocator.create(ActivePromptJob);
+        errdefer allocator.destroy(job);
+        job.* = .{
+            .runtime = self,
+            .output = output,
+            .io = io,
+            .allocator = allocator,
+            .id = owned_id,
+            .kind = .custom_message,
+            .message = owned_message,
+            .custom_type = owned_custom_type,
+            .custom_display = display,
         };
         job.thread = try std.Thread.spawn(.{}, promptThreadMain, .{job});
         self.active_prompt = job;
@@ -1670,15 +1714,28 @@ const Runtime = struct {
         if (!result.handled) return false;
         var started_prompt = false;
         for (result.actions) |action| {
+            if (started_prompt) return error.MultipleCommandPromptActionsUnsupported;
             switch (action) {
                 .send_user_message => |content| {
-                    if (started_prompt) return error.MultipleCommandPromptActionsUnsupported;
                     try self.startPromptAsync(io, allocator, output, id, content, &.{});
                     started_prompt = true;
                 },
                 .send_message => |custom_message| {
-                    if (custom_message.trigger_turn) return error.UnsupportedCommandActionTriggerTurn;
-                    try self.addCustomMessage(io, allocator, custom_message.custom_type, custom_message.content, custom_message.display);
+                    if (custom_message.next_turn) return error.UnsupportedCommandActionNextTurn;
+                    if (custom_message.trigger_turn) {
+                        try self.startCustomPromptAsync(
+                            io,
+                            allocator,
+                            output,
+                            id,
+                            custom_message.custom_type,
+                            custom_message.content,
+                            custom_message.display,
+                        );
+                        started_prompt = true;
+                    } else {
+                        try self.addCustomMessage(io, allocator, custom_message.custom_type, custom_message.content, custom_message.display);
+                    }
                 },
             }
         }
@@ -1751,6 +1808,46 @@ const Runtime = struct {
         const result = last_result orelse return null;
         last_result = null;
         return result;
+    }
+
+    fn runCustomPromptCommand(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
+        retry_event_output: ?*RpcOutput,
+        prompt_job: ?*ActivePromptJob,
+        custom_type: []const u8,
+        content: []const u8,
+        display: bool,
+    ) !?agent.RunResult {
+        const history_limit = self.message_count;
+        try self.addCustomMessage(io, allocator, custom_type, content, display);
+
+        const maybe_run_result = self.runAgentIfAuthenticated(
+            io,
+            allocator,
+            w,
+            retry_event_output,
+            prompt_job,
+            history_limit,
+            &.{},
+            content,
+            &.{},
+        ) catch |err| {
+            if (err != error.RetryCancelled) {
+                const stop_reason: []const u8 = if (err == error.AgentAborted) "aborted" else "error";
+                const error_message: []const u8 = if (err == error.AgentAborted) "Request was aborted" else @errorName(err);
+                try self.addAssistantStatusMessage(io, allocator, "", stop_reason, error_message);
+                try writeRpcAssistantStatusEventsMaybeLocked(retry_event_output, w, self, stop_reason, error_message);
+            }
+            return err;
+        };
+        var run_result = maybe_run_result orelse return null;
+        errdefer run_result.deinit(allocator);
+
+        try self.addAgentResultMessages(io, allocator, run_result);
+        return run_result;
     }
 
     fn handleValue(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, output: *RpcOutput, value: std.json.Value) !void {
@@ -2294,15 +2391,27 @@ const Runtime = struct {
 };
 
 fn promptThreadMain(job: *ActivePromptJob) void {
-    const maybe_result = job.runtime.runPromptCommand(
-        job.io,
-        job.allocator,
-        job.output.writer,
-        job.output,
-        job,
-        job.message,
-        job.image_parts,
-    ) catch |err| {
+    const maybe_result = switch (job.kind) {
+        .user => job.runtime.runPromptCommand(
+            job.io,
+            job.allocator,
+            job.output.writer,
+            job.output,
+            job,
+            job.message,
+            job.image_parts,
+        ),
+        .custom_message => job.runtime.runCustomPromptCommand(
+            job.io,
+            job.allocator,
+            job.output.writer,
+            job.output,
+            job,
+            job.custom_type.?,
+            job.message,
+            job.custom_display,
+        ),
+    } catch |err| {
         job.output.mutex.lock();
         defer job.output.mutex.unlock();
         writeError(job.output.writer, job.id, "prompt", @errorName(err)) catch {};

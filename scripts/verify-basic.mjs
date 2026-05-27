@@ -2326,6 +2326,12 @@ fs.writeFileSync(
     '      await pi.sendMessage({ customType: "test-extension", content: args, display: false });',
     '    }',
     '  });',
+    '  pi.registerCommand("send-next-turn-message", {',
+    '    description: "Queue a custom message for the next turn",',
+    '    handler: async (args) => {',
+    '      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { deliverAs: "nextTurn" });',
+    '    }',
+    '  });',
     '}'
   ].join('\n')
 );
@@ -2783,6 +2789,39 @@ if (
   !rpcCustomSessionText.includes('"customType":"test-extension"')
 ) {
   throw new Error('rpc extension command sendMessage action did not persist an upstream-shaped custom message');
+}
+const fixtureRpcCommandNextTurnSession = path.join(commandsFixtureRoot, 'rpc-command-send-next-turn-message.jsonl');
+fs.rmSync(fixtureRpcCommandNextTurnSession, { force: true });
+const fixtureRpcCommandNextTurnOutput = run(
+  [
+    '--mode',
+    'rpc',
+    '--session',
+    fixtureRpcCommandNextTurnSession,
+    '--extension',
+    'extensions/command-exec.mjs'
+  ],
+  [
+    JSON.stringify({ id: 'rpc-command-send-next-turn', type: 'prompt', message: '/send-next-turn-message queued custom note' }),
+    JSON.stringify({ id: 'rpc-command-send-next-turn-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { cwd: commandsFixtureRoot, env: commandsFixtureEnv }
+);
+const fixtureRpcCommandNextTurnResponses = fixtureRpcCommandNextTurnOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcCommandNextTurn = fixtureRpcCommandNextTurnResponses.find((response) => response.id === 'rpc-command-send-next-turn');
+const rpcCommandNextTurnMessages = fixtureRpcCommandNextTurnResponses.find((response) => response.id === 'rpc-command-send-next-turn-messages');
+const rpcNextTurnSessionText = fs.existsSync(fixtureRpcCommandNextTurnSession)
+  ? fs.readFileSync(fixtureRpcCommandNextTurnSession, 'utf8')
+  : '';
+if (
+  rpcCommandNextTurn?.success !== false ||
+  !rpcCommandNextTurn?.error?.includes('UnsupportedCommandActionNextTurn') ||
+  rpcCommandNextTurnMessages?.data?.messages?.length !== 0 ||
+  rpcNextTurnSessionText.includes('"type":"custom_message"') ||
+  rpcNextTurnSessionText.includes('queued custom note')
+) {
+  throw new Error('rpc extension command sendMessage nextTurn action was not rejected visibly');
 }
 fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
 const topLevelCommandEnv = envWithoutAnthropicAuth({ HOME: commandsFixtureHome });
@@ -5746,6 +5785,17 @@ export default function(pi: any): void {
   });
 }
 `);
+  const rpcExtensionCommandTriggerPath = path.join(rpcExtensionHookFixture, 'command-trigger.mjs');
+  fs.writeFileSync(rpcExtensionCommandTriggerPath, `
+export default function(pi) {
+  pi.registerCommand("trigger-custom", {
+    description: "Trigger a provider turn from a custom message",
+    handler: async (args) => {
+      await pi.sendMessage({ customType: "trigger-extension", content: args, display: true }, { triggerTurn: true });
+    }
+  });
+}
+`);
   const rpcDiscoveredExtensionProject = path.resolve('zig-out/pi-zig-rpc-discovered-extension-project');
   fs.rmSync(rpcDiscoveredExtensionProject, { recursive: true, force: true });
   fs.mkdirSync(path.join(rpcDiscoveredExtensionProject, '.pi/extensions'), { recursive: true });
@@ -6527,6 +6577,39 @@ export default function(pi: any): void {
     !rpcProviderExtensionTsToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_ts_tool_1' && message.toolName === 'ext_ts_echo' && message.content === 'ext-ts-echo: rpc-ts-registered-ok')
   ) {
     throw new Error('rpc provider prompt smoke did not expose and execute an explicit TypeScript registered extension tool');
+  }
+
+  const rpcProviderExtensionCommandTriggerSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-command-trigger-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionCommandTriggerSessionFile, { force: true });
+  const rpcProviderExtensionCommandTriggerOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionCommandTriggerSessionFile, '--extension', rpcExtensionCommandTriggerPath],
+    [
+      JSON.stringify({ id: 'rpc-extension-command-trigger-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-command-trigger-prompt', type: 'prompt', message: '/trigger-custom trigger custom provider' }),
+      JSON.stringify({ id: 'rpc-extension-command-trigger-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionCommandTriggerResponses = rpcProviderExtensionCommandTriggerOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionCommandTriggerPrompt = rpcProviderExtensionCommandTriggerResponses.find((response) => response.id === 'rpc-extension-command-trigger-prompt');
+  const rpcProviderExtensionCommandTriggerMessages = rpcProviderExtensionCommandTriggerResponses.find((response) => response.id === 'rpc-extension-command-trigger-messages');
+  const rpcProviderExtensionCommandTriggerSession = fs.readFileSync(rpcProviderExtensionCommandTriggerSessionFile, 'utf8');
+  if (
+    !rpcProviderExtensionCommandTriggerPrompt?.success ||
+    !rpcProviderExtensionCommandTriggerPrompt?.data?.text?.includes('trigger custom provider') ||
+    rpcProviderExtensionCommandTriggerMessages?.data?.messages?.some((message) => message.role === 'user' && message.content.includes('/trigger-custom')) ||
+    !rpcProviderExtensionCommandTriggerMessages?.data?.messages?.some((message) =>
+      message.role === 'custom' &&
+      message.customType === 'trigger-extension' &&
+      message.content === 'trigger custom provider' &&
+      message.display === true
+    ) ||
+    !rpcProviderExtensionCommandTriggerMessages?.data?.messages?.some((message) => message.role === 'assistant' && message.content.includes('trigger custom provider')) ||
+    !rpcProviderExtensionCommandTriggerSession.includes('"type":"custom_message"') ||
+    rpcProviderExtensionCommandTriggerSession.includes('/trigger-custom trigger custom provider')
+  ) {
+    throw new Error('rpc provider prompt smoke did not trigger an agent turn from extension command sendMessage');
   }
 
   const rpcProviderDiscoveredExtensionHookSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-discovered-extension-hook-smoke.jsonl');
