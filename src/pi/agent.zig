@@ -207,56 +207,56 @@ const read_parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}},"required":["path"],"additionalProperties":false}
 ;
 const edit_parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements matched against the original file.","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact unique text to replace"},"newText":{"type":"string","description":"Replacement text"}},"required":["oldText","newText"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{"type":"object","properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}},"required":["oldText","newText"],"additionalProperties":false}}},"required":["path","edits"],"additionalProperties":false}
 ;
 const write_parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},"content":{"type":"string","description":"Content to write to the file"}},"required":["path","content"],"additionalProperties":false}
 ;
 const grep_parameters_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Search pattern (regex or literal string)"},"path":{"type":"string","description":"Directory or file to search (default: current directory)"},"glob":{"type":"string","description":"Filter files by glob pattern"},"ignoreCase":{"type":"boolean","description":"Case-insensitive search"},"literal":{"type":"boolean","description":"Treat pattern as literal string"},"context":{"type":"number","description":"Number of lines before and after each match"},"limit":{"type":"number","description":"Maximum number of matches to return"}},"required":["pattern"],"additionalProperties":false}
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Search pattern (regex or literal string)"},"path":{"type":"string","description":"Directory or file to search (default: current directory)"},"glob":{"type":"string","description":"Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"},"ignoreCase":{"type":"boolean","description":"Case-insensitive search (default: false)"},"literal":{"type":"boolean","description":"Treat pattern as literal string instead of regex (default: false)"},"context":{"type":"number","description":"Number of lines to show before and after each match (default: 0)"},"limit":{"type":"number","description":"Maximum number of matches to return (default: 100)"}},"required":["pattern"],"additionalProperties":false}
 ;
 const find_parameters_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to match files"},"path":{"type":"string","description":"Directory to search in (default: current directory)"},"limit":{"type":"number","description":"Maximum number of results"}},"required":["pattern"],"additionalProperties":false}
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"},"path":{"type":"string","description":"Directory to search in (default: current directory)"},"limit":{"type":"number","description":"Maximum number of results (default: 1000)"}},"required":["pattern"],"additionalProperties":false}
 ;
 const ls_parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"number","description":"Maximum number of entries to return"}},"additionalProperties":false}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"number","description":"Maximum number of entries to return (default: 500)"}},"additionalProperties":false}
 ;
 const non_vision_image_note = "[Current model does not support images. The image will be omitted from this request.]";
 
 const all_tool_definitions = [_]ai_client.ChatToolDefinition{
     .{
         .name = "read",
-        .description = "Read the contents of a file. Supports text files with offset and limit, plus png, jpg, gif, and webp images as attachments. Text output is truncated to pi-zig read-tool limits.",
+        .description = "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
         .parameters_json = read_parameters_json,
     },
     .{
         .name = "bash",
-        .description = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the same limits as pi-zig tool-bash.",
+        .description = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
         .parameters_json = bash_parameters_json,
     },
     .{
         .name = "edit",
-        .description = "Apply one or more exact targeted replacements to a file.",
+        .description = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
         .parameters_json = edit_parameters_json,
     },
     .{
         .name = "write",
-        .description = "Write content to a file, creating parent directories and overwriting existing content.",
+        .description = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
         .parameters_json = write_parameters_json,
     },
     .{
         .name = "grep",
-        .description = "Search file contents for a pattern. Respects .gitignore through ripgrep and returns file paths with line numbers.",
+        .description = "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.",
         .parameters_json = grep_parameters_json,
     },
     .{
         .name = "find",
-        .description = "Search for files by glob pattern. Returns matching paths relative to the search directory.",
+        .description = "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
         .parameters_json = find_parameters_json,
     },
     .{
         .name = "ls",
-        .description = "List directory contents sorted alphabetically, with slash suffixes for directories.",
+        .description = "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
         .parameters_json = ls_parameters_json,
     },
 };
@@ -879,7 +879,10 @@ fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []c
     var parsed = parseArguments(allocator, "read", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "read", err));
     defer parsed.deinit();
     const path = requiredString(parsed.value, "path") orelse return toolError(try allocator.dupe(u8, "read tool arguments are missing path."));
-    if (imageMimeTypeForPath(path)) |mime_type| {
+    const detected_mime = detectImageMimeTypeForFile(io, path) catch |err| {
+        return toolError(try std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)}));
+    };
+    if (detected_mime) |mime_type| {
         return executeReadImageTool(io, allocator, path, mime_type, model_supports_images) catch |err| {
             return toolError(try std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)}));
         };
@@ -990,10 +993,10 @@ fn executeEditTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []c
         const new_text = requiredString(edit_value, "newText") orelse return toolError(try allocator.dupe(u8, "edit tool edit is missing newText."));
         try edit_replacements.append(allocator, .{ .old_text = old_text, .new_text = new_text });
     }
-    const content = tools.editFileManyText(io, allocator, path, edit_replacements.items) catch |err| {
+    const outcome = tools.editFileManyResult(io, allocator, path, edit_replacements.items) catch |err| {
         return toolError(try std.fmt.allocPrint(allocator, "edit tool failed: {s}", .{@errorName(err)}));
     };
-    return toolOk(content);
+    return .{ .content = outcome.message, .is_error = outcome.is_error };
 }
 
 fn executeWriteTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8) !ToolExecutionResult {
@@ -1065,22 +1068,14 @@ fn toolError(content: []u8) ToolExecutionResult {
     return .{ .content = content, .is_error = true };
 }
 
-fn imageMimeTypeForPath(path: []const u8) ?[]const u8 {
-    const ext = std.fs.path.extension(path);
-    if (asciiEqlIgnoreCase(ext, ".png")) return "image/png";
-    if (asciiEqlIgnoreCase(ext, ".jpg")) return "image/jpeg";
-    if (asciiEqlIgnoreCase(ext, ".jpeg")) return "image/jpeg";
-    if (asciiEqlIgnoreCase(ext, ".webp")) return "image/webp";
-    if (asciiEqlIgnoreCase(ext, ".gif")) return "image/gif";
-    return null;
-}
-
-fn asciiEqlIgnoreCase(left: []const u8, right: []const u8) bool {
-    if (left.len != right.len) return false;
-    for (left, right) |l, r| {
-        if (std.ascii.toLower(l) != std.ascii.toLower(r)) return false;
-    }
-    return true;
+fn detectImageMimeTypeForFile(io: std.Io, path: []const u8) !?[]const u8 {
+    // Sniff only the leading bytes upstream reads (mime.ts), regardless of file size.
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buf: [tools.image_type_sniff_bytes]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    const read_len = reader.interface.readSliceShort(&buf) catch 0;
+    return tools.detectImageMimeType(buf[0..read_len]);
 }
 
 fn fieldValue(value: std.json.Value, name: []const u8) ?std.json.Value {
@@ -1168,11 +1163,22 @@ test "failed tool calls are marked as errors" {
     try std.testing.expect(std.mem.startsWith(u8, result.content, "read tool failed:"));
 }
 
+// Canonical 1x1 PNG used by image read tests; matches the verify-basic.mjs
+// fixture so magic-byte detection (tools.detectImageMimeType) recognizes it.
+const test_png_bytes = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+    0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x1f, 0x00,
+    0x03, 0x03, 0x02, 0x00, 0xef, 0xbf, 0xa7, 0xdb, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+};
+const test_png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
 test "read image appends non-vision note and keeps image parts for provider downgrade" {
     const path = "zig-out/pi-zig-read-nonvision-test.png";
     std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
-    try tools.writeFile(std.testing.io, path, "fake image bytes");
+    try tools.writeFile(std.testing.io, path, &test_png_bytes);
 
     var call = ai_client.ChatToolCall{
         .id = try std.testing.allocator.dupe(u8, "call_read_nonvision_image"),
@@ -1202,7 +1208,7 @@ test "read image appends non-vision note and keeps image parts for provider down
     switch (result.content_parts[1]) {
         .image => |image| {
             try std.testing.expectEqualStrings("image/png", image.mime_type);
-            try std.testing.expectEqualStrings("ZmFrZSBpbWFnZSBieXRlcw==", image.data);
+            try std.testing.expectEqualStrings(test_png_base64, image.data);
         },
         .text => return error.ExpectedImageContentPart,
     }
@@ -1212,7 +1218,7 @@ test "read image keeps image parts for vision model" {
     const path = "zig-out/pi-zig-read-vision-test.png";
     std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
-    try tools.writeFile(std.testing.io, path, "fake image bytes");
+    try tools.writeFile(std.testing.io, path, &test_png_bytes);
 
     var call = ai_client.ChatToolCall{
         .id = try std.testing.allocator.dupe(u8, "call_read_vision_image"),
@@ -1239,7 +1245,7 @@ test "read image keeps image parts for vision model" {
     switch (result.content_parts[1]) {
         .image => |image| {
             try std.testing.expectEqualStrings("image/png", image.mime_type);
-            try std.testing.expectEqualStrings("ZmFrZSBpbWFnZSBieXRlcw==", image.data);
+            try std.testing.expectEqualStrings(test_png_base64, image.data);
         },
         .text => return error.ExpectedImageContentPart,
     }

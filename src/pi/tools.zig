@@ -83,8 +83,77 @@ pub const EditReplacement = struct {
     new_text: []const u8,
 };
 
+/// Result of an edit attempt. `message` is the upstream-shaped success or
+/// failure text the model receives; `is_error` mirrors the tool isError flag.
+/// On success the file has already been written.
+pub const EditOutcome = struct {
+    message: []u8,
+    is_error: bool,
+};
+
 pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
+}
+
+/// Number of leading bytes upstream sniffs to detect image types (mime.ts).
+pub const image_type_sniff_bytes = 4100;
+
+const png_signature = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
+
+/// Detect a supported image MIME type from leading file bytes, mirroring
+/// upstream `detectSupportedImageMimeType`. Returns null for non-images,
+/// CMYK JPEG (0xFFD8FFF7), and animated PNG (acTL chunk before IDAT).
+pub fn detectImageMimeType(bytes: []const u8) ?[]const u8 {
+    if (startsWithBytes(bytes, &.{ 0xff, 0xd8, 0xff })) {
+        if (bytes.len >= 4 and bytes[3] == 0xf7) return null;
+        return "image/jpeg";
+    }
+    if (startsWithBytes(bytes, &png_signature)) {
+        if (isPng(bytes) and !isAnimatedPng(bytes)) return "image/png";
+        return null;
+    }
+    if (startsWithAscii(bytes, 0, "GIF")) return "image/gif";
+    if (startsWithAscii(bytes, 0, "RIFF") and startsWithAscii(bytes, 8, "WEBP")) return "image/webp";
+    return null;
+}
+
+fn startsWithBytes(buffer: []const u8, prefix: []const u8) bool {
+    if (buffer.len < prefix.len) return false;
+    return std.mem.eql(u8, buffer[0..prefix.len], prefix);
+}
+
+fn startsWithAscii(buffer: []const u8, offset: usize, text: []const u8) bool {
+    if (buffer.len < offset + text.len) return false;
+    return std.mem.eql(u8, buffer[offset .. offset + text.len], text);
+}
+
+fn readUint32Be(buffer: []const u8, offset: usize) u32 {
+    var value: u32 = 0;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        const byte: u32 = if (offset + i < buffer.len) buffer[offset + i] else 0;
+        value = (value << 8) | byte;
+    }
+    return value;
+}
+
+fn isPng(buffer: []const u8) bool {
+    return buffer.len >= 16 and readUint32Be(buffer, png_signature.len) == 13 and startsWithAscii(buffer, 12, "IHDR");
+}
+
+fn isAnimatedPng(buffer: []const u8) bool {
+    var offset: usize = png_signature.len;
+    while (offset + 8 <= buffer.len) {
+        const chunk_length = readUint32Be(buffer, offset);
+        const chunk_type_offset = offset + 4;
+        if (startsWithAscii(buffer, chunk_type_offset, "acTL")) return true;
+        if (startsWithAscii(buffer, chunk_type_offset, "IDAT")) return false;
+
+        const next_offset = offset + 8 + chunk_length + 4;
+        if (next_offset <= offset or next_offset > buffer.len) return false;
+        offset = next_offset;
+    }
+    return false;
 }
 
 pub fn readFileForTool(io: std.Io, allocator: std.mem.Allocator, path: []const u8, offset: ?usize, limit: ?usize) !void {
@@ -475,15 +544,28 @@ pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_
 }
 
 pub fn editFileMany(io: std.Io, allocator: std.mem.Allocator, path: []const u8, edits: []const EditReplacement) !void {
-    const text = try editFileManyText(io, allocator, path, edits);
-    defer allocator.free(text);
-    try std.Io.File.stdout().writeStreamingAll(io, text);
+    const outcome = try editFileManyResult(io, allocator, path, edits);
+    defer allocator.free(outcome.message);
+    try std.Io.File.stdout().writeStreamingAll(io, outcome.message);
+    if (outcome.is_error) return error.EditFailed;
 }
 
-pub fn editFileManyText(io: std.Io, allocator: std.mem.Allocator, path: []const u8, edits: []const EditReplacement) ![]u8 {
-    if (edits.len == 0) return error.EmptyEditTarget;
+/// Apply one or more exact-text replacements to a file, matching upstream
+/// `applyEditsToNormalizedContent` semantics: BOM/CRLF preservation, fuzzy
+/// matching (trailing whitespace + Unicode quotes/dashes/spaces), uniqueness
+/// and overlap detection, and upstream-shaped error messages.
+pub fn editFileManyResult(io: std.Io, allocator: std.mem.Allocator, path: []const u8, edits: []const EditReplacement) !EditOutcome {
+    if (edits.len == 0) {
+        return .{
+            .message = try std.fmt.allocPrint(allocator, "Edit tool input is invalid. edits must contain at least one replacement.", .{}),
+            .is_error = true,
+        };
+    }
 
-    const bytes = try readFile(io, allocator, path, max_edit_file_bytes);
+    const bytes = readFile(io, allocator, path, max_edit_file_bytes) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied => return .{ .message = try editAccessErrorMessage(allocator, path, err), .is_error = true },
+        else => return err,
+    };
     defer allocator.free(bytes);
 
     const stripped = stripUtf8Bom(bytes);
@@ -512,40 +594,80 @@ pub fn editFileManyText(io: std.Io, allocator: std.mem.Allocator, path: []const 
         });
     }
 
-    var matched_edits: std.ArrayList(MatchedEdit) = .empty;
-    defer matched_edits.deinit(allocator);
+    for (normalized_edits.items, 0..) |edit, index| {
+        if (edit.old_text.len == 0) {
+            return .{ .message = try emptyOldTextErrorMessage(allocator, path, index, edits.len), .is_error = true };
+        }
+    }
 
+    // Match exact first; fall back to fuzzy-normalized content space if any edit
+    // only matches fuzzily, mirroring upstream's single base-content selection.
+    var used_fuzzy = false;
     for (normalized_edits.items) |edit| {
-        if (edit.old_text.len == 0) return error.EmptyEditTarget;
-        const occurrences = findOccurrences(normalized_content, edit.old_text);
-        if (occurrences.count == 0) return error.EditTargetMissing;
-        if (occurrences.count > 1) return error.EditTargetNotUnique;
+        if (std.mem.indexOf(u8, normalized_content, edit.old_text) == null) {
+            used_fuzzy = true;
+            break;
+        }
+    }
+
+    const fuzzy_content = if (used_fuzzy) try normalizeForFuzzyMatch(allocator, normalized_content) else &[_]u8{};
+    defer if (used_fuzzy) allocator.free(fuzzy_content);
+    const base_content = if (used_fuzzy) fuzzy_content else normalized_content;
+
+    var matched_edits: std.ArrayList(MatchedEdit) = .empty;
+    defer {
+        for (matched_edits.items) |edit| allocator.free(edit.new_text);
+        matched_edits.deinit(allocator);
+    }
+
+    for (normalized_edits.items, 0..) |edit, index| {
+        const fuzzy_old = if (used_fuzzy) try normalizeForFuzzyMatch(allocator, edit.old_text) else &[_]u8{};
+        defer if (used_fuzzy) allocator.free(fuzzy_old);
+        const needle = if (used_fuzzy) fuzzy_old else edit.old_text;
+
+        const occurrences = findOccurrences(base_content, needle);
+        if (occurrences.count == 0) {
+            return .{ .message = try notFoundErrorMessage(allocator, path, index, edits.len), .is_error = true };
+        }
+        if (occurrences.count > 1) {
+            return .{ .message = try duplicateErrorMessage(allocator, path, index, edits.len, occurrences.count), .is_error = true };
+        }
+        // Replacement text uses the LF-normalized newText regardless of match mode.
+        const owned_new = try allocator.dupe(u8, edit.new_text);
+        errdefer allocator.free(owned_new);
         try matched_edits.append(allocator, .{
-            .edit_index = edit.edit_index,
+            .edit_index = index,
             .match_index = occurrences.first.?,
-            .match_len = edit.old_text.len,
-            .new_text = edit.new_text,
+            .match_len = needle.len,
+            .new_text = owned_new,
         });
     }
 
     std.mem.sort(MatchedEdit, matched_edits.items, {}, lessThanMatchedEdit);
     for (matched_edits.items[1..], 1..) |current, index| {
         const previous = matched_edits.items[index - 1];
-        if (previous.match_index + previous.match_len > current.match_index) return error.EditTargetOverlap;
+        if (previous.match_index + previous.match_len > current.match_index) {
+            return .{
+                .message = try overlapErrorMessage(allocator, path, previous.edit_index, current.edit_index),
+                .is_error = true,
+            };
+        }
     }
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var cursor: usize = 0;
     for (matched_edits.items) |edit| {
-        try out.writer.writeAll(normalized_content[cursor..edit.match_index]);
+        try out.writer.writeAll(base_content[cursor..edit.match_index]);
         try out.writer.writeAll(edit.new_text);
         cursor = edit.match_index + edit.match_len;
     }
-    try out.writer.writeAll(normalized_content[cursor..]);
+    try out.writer.writeAll(base_content[cursor..]);
     const new_content = out.written();
 
-    if (std.mem.eql(u8, normalized_content, new_content)) return error.EditNoChange;
+    if (std.mem.eql(u8, base_content, new_content)) {
+        return .{ .message = try noChangeErrorMessage(allocator, path, edits.len), .is_error = true };
+    }
 
     var final_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer final_writer.deinit();
@@ -554,9 +676,56 @@ pub fn editFileManyText(io: std.Io, allocator: std.mem.Allocator, path: []const 
     const final_content = try final_writer.toOwnedSlice();
     defer allocator.free(final_content);
 
-    try writeFile(io, path, final_content);
+    writeFile(io, path, final_content) catch |err| switch (err) {
+        error.AccessDenied, error.FileNotFound => return .{ .message = try editAccessErrorMessage(allocator, path, err), .is_error = true },
+        else => return err,
+    };
 
-    return std.fmt.allocPrint(allocator, "Successfully replaced {d} block(s) in {s}.", .{ edits.len, path });
+    return .{
+        .message = try std.fmt.allocPrint(allocator, "Successfully replaced {d} block(s) in {s}.", .{ edits.len, path }),
+        .is_error = false,
+    };
+}
+
+fn editAccessErrorMessage(allocator: std.mem.Allocator, path: []const u8, err: anyerror) ![]u8 {
+    const code = switch (err) {
+        error.FileNotFound => "ENOENT",
+        error.AccessDenied => "EACCES",
+        else => @errorName(err),
+    };
+    return std.fmt.allocPrint(allocator, "Could not edit file: {s}. Error code: {s}.", .{ path, code });
+}
+
+fn notFoundErrorMessage(allocator: std.mem.Allocator, path: []const u8, edit_index: usize, total_edits: usize) ![]u8 {
+    if (total_edits == 1) {
+        return std.fmt.allocPrint(allocator, "Could not find the exact text in {s}. The old text must match exactly including all whitespace and newlines.", .{path});
+    }
+    return std.fmt.allocPrint(allocator, "Could not find edits[{d}] in {s}. The oldText must match exactly including all whitespace and newlines.", .{ edit_index, path });
+}
+
+fn duplicateErrorMessage(allocator: std.mem.Allocator, path: []const u8, edit_index: usize, total_edits: usize, occurrences: usize) ![]u8 {
+    if (total_edits == 1) {
+        return std.fmt.allocPrint(allocator, "Found {d} occurrences of the text in {s}. The text must be unique. Please provide more context to make it unique.", .{ occurrences, path });
+    }
+    return std.fmt.allocPrint(allocator, "Found {d} occurrences of edits[{d}] in {s}. Each oldText must be unique. Please provide more context to make it unique.", .{ occurrences, edit_index, path });
+}
+
+fn emptyOldTextErrorMessage(allocator: std.mem.Allocator, path: []const u8, edit_index: usize, total_edits: usize) ![]u8 {
+    if (total_edits == 1) {
+        return std.fmt.allocPrint(allocator, "oldText must not be empty in {s}.", .{path});
+    }
+    return std.fmt.allocPrint(allocator, "edits[{d}].oldText must not be empty in {s}.", .{ edit_index, path });
+}
+
+fn noChangeErrorMessage(allocator: std.mem.Allocator, path: []const u8, total_edits: usize) ![]u8 {
+    if (total_edits == 1) {
+        return std.fmt.allocPrint(allocator, "No changes made to {s}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.", .{path});
+    }
+    return std.fmt.allocPrint(allocator, "No changes made to {s}. The replacements produced identical content.", .{path});
+}
+
+fn overlapErrorMessage(allocator: std.mem.Allocator, path: []const u8, previous_index: usize, current_index: usize) ![]u8 {
+    return std.fmt.allocPrint(allocator, "edits[{d}] and edits[{d}] overlap in {s}. Merge them into one edit or target disjoint regions.", .{ previous_index, current_index, path });
 }
 
 pub fn runShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !void {
@@ -870,6 +1039,76 @@ fn writeRestoredLineEndings(w: *std.Io.Writer, content: []const u8, line_ending:
             try w.writeByte(byte);
         }
     }
+}
+
+/// Normalize text for the edit tool's fuzzy fallback, mirroring upstream
+/// `normalizeForFuzzyMatch`: strip trailing whitespace per line, map smart
+/// quotes/dashes to ASCII, and collapse special Unicode spaces to a regular
+/// space. Input is assumed LF-normalized.
+///
+/// NOTE: upstream prefixes this with Unicode NFKC normalization. Zig std has no
+/// NFKC tables, so compatibility-equivalent forms (e.g. fullwidth punctuation,
+/// combining-mark recomposition) are NOT folded here. The targeted replacements
+/// below cover the common smart-punctuation cases; see docs/parity.md.
+fn normalizeForFuzzyMatch(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var mapped: std.Io.Writer.Allocating = .init(allocator);
+    defer mapped.deinit();
+
+    var index: usize = 0;
+    while (index < content.len) {
+        const first = content[index];
+        const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
+            try mapped.writer.writeByte(first);
+            index += 1;
+            continue;
+        };
+        if (index + seq_len > content.len) {
+            try mapped.writer.writeByte(first);
+            index += 1;
+            continue;
+        }
+        const codepoint = std.unicode.utf8Decode(content[index .. index + seq_len]) catch {
+            try mapped.writer.writeByte(first);
+            index += 1;
+            continue;
+        };
+        if (fuzzyAsciiReplacement(codepoint)) |replacement| {
+            try mapped.writer.writeByte(replacement);
+        } else {
+            try mapped.writer.writeAll(content[index .. index + seq_len]);
+        }
+        index += seq_len;
+    }
+
+    return stripTrailingWhitespacePerLine(allocator, mapped.written());
+}
+
+fn fuzzyAsciiReplacement(codepoint: u21) ?u8 {
+    return switch (codepoint) {
+        // Smart single quotes -> '
+        0x2018, 0x2019, 0x201A, 0x201B => '\'',
+        // Smart double quotes -> "
+        0x201C, 0x201D, 0x201E, 0x201F => '"',
+        // Unicode dashes/hyphens/minus -> -
+        0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2212 => '-',
+        // Special spaces -> regular space
+        0x00A0, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000 => ' ',
+        else => null,
+    };
+}
+
+fn stripTrailingWhitespacePerLine(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.writer.writeByte('\n');
+        first = false;
+        try out.writer.writeAll(std.mem.trimEnd(u8, line, " \t\r\x0b\x0c"));
+    }
+    return out.toOwnedSlice();
 }
 
 fn formatShellOutput(allocator: std.mem.Allocator, io: std.Io, raw_output: []const u8, exit_code: ?u8) !ShellOutput {
@@ -1740,6 +1979,197 @@ test "bash output update path preserves stdout stderr write order" {
     defer std.testing.allocator.free(result.output);
 
     try std.testing.expectEqualStrings("outerrdone", result.output);
+}
+
+fn readTempFixture(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return readFile(std.testing.io, allocator, name, max_edit_file_bytes);
+}
+
+test "edit fuzzy matching folds smart punctuation, dashes, and special spaces" {
+    const path = "zig-out/pi-zig-edit-fuzzy-test.txt";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    // Smart single quotes -> ASCII.
+    try writeFile(std.testing.io, path, "console.log(\xe2\x80\x98hello\xe2\x80\x99);\n");
+    const edits1 = [_]EditReplacement{.{ .old_text = "console.log('hello');", .new_text = "console.log('world');" }};
+    const outcome1 = try editFileManyResult(std.testing.io, std.testing.allocator, path, &edits1);
+    defer std.testing.allocator.free(outcome1.message);
+    try std.testing.expect(!outcome1.is_error);
+    const after1 = try readTempFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(after1);
+    try std.testing.expectEqualStrings("console.log('world');\n", after1);
+
+    // Unicode dashes (en/em) -> ASCII hyphen.
+    try writeFile(std.testing.io, path, "range: 1\xe2\x80\x935\nbreak\xe2\x80\x94here\n");
+    const edits2 = [_]EditReplacement{.{ .old_text = "range: 1-5\nbreak-here", .new_text = "range: 10-50\nbreak--here" }};
+    const outcome2 = try editFileManyResult(std.testing.io, std.testing.allocator, path, &edits2);
+    defer std.testing.allocator.free(outcome2.message);
+    try std.testing.expect(!outcome2.is_error);
+    const after2 = try readTempFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(after2);
+    try std.testing.expect(std.mem.indexOf(u8, after2, "10-50") != null);
+
+    // Non-breaking space -> regular space.
+    try writeFile(std.testing.io, path, "hello\xc2\xa0world\n");
+    const edits3 = [_]EditReplacement{.{ .old_text = "hello world", .new_text = "hello universe" }};
+    const outcome3 = try editFileManyResult(std.testing.io, std.testing.allocator, path, &edits3);
+    defer std.testing.allocator.free(outcome3.message);
+    try std.testing.expect(!outcome3.is_error);
+    const after3 = try readTempFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(after3);
+    try std.testing.expect(std.mem.indexOf(u8, after3, "universe") != null);
+}
+
+test "edit fuzzy matching strips trailing whitespace per line" {
+    const path = "zig-out/pi-zig-edit-trailing-ws-test.txt";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    try writeFile(std.testing.io, path, "line one   \nline two  \nline three\n");
+
+    const edits = [_]EditReplacement{.{ .old_text = "line one\nline two\n", .new_text = "replaced\n" }};
+    const outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &edits);
+    defer std.testing.allocator.free(outcome.message);
+    try std.testing.expect(!outcome.is_error);
+    const after = try readTempFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings("replaced\nline three\n", after);
+}
+
+test "edit prefers exact match and detects duplicates after fuzzy normalization" {
+    const path = "zig-out/pi-zig-edit-fuzzy-dup-test.txt";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    // Exact preferred over fuzzy: only the exact occurrence changes.
+    try writeFile(std.testing.io, path, "const x = 'exact';\nconst y = 'other';\n");
+    const exact_edits = [_]EditReplacement{.{ .old_text = "const x = 'exact';", .new_text = "const x = 'changed';" }};
+    const exact_outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &exact_edits);
+    defer std.testing.allocator.free(exact_outcome.message);
+    try std.testing.expect(!exact_outcome.is_error);
+    const exact_after = try readTempFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(exact_after);
+    try std.testing.expectEqualStrings("const x = 'changed';\nconst y = 'other';\n", exact_after);
+
+    // Two lines identical only after trailing whitespace strip -> duplicate.
+    try writeFile(std.testing.io, path, "hello world   \nhello world\n");
+    const dup_edits = [_]EditReplacement{.{ .old_text = "hello world", .new_text = "replaced" }};
+    const dup_outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &dup_edits);
+    defer std.testing.allocator.free(dup_outcome.message);
+    try std.testing.expect(dup_outcome.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, dup_outcome.message, "Found 2 occurrences") != null);
+}
+
+test "edit error messages match upstream for single and multi-edit failures" {
+    const path = "zig-out/pi-zig-edit-error-test.txt";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    // Single-edit not found.
+    try writeFile(std.testing.io, path, "completely different content\n");
+    const missing = [_]EditReplacement{.{ .old_text = "this does not exist", .new_text = "x" }};
+    const missing_outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &missing);
+    defer std.testing.allocator.free(missing_outcome.message);
+    try std.testing.expect(missing_outcome.is_error);
+    try std.testing.expectEqualStrings(
+        "Could not find the exact text in zig-out/pi-zig-edit-error-test.txt. The old text must match exactly including all whitespace and newlines.",
+        missing_outcome.message,
+    );
+
+    // Single-edit duplicate.
+    try writeFile(std.testing.io, path, "repeat repeat");
+    const dup = [_]EditReplacement{.{ .old_text = "repeat", .new_text = "once" }};
+    const dup_outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &dup);
+    defer std.testing.allocator.free(dup_outcome.message);
+    try std.testing.expect(dup_outcome.is_error);
+    try std.testing.expectEqualStrings(
+        "Found 2 occurrences of the text in zig-out/pi-zig-edit-error-test.txt. The text must be unique. Please provide more context to make it unique.",
+        dup_outcome.message,
+    );
+
+    // Multi-edit, second edit missing -> indexed message.
+    try writeFile(std.testing.io, path, "alpha beta");
+    const multi_missing = [_]EditReplacement{
+        .{ .old_text = "alpha", .new_text = "x" },
+        .{ .old_text = "missing", .new_text = "y" },
+    };
+    const multi_missing_outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &multi_missing);
+    defer std.testing.allocator.free(multi_missing_outcome.message);
+    try std.testing.expect(multi_missing_outcome.is_error);
+    try std.testing.expectEqualStrings(
+        "Could not find edits[1] in zig-out/pi-zig-edit-error-test.txt. The oldText must match exactly including all whitespace and newlines.",
+        multi_missing_outcome.message,
+    );
+    // File is untouched after a failed edit (no partial application).
+    const untouched = try readTempFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(untouched);
+    try std.testing.expectEqualStrings("alpha beta", untouched);
+
+    // Empty oldText.
+    try writeFile(std.testing.io, path, "anything");
+    const empty = [_]EditReplacement{.{ .old_text = "", .new_text = "y" }};
+    const empty_outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &empty);
+    defer std.testing.allocator.free(empty_outcome.message);
+    try std.testing.expect(empty_outcome.is_error);
+    try std.testing.expectEqualStrings("oldText must not be empty in zig-out/pi-zig-edit-error-test.txt.", empty_outcome.message);
+
+    // Overlapping edits.
+    try writeFile(std.testing.io, path, "abcdef");
+    const overlap = [_]EditReplacement{
+        .{ .old_text = "abc", .new_text = "x" },
+        .{ .old_text = "bcd", .new_text = "y" },
+    };
+    const overlap_outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &overlap);
+    defer std.testing.allocator.free(overlap_outcome.message);
+    try std.testing.expect(overlap_outcome.is_error);
+    try std.testing.expectEqualStrings(
+        "edits[0] and edits[1] overlap in zig-out/pi-zig-edit-error-test.txt. Merge them into one edit or target disjoint regions.",
+        overlap_outcome.message,
+    );
+
+    // Empty edit list.
+    try writeFile(std.testing.io, path, "anything");
+    const none_outcome = try editFileManyResult(std.testing.io, std.testing.allocator, path, &.{});
+    defer std.testing.allocator.free(none_outcome.message);
+    try std.testing.expect(none_outcome.is_error);
+    try std.testing.expectEqualStrings(
+        "Edit tool input is invalid. edits must contain at least one replacement.",
+        none_outcome.message,
+    );
+}
+
+test "image mime detection sniffs magic bytes and rejects non-images" {
+    // PNG (non-animated 1x1).
+    const png = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+        0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x1f, 0x00,
+        0x03, 0x03, 0x02, 0x00, 0xef, 0xbf, 0xa7, 0xdb, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+        0xae, 0x42, 0x60, 0x82,
+    };
+    try std.testing.expectEqualStrings("image/png", detectImageMimeType(&png).?);
+
+    // JPEG.
+    try std.testing.expectEqualStrings("image/jpeg", detectImageMimeType(&[_]u8{ 0xff, 0xd8, 0xff, 0xe0, 0x00 }).?);
+    // CMYK JPEG marker (0xFFD8FFF7) is rejected.
+    try std.testing.expect(detectImageMimeType(&[_]u8{ 0xff, 0xd8, 0xff, 0xf7 }) == null);
+
+    // GIF and WEBP.
+    try std.testing.expectEqualStrings("image/gif", detectImageMimeType("GIF89a").?);
+    try std.testing.expectEqualStrings("image/webp", detectImageMimeType("RIFF\x00\x00\x00\x00WEBPVP8 ").?);
+
+    // Non-image content with no recognizable signature.
+    try std.testing.expect(detectImageMimeType("fake image bytes") == null);
+    try std.testing.expect(detectImageMimeType("") == null);
+
+    // Animated PNG (acTL chunk before IDAT) is rejected.
+    var apng = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+        0x02, 0x00, 0x00, 0x00, 0x08, 0x61, 0x63, 0x54, 0x4c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    try std.testing.expect(detectImageMimeType(&apng) == null);
 }
 
 test "shell path resolution validates custom paths and prefers bash on unix" {
