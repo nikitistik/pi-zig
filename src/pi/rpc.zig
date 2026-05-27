@@ -2190,6 +2190,28 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "prompt requires a string message");
             };
+            const streaming_delivery = promptStreamingDelivery(value) catch {
+                return writeError(w, id, command, "prompt streamingBehavior must be \"steer\" or \"followUp\"");
+            };
+            self.collectActivePrompt(allocator, false);
+            if (self.isPromptRunning()) {
+                const delivery = streaming_delivery orelse {
+                    return writeError(w, id, command, "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+                };
+                const queue = switch (delivery) {
+                    .steer => &self.steering_queue,
+                    .follow_up => &self.follow_up_queue,
+                    .next_turn => unreachable,
+                };
+                if (self.handleQueuedExtensionPromptCommand(io, allocator, w, id, command, message, delivery, queue) catch |err| {
+                    return writeError(w, id, command, @errorName(err));
+                }) return;
+                const image_parts = parseRpcImages(allocator, value) catch {
+                    return writeError(w, id, command, "prompt images must be ImageContent objects with type=image, data, and mimeType");
+                };
+                defer freeRpcImages(allocator, image_parts);
+                return self.enqueuePendingMessage(allocator, w, id, command, queue, message, image_parts);
+            }
             if (self.handleExtensionPromptCommand(io, allocator, output, w, id, command, message) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             }) return;
@@ -2928,6 +2950,7 @@ fn isActivePromptNonBlockingCommand(value: std.json.Value) bool {
     const command = getStringField(value, "type") orelse return false;
     return std.mem.eql(u8, command, "abort") or
         std.mem.eql(u8, command, "abort_retry") or
+        (std.mem.eql(u8, command, "prompt") and hasPromptStreamingBehavior(value)) or
         std.mem.eql(u8, command, "steer") or
         std.mem.eql(u8, command, "follow_up");
 }
@@ -2935,6 +2958,20 @@ fn isActivePromptNonBlockingCommand(value: std.json.Value) bool {
 fn isActiveBashNonBlockingCommand(value: std.json.Value) bool {
     const command = getStringField(value, "type") orelse return false;
     return std.mem.eql(u8, command, "abort_bash") or std.mem.eql(u8, command, "get_state");
+}
+
+fn promptStreamingDelivery(value: std.json.Value) !?extension_runner.Runner.CommandDelivery {
+    if (value != .object) return null;
+    const field = value.object.get("streamingBehavior") orelse return null;
+    if (field != .string) return error.InvalidPromptStreamingBehavior;
+    if (std.mem.eql(u8, field.string, "steer")) return .steer;
+    if (std.mem.eql(u8, field.string, "followUp")) return .follow_up;
+    return error.InvalidPromptStreamingBehavior;
+}
+
+fn hasPromptStreamingBehavior(value: std.json.Value) bool {
+    if (value != .object) return false;
+    return value.object.get("streamingBehavior") != null;
 }
 
 fn toolListContains(value: []const u8, needle: []const u8) bool {
