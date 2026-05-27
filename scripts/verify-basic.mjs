@@ -5095,6 +5095,10 @@ export default function(pi: any): void {
   if (!providerNonVisionAgentImage.includes('non vision image agent observed')) {
     throw new Error('provider-backed agent loop did not downgrade direct image content parts for non-vision models');
   }
+  // The read tool detects images by magic bytes (parity with upstream mime.ts),
+  // so the read-tool fixture must contain a real PNG, unlike the @-attachment
+  // fixture above which is matched by extension.
+  fs.writeFileSync(providerImagePath, Buffer.from(tinyPngBase64, 'base64'));
   const providerNonVisionReadImage = run(
     ['--no-session', '--provider', 'openai', '--model', 'gpt-4', '-p', 'non vision read image result'],
     undefined,
@@ -8956,6 +8960,82 @@ if (
   fs.readFileSync(flow03GlobalSettingsPath, 'utf8') !== '{ not valid json'
 ) {
   throw new Error('flow03: invalid settings JSON must be reported and left untouched');
+// ===== FLOW 08: tools =====
+// Edit tool upstream-shaped error messages, fuzzy matching, and access errors.
+const flow08EditDir = 'zig-out/pi-zig-flow08-edit';
+fs.rmSync(flow08EditDir, { recursive: true, force: true });
+fs.mkdirSync(flow08EditDir, { recursive: true });
+
+const flow08NotFoundPath = path.join(flow08EditDir, 'not-found.txt');
+fs.writeFileSync(flow08NotFoundPath, 'completely different content\n');
+const flow08NotFound = runFail(['tool-edit', flow08NotFoundPath, 'this does not exist', 'x']);
+if (!flow08NotFound.stdout.includes(`Could not find the exact text in ${flow08NotFoundPath}. The old text must match exactly including all whitespace and newlines.`)) {
+  throw new Error('FLOW 08 tool-edit single not-found did not return upstream-shaped message');
+}
+
+const flow08MultiPath = path.join(flow08EditDir, 'multi.txt');
+fs.writeFileSync(flow08MultiPath, 'alpha beta');
+const flow08Multi = runFail(['tool-edit', flow08MultiPath, 'alpha', 'x', 'missing', 'y']);
+if (!flow08Multi.stdout.includes(`Could not find edits[1] in ${flow08MultiPath}. The oldText must match exactly including all whitespace and newlines.`)) {
+  throw new Error('FLOW 08 tool-edit multi not-found did not return indexed upstream-shaped message');
+}
+if (fs.readFileSync(flow08MultiPath, 'utf8') !== 'alpha beta') {
+  throw new Error('FLOW 08 tool-edit multi failure partially applied edits');
+}
+
+const flow08DupPath = path.join(flow08EditDir, 'dup.txt');
+fs.writeFileSync(flow08DupPath, 'repeat repeat');
+const flow08Dup = runFail(['tool-edit', flow08DupPath, 'repeat', 'once']);
+if (!flow08Dup.stdout.includes(`Found 2 occurrences of the text in ${flow08DupPath}. The text must be unique. Please provide more context to make it unique.`)) {
+  throw new Error('FLOW 08 tool-edit duplicate did not return upstream-shaped message');
+}
+
+const flow08OverlapPath = path.join(flow08EditDir, 'overlap.txt');
+fs.writeFileSync(flow08OverlapPath, 'abcdef');
+const flow08Overlap = runFail(['tool-edit', flow08OverlapPath, 'abc', 'x', 'bcd', 'y']);
+if (!flow08Overlap.stdout.includes(`edits[0] and edits[1] overlap in ${flow08OverlapPath}. Merge them into one edit or target disjoint regions.`)) {
+  throw new Error('FLOW 08 tool-edit overlap did not return upstream-shaped message');
+}
+
+const flow08NoChangePath = path.join(flow08EditDir, 'no-change.txt');
+fs.writeFileSync(flow08NoChangePath, 'hello');
+const flow08NoChange = runFail(['tool-edit', flow08NoChangePath, 'hello', 'hello']);
+if (!flow08NoChange.stdout.includes(`No changes made to ${flow08NoChangePath}. The replacement produced identical content.`)) {
+  throw new Error('FLOW 08 tool-edit no-change did not return upstream-shaped message');
+}
+
+const flow08MissingFile = runFail(['tool-edit', path.join(flow08EditDir, 'absent.txt'), 'a', 'b']);
+if (!flow08MissingFile.stdout.includes('Error code: ENOENT.')) {
+  throw new Error('FLOW 08 tool-edit missing file did not return upstream-shaped ENOENT message');
+}
+
+// Fuzzy matching: smart quotes, Unicode dashes, NBSP, and trailing whitespace.
+const flow08QuotesPath = path.join(flow08EditDir, 'quotes.txt');
+fs.writeFileSync(flow08QuotesPath, 'console.log(‘hello’);\n');
+const flow08Quotes = run(['tool-edit', flow08QuotesPath, "console.log('hello');", "console.log('world');"]);
+if (!flow08Quotes.includes('Successfully replaced 1 block(s)') || !fs.readFileSync(flow08QuotesPath, 'utf8').includes("console.log('world');")) {
+  throw new Error('FLOW 08 tool-edit fuzzy smart-quote match did not replace content');
+}
+
+const flow08DashPath = path.join(flow08EditDir, 'dash.txt');
+fs.writeFileSync(flow08DashPath, 'range: 1–5\nbreak—here\n');
+run(['tool-edit', flow08DashPath, 'range: 1-5\nbreak-here', 'range: 10-50\nbreak--here']);
+if (!fs.readFileSync(flow08DashPath, 'utf8').includes('10-50')) {
+  throw new Error('FLOW 08 tool-edit fuzzy Unicode-dash match did not replace content');
+}
+
+const flow08NbspPath = path.join(flow08EditDir, 'nbsp.txt');
+fs.writeFileSync(flow08NbspPath, 'hello world\n');
+run(['tool-edit', flow08NbspPath, 'hello world', 'hello universe']);
+if (!fs.readFileSync(flow08NbspPath, 'utf8').includes('universe')) {
+  throw new Error('FLOW 08 tool-edit fuzzy non-breaking-space match did not replace content');
+}
+
+const flow08TrailingPath = path.join(flow08EditDir, 'trailing.txt');
+fs.writeFileSync(flow08TrailingPath, 'line one   \nline two  \nline three\n');
+run(['tool-edit', flow08TrailingPath, 'line one\nline two\n', 'replaced\n']);
+if (fs.readFileSync(flow08TrailingPath, 'utf8') !== 'replaced\nline three\n') {
+  throw new Error('FLOW 08 tool-edit fuzzy trailing-whitespace match did not replace content');
 }
 
 console.log('basic pi-zig smokes passed');
