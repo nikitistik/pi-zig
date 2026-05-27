@@ -1,0 +1,903 @@
+{
+  "generatedFrom": "scripts/upstream-inventory.mjs",
+  "commit": "fc8a1559017f1e581cfa971aa3cef11a507a4975",
+  "counts": {
+    "packages": 8,
+    "primaryPackages": 4,
+    "examplePackages": 4,
+    "cliFlags": 46,
+    "subcommands": 6,
+    "appModes": 4,
+    "builtinSlashCommands": 21,
+    "rpcCommands": 29,
+    "builtInTools": 7,
+    "providerImplementationFiles": 20,
+    "transportApis": 9,
+    "generatedModelProviders": 32,
+    "generatedModelRows": 924,
+    "envKeyProviders": 30,
+    "oauthProviders": 3,
+    "extensionApiMethods": 22,
+    "extensionEvents": 29,
+    "tuiComponents": 12,
+    "interactiveComponents": 36,
+    "docs": 26
+  },
+  "inventory": {
+    "name": "pi-monorepo",
+    "version": "0.0.3",
+    "node": ">=22.19.0",
+    "workspaces": [
+      "packages/*",
+      "packages/coding-agent/examples/extensions/with-deps",
+      "packages/coding-agent/examples/extensions/custom-provider-anthropic",
+      "packages/coding-agent/examples/extensions/custom-provider-gitlab-duo",
+      "packages/coding-agent/examples/extensions/sandbox"
+    ],
+    "commit": "fc8a1559017f1e581cfa971aa3cef11a507a4975",
+    "packageFileCount": 734,
+    "packageCount": 8,
+    "primaryPackageCount": 4,
+    "examplePackageCount": 4,
+    "packages": [
+      {
+        "dir": "packages/agent",
+        "name": "@earendil-works/pi-agent-core",
+        "version": "0.75.5",
+        "private": false,
+        "role": "primary",
+        "bin": [],
+        "exports": [
+          ".",
+          "./node",
+          "./package.json"
+        ],
+        "scripts": [
+          "clean",
+          "build",
+          "test",
+          "test:harness",
+          "coverage:harness",
+          "prepublishOnly"
+        ],
+        "dependencies": [
+          "@earendil-works/pi-ai",
+          "ignore",
+          "typebox",
+          "yaml"
+        ],
+        "workspaceDependencies": [
+          "@earendil-works/pi-ai"
+        ],
+        "optionalDependencies": [],
+        "devDependencies": [
+          "@types/node",
+          "@vitest/coverage-v8",
+          "typescript",
+          "vitest"
+        ],
+        "piExtensions": [],
+        "sourceFiles": 25,
+        "testFiles": 20
+      },
+      {
+        "dir": "packages/ai",
+        "name": "@earendil-works/pi-ai",
+        "version": "0.75.5",
+        "private": false,
+        "role": "primary",
+        "bin": [
+          "pi-ai"
+        ],
+        "exports": [
+          ".",
+          "./anthropic",
+          "./azure-openai-responses",
+          "./google",
+          "./google-vertex",
+          "./mistral",
+          "./openai-codex-responses",
+          "./openai-completions",
+          "./openai-responses",
+          "./oauth",
+          "./bedrock-provider"
+        ],
+        "scripts": [
+          "clean",
+          "generate-models",
+          "generate-image-models",
+          "build",
+          "test",
+          "prepublishOnly"
+        ],
+        "dependencies": [
+          "@anthropic-ai/sdk",
+          "@aws-sdk/client-bedrock-runtime",
+          "@smithy/node-http-handler",
+          "@google/genai",
+          "@mistralai/mistralai",
+          "http-proxy-agent",
+          "https-proxy-agent",
+          "openai",
+          "partial-json",
+          "typebox"
+        ],
+        "workspaceDependencies": [],
+        "optionalDependencies": [],
+        "devDependencies": [
+          "@types/node",
+          "canvas",
+          "vitest"
+        ],
+        "piExtensions": [],
+        "sourceFiles": 53,
+        "testFiles": 76
+      },
+      {
+        "dir": "packages/coding-agent/examples/extensions/custom-provider-anthropic",
+        "name": "pi-extension-custom-provider-anthropic",
+        "version": "0.75.5",
+        "private": true,
+        "role": "example-extension",
+        "bin": [],
+        "exports": [],
+        "scripts": [
+          "clean",
+          "build",
+          "check"
+        ],
+        "dependencies": [
+          "@anthropic-ai/sdk"
+        ],
+        "workspaceDependencies": [],
+        "optionalDependencies": [],
+        "devDependencies": [],
+        "piExtensions": [
+          "./index.ts"
+        ],
+        "sourceFiles": 0,
+        "testFiles": 0
+      },
+      {
+        "dir": "packages/coding-agent/examples/extensions/custom-provider-gitlab-duo",
+        "name": "pi-extension-custom-provider-gitlab-duo",
+        "version": "0.75.5",
+        "private": true,
+        "role": "example-extension",
+        "bin": [],
+        "exports": [],
+        "scripts": [
+          "clean",
+          "build",
+          "check"
+        ],
+        "dependencies": [],
+        "workspaceDependencies": [],
+        "optionalDependencies": [],
+        "devDependencies": [],
+        "piExtensions": [
+          "./index.ts"
+        ],
+        "sourceFiles": 0,
+        "testFiles": 0
+      },
+      {
+        "dir": "packages/coding-agent/examples/extensions/sandbox",
+        "name": "pi-extension-sandbox",
+        "version": "1.5.5",
+        "private": true,
+        "role": "example-extension",
+        "bin": [],
+        "exports": [],
+        "scripts": [
+          "clean",
+          "build",
+          "check"
+        ],
+        "dependencies": [
+          "@anthropic-ai/sandbox-runtime"
+        ],
+        "workspaceDependencies": [],
+        "optionalDependencies": [],
+        "devDependencies": [],
+        "piExtensions": [
+          "./index.ts"
+        ],
+        "sourceFiles": 0,
+        "testFiles": 0
+      },
+      {
+        "dir": "packages/coding-agent/examples/extensions/with-deps",
+        "name": "pi-extension-with-deps",
+        "version": "0.75.5",
+        "private": true,
+        "role": "example-extension",
+        "bin": [],
+        "exports": [],
+        "scripts": [
+          "clean",
+          "build",
+          "check"
+        ],
+        "dependencies": [
+          "ms"
+        ],
+        "workspaceDependencies": [],
+        "optionalDependencies": [],
+        "devDependencies": [
+          "@types/ms"
+        ],
+        "piExtensions": [
+          "./index.ts"
+        ],
+        "sourceFiles": 0,
+        "testFiles": 0
+      },
+      {
+        "dir": "packages/coding-agent",
+        "name": "@earendil-works/pi-coding-agent",
+        "version": "0.75.5",
+        "private": false,
+        "role": "primary",
+        "bin": [
+          "pi"
+        ],
+        "exports": [
+          ".",
+          "./hooks"
+        ],
+        "scripts": [
+          "clean",
+          "build",
+          "build:binary",
+          "copy-assets",
+          "copy-binary-assets",
+          "test",
+          "shrinkwrap",
+          "prepublishOnly"
+        ],
+        "dependencies": [
+          "@earendil-works/pi-agent-core",
+          "@earendil-works/pi-ai",
+          "@earendil-works/pi-tui",
+          "@silvia-odwyer/photon-node",
+          "chalk",
+          "cross-spawn",
+          "diff",
+          "glob",
+          "highlight.js",
+          "hosted-git-info",
+          "ignore",
+          "jiti",
+          "minimatch",
+          "proper-lockfile",
+          "typebox",
+          "undici",
+          "yaml"
+        ],
+        "workspaceDependencies": [
+          "@earendil-works/pi-agent-core",
+          "@earendil-works/pi-ai",
+          "@earendil-works/pi-tui"
+        ],
+        "optionalDependencies": [
+          "@mariozechner/clipboard"
+        ],
+        "devDependencies": [
+          "@types/cross-spawn",
+          "@types/diff",
+          "@types/hosted-git-info",
+          "@types/ms",
+          "@types/node",
+          "@types/proper-lockfile",
+          "shx",
+          "typescript",
+          "vitest"
+        ],
+        "piExtensions": [],
+        "sourceFiles": 145,
+        "testFiles": 133
+      },
+      {
+        "dir": "packages/tui",
+        "name": "@earendil-works/pi-tui",
+        "version": "0.75.5",
+        "private": false,
+        "role": "primary",
+        "bin": [],
+        "exports": [],
+        "scripts": [
+          "clean",
+          "build",
+          "test",
+          "prepublishOnly"
+        ],
+        "dependencies": [
+          "get-east-asian-width",
+          "marked"
+        ],
+        "workspaceDependencies": [],
+        "optionalDependencies": [],
+        "devDependencies": [
+          "@xterm/headless",
+          "chalk"
+        ],
+        "piExtensions": [],
+        "sourceFiles": 26,
+        "testFiles": 28
+      }
+    ],
+    "cli": {
+      "commandFiles": [
+        "cli/args.ts",
+        "cli/config-selector.ts",
+        "cli/file-processor.ts",
+        "cli/initial-message.ts",
+        "cli/list-models.ts",
+        "cli/session-picker.ts"
+      ],
+      "flags": [
+        "--api-key",
+        "--append-system-prompt",
+        "--continue",
+        "--export",
+        "--extension",
+        "--fork",
+        "--help",
+        "--list-models",
+        "--mode",
+        "--model",
+        "--models",
+        "--no-builtin-tools",
+        "--no-context-files",
+        "--no-extensions",
+        "--no-prompt-templates",
+        "--no-session",
+        "--no-skills",
+        "--no-themes",
+        "--no-tools",
+        "--offline",
+        "--print",
+        "--prompt-template",
+        "--provider",
+        "--resume",
+        "--session",
+        "--session-dir",
+        "--skill",
+        "--system-prompt",
+        "--theme",
+        "--thinking",
+        "--tools",
+        "--verbose",
+        "--version",
+        "-c",
+        "-e",
+        "-h",
+        "-nbt",
+        "-nc",
+        "-ne",
+        "-np",
+        "-ns",
+        "-nt",
+        "-p",
+        "-r",
+        "-t",
+        "-v"
+      ],
+      "subcommands": [
+        "config",
+        "install",
+        "list",
+        "remove",
+        "uninstall",
+        "update"
+      ],
+      "modeFiles": [
+        "modes/index.ts",
+        "modes/interactive/components/armin.ts",
+        "modes/interactive/components/assistant-message.ts",
+        "modes/interactive/components/bash-execution.ts",
+        "modes/interactive/components/bordered-loader.ts",
+        "modes/interactive/components/branch-summary-message.ts",
+        "modes/interactive/components/compaction-summary-message.ts",
+        "modes/interactive/components/config-selector.ts",
+        "modes/interactive/components/countdown-timer.ts",
+        "modes/interactive/components/custom-editor.ts",
+        "modes/interactive/components/custom-message.ts",
+        "modes/interactive/components/daxnuts.ts",
+        "modes/interactive/components/diff.ts",
+        "modes/interactive/components/dynamic-border.ts",
+        "modes/interactive/components/earendil-announcement.ts",
+        "modes/interactive/components/extension-editor.ts",
+        "modes/interactive/components/extension-input.ts",
+        "modes/interactive/components/extension-selector.ts",
+        "modes/interactive/components/footer.ts",
+        "modes/interactive/components/index.ts",
+        "modes/interactive/components/keybinding-hints.ts",
+        "modes/interactive/components/login-dialog.ts",
+        "modes/interactive/components/model-selector.ts",
+        "modes/interactive/components/oauth-selector.ts",
+        "modes/interactive/components/scoped-models-selector.ts",
+        "modes/interactive/components/session-selector-search.ts",
+        "modes/interactive/components/session-selector.ts",
+        "modes/interactive/components/settings-selector.ts",
+        "modes/interactive/components/show-images-selector.ts",
+        "modes/interactive/components/skill-invocation-message.ts",
+        "modes/interactive/components/theme-selector.ts",
+        "modes/interactive/components/thinking-selector.ts",
+        "modes/interactive/components/tool-execution.ts",
+        "modes/interactive/components/tree-selector.ts",
+        "modes/interactive/components/user-message-selector.ts",
+        "modes/interactive/components/user-message.ts",
+        "modes/interactive/components/visual-truncate.ts",
+        "modes/interactive/interactive-mode.ts",
+        "modes/interactive/theme/theme.ts",
+        "modes/print-mode.ts",
+        "modes/rpc/jsonl.ts",
+        "modes/rpc/rpc-client.ts",
+        "modes/rpc/rpc-mode.ts",
+        "modes/rpc/rpc-types.ts"
+      ],
+      "appModes": [
+        "interactive",
+        "print",
+        "json",
+        "rpc"
+      ],
+      "builtinSlashCommands": [
+        "settings",
+        "model",
+        "scoped-models",
+        "export",
+        "import",
+        "share",
+        "copy",
+        "name",
+        "session",
+        "changelog",
+        "hotkeys",
+        "fork",
+        "clone",
+        "tree",
+        "login",
+        "logout",
+        "new",
+        "compact",
+        "resume",
+        "reload",
+        "quit"
+      ],
+      "slashCommandRows": 19
+    },
+    "rpcCommands": [
+      "prompt",
+      "steer",
+      "follow_up",
+      "abort",
+      "new_session",
+      "get_state",
+      "set_model",
+      "cycle_model",
+      "get_available_models",
+      "set_thinking_level",
+      "cycle_thinking_level",
+      "set_steering_mode",
+      "set_follow_up_mode",
+      "compact",
+      "set_auto_compaction",
+      "set_auto_retry",
+      "abort_retry",
+      "bash",
+      "abort_bash",
+      "get_session_stats",
+      "export_html",
+      "switch_session",
+      "fork",
+      "clone",
+      "get_fork_messages",
+      "get_last_assistant_text",
+      "set_session_name",
+      "get_messages",
+      "get_commands"
+    ],
+    "builtInTools": [
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "grep",
+      "find",
+      "ls"
+    ],
+    "toolModuleFiles": [
+      "bash",
+      "edit-diff",
+      "edit",
+      "file-mutation-queue",
+      "find",
+      "grep",
+      "index",
+      "ls",
+      "output-accumulator",
+      "path-utils",
+      "read",
+      "render-utils",
+      "tool-definition-wrapper",
+      "truncate",
+      "write"
+    ],
+    "providers": {
+      "implementationFiles": [
+        "providers/amazon-bedrock.ts",
+        "providers/anthropic.ts",
+        "providers/azure-openai-responses.ts",
+        "providers/cloudflare.ts",
+        "providers/faux.ts",
+        "providers/github-copilot-headers.ts",
+        "providers/google-shared.ts",
+        "providers/google-vertex.ts",
+        "providers/google.ts",
+        "providers/images/openrouter.ts",
+        "providers/images/register-builtins.ts",
+        "providers/mistral.ts",
+        "providers/openai-codex-responses.ts",
+        "providers/openai-completions.ts",
+        "providers/openai-prompt-cache.ts",
+        "providers/openai-responses-shared.ts",
+        "providers/openai-responses.ts",
+        "providers/register-builtins.ts",
+        "providers/simple-options.ts",
+        "providers/transform-messages.ts"
+      ],
+      "transportApis": [
+        "anthropic-messages",
+        "openai-completions",
+        "mistral-conversations",
+        "openai-responses",
+        "azure-openai-responses",
+        "openai-codex-responses",
+        "google-generative-ai",
+        "google-vertex",
+        "bedrock-converse-stream"
+      ],
+      "generatedModelProviders": [
+        "amazon-bedrock",
+        "anthropic",
+        "azure-openai-responses",
+        "cerebras",
+        "cloudflare-ai-gateway",
+        "cloudflare-workers-ai",
+        "deepseek",
+        "fireworks",
+        "github-copilot",
+        "google",
+        "google-vertex",
+        "groq",
+        "huggingface",
+        "kimi-coding",
+        "minimax",
+        "minimax-cn",
+        "mistral",
+        "moonshotai",
+        "moonshotai-cn",
+        "openai",
+        "openai-codex",
+        "opencode",
+        "opencode-go",
+        "openrouter",
+        "together",
+        "vercel-ai-gateway",
+        "xai",
+        "xiaomi",
+        "xiaomi-token-plan-ams",
+        "xiaomi-token-plan-cn",
+        "xiaomi-token-plan-sgp",
+        "zai"
+      ],
+      "generatedModelRows": 924,
+      "envKeyProviders": [
+        "anthropic",
+        "azure-openai-responses",
+        "cerebras",
+        "cloudflare-ai-gateway",
+        "cloudflare-workers-ai",
+        "deepseek",
+        "fireworks",
+        "github-copilot",
+        "google",
+        "google-vertex",
+        "groq",
+        "huggingface",
+        "kimi-coding",
+        "minimax",
+        "minimax-cn",
+        "mistral",
+        "moonshotai",
+        "moonshotai-cn",
+        "openai",
+        "opencode",
+        "opencode-go",
+        "openrouter",
+        "together",
+        "vercel-ai-gateway",
+        "xai",
+        "xiaomi",
+        "xiaomi-token-plan-ams",
+        "xiaomi-token-plan-cn",
+        "xiaomi-token-plan-sgp",
+        "zai"
+      ],
+      "oauthProviders": [
+        "anthropic",
+        "github-copilot",
+        "openai-codex"
+      ]
+    },
+    "extensions": {
+      "apiFiles": [
+        "core/extensions/index.ts",
+        "core/extensions/loader.ts",
+        "core/extensions/runner.ts",
+        "core/extensions/types.ts",
+        "core/extensions/wrapper.ts"
+      ],
+      "apiMethods": [
+        "appendEntry",
+        "exec",
+        "getActiveTools",
+        "getAllTools",
+        "getCommands",
+        "getFlag",
+        "getSessionName",
+        "getThinkingLevel",
+        "registerCommand",
+        "registerFlag",
+        "registerMessageRenderer",
+        "registerProvider",
+        "registerShortcut",
+        "registerTool",
+        "sendMessage",
+        "sendUserMessage",
+        "setActiveTools",
+        "setLabel",
+        "setModel",
+        "setSessionName",
+        "setThinkingLevel",
+        "unregisterProvider"
+      ],
+      "events": [
+        "after_provider_response",
+        "agent_end",
+        "agent_start",
+        "before_agent_start",
+        "before_provider_request",
+        "context",
+        "input",
+        "message_end",
+        "message_start",
+        "message_update",
+        "model_select",
+        "resources_discover",
+        "session_before_compact",
+        "session_before_fork",
+        "session_before_switch",
+        "session_before_tree",
+        "session_compact",
+        "session_shutdown",
+        "session_start",
+        "session_tree",
+        "thinking_level_select",
+        "tool_call",
+        "tool_execution_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_result",
+        "turn_end",
+        "turn_start",
+        "user_bash"
+      ]
+    },
+    "tui": {
+      "components": [
+        "box",
+        "cancellable-loader",
+        "editor",
+        "image",
+        "input",
+        "loader",
+        "markdown",
+        "select-list",
+        "settings-list",
+        "spacer",
+        "text",
+        "truncated-text"
+      ],
+      "topLevelModules": [
+        "autocomplete",
+        "editor-component",
+        "fuzzy",
+        "index",
+        "keybindings",
+        "keys",
+        "kill-ring",
+        "native-modifiers",
+        "stdin-buffer",
+        "terminal-image",
+        "terminal",
+        "tui",
+        "undo-stack",
+        "utils"
+      ],
+      "interactiveComponents": [
+        "armin",
+        "assistant-message",
+        "bash-execution",
+        "bordered-loader",
+        "branch-summary-message",
+        "compaction-summary-message",
+        "config-selector",
+        "countdown-timer",
+        "custom-editor",
+        "custom-message",
+        "daxnuts",
+        "diff",
+        "dynamic-border",
+        "earendil-announcement",
+        "extension-editor",
+        "extension-input",
+        "extension-selector",
+        "footer",
+        "index",
+        "keybinding-hints",
+        "login-dialog",
+        "model-selector",
+        "oauth-selector",
+        "scoped-models-selector",
+        "session-selector-search",
+        "session-selector",
+        "settings-selector",
+        "show-images-selector",
+        "skill-invocation-message",
+        "theme-selector",
+        "thinking-selector",
+        "tool-execution",
+        "tree-selector",
+        "user-message-selector",
+        "user-message",
+        "visual-truncate"
+      ]
+    },
+    "docs": [
+      {
+        "section": "Start here",
+        "title": "Overview",
+        "path": "index.md"
+      },
+      {
+        "section": "Start here",
+        "title": "Quickstart",
+        "path": "quickstart.md"
+      },
+      {
+        "section": "Start here",
+        "title": "Using Pi",
+        "path": "usage.md"
+      },
+      {
+        "section": "Start here",
+        "title": "Providers",
+        "path": "providers.md"
+      },
+      {
+        "section": "Start here",
+        "title": "Settings",
+        "path": "settings.md"
+      },
+      {
+        "section": "Start here",
+        "title": "Keybindings",
+        "path": "keybindings.md"
+      },
+      {
+        "section": "Start here",
+        "title": "Sessions",
+        "path": "sessions.md"
+      },
+      {
+        "section": "Start here",
+        "title": "Compaction",
+        "path": "compaction.md"
+      },
+      {
+        "section": "Customization",
+        "title": "Extensions",
+        "path": "extensions.md"
+      },
+      {
+        "section": "Customization",
+        "title": "Skills",
+        "path": "skills.md"
+      },
+      {
+        "section": "Customization",
+        "title": "Prompt Templates",
+        "path": "prompt-templates.md"
+      },
+      {
+        "section": "Customization",
+        "title": "Themes",
+        "path": "themes.md"
+      },
+      {
+        "section": "Customization",
+        "title": "Pi Packages",
+        "path": "packages.md"
+      },
+      {
+        "section": "Customization",
+        "title": "Custom Models",
+        "path": "models.md"
+      },
+      {
+        "section": "Customization",
+        "title": "Custom Providers",
+        "path": "custom-provider.md"
+      },
+      {
+        "section": "Reference",
+        "title": "Session Format",
+        "path": "session-format.md"
+      },
+      {
+        "section": "Programmatic Usage",
+        "title": "SDK",
+        "path": "sdk.md"
+      },
+      {
+        "section": "Programmatic Usage",
+        "title": "RPC Mode",
+        "path": "rpc.md"
+      },
+      {
+        "section": "Programmatic Usage",
+        "title": "JSON Event Stream Mode",
+        "path": "json.md"
+      },
+      {
+        "section": "Programmatic Usage",
+        "title": "TUI Components",
+        "path": "tui.md"
+      },
+      {
+        "section": "Platform Setup",
+        "title": "Windows",
+        "path": "windows.md"
+      },
+      {
+        "section": "Platform Setup",
+        "title": "Termux on Android",
+        "path": "termux.md"
+      },
+      {
+        "section": "Platform Setup",
+        "title": "tmux",
+        "path": "tmux.md"
+      },
+      {
+        "section": "Platform Setup",
+        "title": "Terminal Setup",
+        "path": "terminal-setup.md"
+      },
+      {
+        "section": "Platform Setup",
+        "title": "Shell Aliases",
+        "path": "shell-aliases.md"
+      },
+      {
+        "section": "Development",
+        "title": "Development",
+        "path": "development.md"
+      }
+    ]
+  }
+}

@@ -9,6 +9,7 @@ Status values:
 
 Current checkpoint evidence:
 
+- Upstream inventory ledger: `scripts/upstream-inventory.mjs` now enumerates every upstream surface (8 packages with deps/workspace refs, 46 CLI flags, 6 subcommands, 4 app modes, 21 built-in slash commands, 29 inbound RPC commands, 7 built-in tools/15 tool modules, 9 transport APIs, 20 provider files, 32 model providers/924 rows, 30 env-key + 3 OAuth auth surfaces, 22 extension API methods, 29 extension events, 12 TUI components, 36 interactive component groups, 26 public-API docs), fails its self-checks if any list drifts from disk, and writes `docs/inventory/upstream-inventory.json`; `docs/parity.md` adds a visible weighting behind the recomputed weighted total and surface-coverage maps marking every command/provider/transport/extension-API/RPC-command/TUI-group with a local status and explicit unknowns.
 - Agent/RPC extension path: `--mode rpc --session <file> --extension <hook.mjs>` now binds explicit tool hooks, and `--extension <tool.mjs>` / `<tool.ts>` expose registered tools to RPC provider prompts.
 - Runtime extension discovery: provider-backed JSON/text/RPC now execute enabled discovered `.js`/`.mjs`/`.ts` extension paths from project/user/package discovery; full upstream `jiti` aliasing, virtual modules, dependency roots, and long-lived extension state remain open.
 - Extension command inventory/execution: `commands` and RPC `get_commands` now load extension `registerCommand` metadata, emit extension slash commands before prompts/skills, assign upstream-shaped duplicate invocation names such as `deploy:1` / `deploy:2`, and RPC plus top-level text/JSON prompts now execute matching `/command args` handlers without appending a user message or calling provider/auth; command handlers can route `pi.sendUserMessage()` strings and `(TextContent | ImageContent)[]` arrays into raw follow-on user turns without re-expanding slash-looking text, preserving image parts through RPC idle prompts, provider-backed command prompts, and top-level prompt execution, persist idle `pi.sendMessage()` calls as upstream-shaped `custom_message` entries, run turns from custom `pi.sendMessage(..., { triggerTurn: true })` actions, and persist `pi.appendEntry(customType, data)` as hidden `custom` entries; RPC `pi.sendMessage(..., { deliverAs: "nextTurn" })` now queues a custom message invisibly, injects it after the next user prompt, persists the JSONL order as user/custom/assistant, and sends the custom content to provider history, while top-level nextTurn still rejects visibly until one-shot CLI queue semantics are designed; active RPC `prompt("/command args")` now executes registered extension commands immediately before active-prompt queue/error handling, and prompt-submitted handlers can enqueue `pi.sendUserMessage(..., { deliverAs })` plus custom `pi.sendMessage(..., { deliverAs })` actions while a prompt is running; direct queued `steer`/`follow_up` resource handling stays separate from registered extension command handlers; top-level registered-command action smokes cover `pi.appendEntry(customType, data)`, default custom `pi.sendMessage()` persistence, `pi.sendMessage(..., { triggerTurn: true })` prompt turns, raw `pi.sendUserMessage()` prompt turns in text and JSON mode, image-array `pi.sendUserMessage()` session persistence, and visible `deliverAs: "nextTurn"` rejection, while unknown slash prompts continue through the normal prompt path.
@@ -26,33 +27,41 @@ Current checkpoint evidence:
 
 Current implementation estimate:
 
-| Area | Complete | Remaining |
-|---|---:|---:|
-| Monorepo package map | 35% | 65% |
-| CLI parser/help | 72% | 28% |
-| Package commands | 58% | 42% |
-| Settings manager | 69% | 31% |
-| Print mode | 67% | 33% |
-| JSON mode | 74% | 26% |
-| RPC mode | 92% | 8% |
-| Agent runtime/harness/tool loop | 98% | 2% |
-| Provider registry/transports | 54% | 46% |
-| Models registry | 62% | 38% |
-| OAuth/auth storage | 33% | 67% |
-| Built-in tools | 77% | 23% |
-| Sessions | 70% | 30% |
-| Compaction | 45% | 55% |
-| Extensions | 66% | 34% |
-| Skills/templates/themes/context | 59% | 41% |
-| TUI renderer | 0% | 100% |
-| HTML export | 32% | 68% |
-| Preact workbench | 25% | 75% |
-| Prin7r integration | 0% | 100% |
-| Total weighted estimate | 72% | 28% |
+The total is a weighted average: `total = Σ(weight × complete) / Σ(weight)`. Weights
+are anchored to upstream surface breadth (source-file count, protocol size, and
+parity risk per `docs/upstream-inventory.md`), so a large unimplemented surface
+(e.g. the 26-file TUI package at 0%) is not hidden by small near-complete areas.
+The `Contribution` column is `weight × complete / 100` — points each area adds to
+the 110-point total (Σ weight = 110). Per-area `Complete` values are owned by the
+flow that implements each area; this ledger only recomputes the weighted total.
+
+| Area | Weight | Complete | Remaining | Contribution |
+|---|---:|---:|---:|---:|
+| Monorepo package map | 1 | 70% | 30% | 0.70 |
+| CLI parser/help | 5 | 72% | 28% | 3.60 |
+| Package commands | 4 | 58% | 42% | 2.32 |
+| Settings manager | 4 | 69% | 31% | 2.76 |
+| Print mode | 4 | 67% | 33% | 2.68 |
+| JSON mode | 5 | 74% | 26% | 3.70 |
+| RPC mode | 7 | 92% | 8% | 6.44 |
+| Agent runtime/harness/tool loop | 13 | 98% | 2% | 12.74 |
+| Provider registry/transports | 10 | 54% | 46% | 5.40 |
+| Models registry | 4 | 62% | 38% | 2.48 |
+| OAuth/auth storage | 4 | 33% | 67% | 1.32 |
+| Built-in tools | 7 | 77% | 23% | 5.39 |
+| Sessions | 6 | 70% | 30% | 4.20 |
+| Compaction | 4 | 45% | 55% | 1.80 |
+| Extensions | 7 | 66% | 34% | 4.62 |
+| Skills/templates/themes/context | 5 | 59% | 41% | 2.95 |
+| TUI renderer | 12 | 0% | 100% | 0.00 |
+| HTML export | 2 | 32% | 68% | 0.64 |
+| Preact workbench | 3 | 25% | 75% | 0.75 |
+| Prin7r integration | 3 | 0% | 100% | 0.00 |
+| **Total weighted estimate** | **110** | **59%** | **41%** | **64.49** |
 
 | Area | Upstream Source | Pi-Zig Target | Status | Evidence |
 |---|---|---|---|---|
-| Monorepo package map | `packages/*/package.json` | `src/pi/upstream.zig`, `docs/upstream-inventory.md` | foundation | `node scripts/upstream-inventory.mjs` |
+| Monorepo package map | `packages/*/package.json` | `src/pi/upstream.zig`, `docs/upstream-inventory.md`, `scripts/upstream-inventory.mjs`, `docs/inventory/upstream-inventory.json` | in_progress | `node scripts/upstream-inventory.mjs` enumerates all 8 workspace packages (4 primary + 4 example extensions) with deps and `@earendil-works/pi-*` workspace references, 46 CLI flags, 6 top-level subcommands, 4 app modes, 21 built-in slash commands, 29 inbound RPC commands, 7 built-in tools (15 tool modules), 9 transport APIs, 20 provider files, 32 generated model providers/924 rows, 30 env-key + 3 OAuth auth surfaces, 22 extension API methods, 29 extension events, 12 TUI components, 36 interactive component groups, and 26 public-API/DoD doc pages; self-check assertions fail if any list drifts from disk, and a machine-readable artifact is written to `docs/inventory/upstream-inventory.json`. `docs/parity.md` surface-coverage maps map every command/provider/transport/extension-API/RPC-command/TUI-group to a local status with unknowns marked. Remaining: `src/pi/upstream.zig` runtime mirror still covers only a subset of the inventory |
 | CLI parser/help | `packages/coding-agent/src/cli/args.ts` | `src/main.zig`, `src/pi/cli.zig`, `src/pi/cli_runtime.zig` | in_progress | `zig build test`; `zig build run -- parse-args ...`; `zig-out/bin/pi-zig --list-models haiku`; `zig-out/bin/pi-zig -p "hello"`; top-level `--session-dir`, `--continue`, `--session <id-prefix>`, and `--fork` smokes |
 | Package commands | `package-manager-cli.ts`, docs/packages.md | `src/pi/package_manager.zig`, future full Zig package manager | in_progress | `zig-out/bin/pi-zig install --help`; `list` empty-state smoke; local path `install`, `install --local`, `list`, `remove`, and `uninstall -l` persist package entries relative to the selected settings file; managed npm installs create/use `npm/node_modules`, package-manager-aware install args, and uninstall removes managed packages; managed git installs clone into `git/<host>/<path>`, `update --extension` and `update --extensions` run fetch/reset/clean reconciliation, unpinned npm updates compare installed package versions to `npm view <name> version --json`, local/npm/git list entries show installed paths, and no-match update/remove errors suggest configured npm/git sources for shorthand input; `update --self` checks `https://pi.dev/api/latest-version`, skips when current, refuses unmanaged checkout binaries, follows global bin symlinks back to the managed npm package, detects npm/pnpm/yarn/bun-style global installs, validates self-update path writability, and `update --self --force` executes an upstream-shaped npm/pnpm/yarn/bun global install command with lifecycle scripts disabled; Windows native dependency quarantine and package-manager edge cases are still missing |
 | Settings manager | `core/settings-manager.ts`, `core/http-dispatcher.ts` | `src/pi/settings.zig`, future shared settings API for all runtime surfaces | in_progress | `zig-out/bin/pi-zig settings --json` reads global/project settings, migrates `queueMode`, `websockets`, legacy `skills`, and `retry.maxDelayMs`, merges project overrides over global nested objects, exposes upstream defaults for compaction/retry/transport/session dir/http idle timeout, preserves unrelated keys on `settings set` and `settings set-model`, avoids creating `.pi` during reads, and refuses to overwrite invalid JSON |
@@ -75,3 +84,106 @@ Current implementation estimate:
 | HTML export | `core/export-html/*` | `src/pi/session.zig` JSONL exporter, `src/pi/rpc.zig` minimal exporter, future upstream renderer parity | in_progress | top-level `--export <session> [output]` renders local JSONL messages to HTML and reports `Exported to: ...`; RPC `export_html` smoke with escaped local session content |
 | Preact workbench | n/a upstream TUI/web embedding target | `frontend/src/main.tsx` | foundation | frontend build |
 | Prin7r integration | target repo | future `patches/prin7r-pi-zig-*` | not_started | none |
+
+## Surface coverage maps (Flow 01 inventory)
+
+These tables map every upstream surface enumerated by
+`node scripts/upstream-inventory.mjs` to a local status, so no command, provider,
+extension API, RPC command, or TUI group is invisible. Every unknown is marked
+explicitly. Status values reuse the legend above; `n/a (needs TUI)` means the
+surface is interactive-only and blocked on the unstarted TUI renderer.
+
+### Top-level CLI commands (6)
+
+| Command | Upstream source | Local status | Evidence / gap |
+|---|---|---|---|
+| `install` | `package-manager-cli.ts` | in_progress | local path install + settings persistence; managed npm/git installs |
+| `remove` | `package-manager-cli.ts` | in_progress | removes matching settings entry |
+| `uninstall` (alias) | `package-manager-cli.ts` | in_progress | alias for `remove` |
+| `update` | `package-manager-cli.ts` | in_progress | `--extension(s)`, unpinned npm, git reconcile, `--self` checks |
+| `list` | `package-manager-cli.ts` | in_progress | lists user/project packages with installed paths |
+| `config` | `package-manager-cli.ts` → `cli/config-selector.ts` | not_started | TUI resource enable/disable selector; blocked on TUI renderer |
+
+### App modes (4)
+
+| Mode | Upstream entrypoint | Local status | Evidence / gap |
+|---|---|---|---|
+| `print` (text) | `modes/print-mode.ts` | in_progress | provider-backed `-p` runs through agent loop |
+| `json` | `modes/print-mode.ts` (json output) | in_progress | full JSON event stream for provider/tool runs |
+| `rpc` | `modes/rpc/rpc-mode.ts` | in_progress | 29/29 inbound commands handled |
+| `interactive` | `modes/interactive/interactive-mode.ts` | not_started | n/a (needs TUI) |
+
+### Transport APIs (9 registered)
+
+| Transport API | Upstream provider file | Local status | Evidence / gap |
+|---|---|---|---|
+| `anthropic-messages` | `providers/anthropic.ts` | in_progress | native Anthropic Messages text/image/tool/SSE in `ai_client.zig` |
+| `openai-completions` | `providers/openai-completions.ts` | in_progress | OpenAI-compatible shim (chat/completions) |
+| `openai-responses` | `providers/openai-responses.ts` | in_progress | OpenAI Responses streamed function-call events |
+| `azure-openai-responses` | `providers/azure-openai-responses.ts` | foundation | routed via OpenAI-compatible shim; Azure deployment map untested |
+| `openai-codex-responses` | `providers/openai-codex-responses.ts` | foundation | OpenAI Responses path; Codex OAuth untested |
+| `mistral-conversations` | `providers/mistral.ts` | in_progress | native Mistral chat text/image/tool/SSE |
+| `google-generative-ai` | `providers/google.ts` | in_progress | native Google GenerateContent + functionCall/thoughtSignature |
+| `google-vertex` | `providers/google-vertex.ts` | in_progress | API-key + `ya29.*` OAuth bearer; ADC/login/refresh missing |
+| `bedrock-converse-stream` | `providers/amazon-bedrock.ts` | in_progress | bearer ConverseStream event-stream; SigV4/profile auth missing |
+
+Image routes (`providers/images/openrouter.ts`,
+`providers/images/register-builtins.ts`): **not_started** — no local image
+generation/resize worker.
+
+### Auth surfaces
+
+| Surface | Upstream source | Local status | Evidence / gap |
+|---|---|---|---|
+| API-key env providers (30) | `env-api-keys.ts` | in_progress | `src/pi/providers.zig` maps all 30; `provider-env`/`auth status` JSON |
+| OAuth `anthropic` | `utils/oauth/anthropic.ts` | foundation | stored token resolve/status; no login/refresh flow |
+| OAuth `github-copilot` | `utils/oauth/github-copilot.ts` | foundation | env token only; device-code login missing |
+| OAuth `openai-codex` | `utils/oauth/openai-codex.ts` | not_started | no PKCE/device-code login or refresh |
+| Ambient AWS / Google ADC | `env-api-keys.ts` (excluded) | not_started | intentionally unmapped upstream; not ported |
+
+### Extension API methods (22)
+
+| Status | Methods |
+|---|---|
+| in_progress (wired in runner) | `registerTool`, `registerCommand`, `registerFlag`, `getFlag`, `sendMessage`, `sendUserMessage`, `appendEntry` |
+| not_started | `registerShortcut`, `registerMessageRenderer`, `registerProvider`, `unregisterProvider`, `setSessionName`, `getSessionName`, `setLabel`, `exec`, `getActiveTools`, `getAllTools`, `setActiveTools`, `getCommands`, `setModel`, `getThinkingLevel`, `setThinkingLevel` |
+
+Source: `core/extensions/types.ts` → `src/pi/extension_runner.zig`. The unstarted
+methods need either runtime state access (`getActiveTools`/`setModel`) or the
+`registerProvider` provider-injection path that is not yet bridged.
+
+### Extension lifecycle events (29)
+
+| Status | Events |
+|---|---|
+| in_progress (dispatched) | `tool_call`, `tool_result`, `input`, `context` |
+| not_started | `resources_discover`, `session_start`, `session_before_switch`, `session_before_fork`, `session_before_compact`, `session_compact`, `session_shutdown`, `session_before_tree`, `session_tree`, `before_provider_request`, `after_provider_response`, `before_agent_start`, `agent_start`, `agent_end`, `turn_start`, `turn_end`, `message_start`, `message_update`, `message_end`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`, `model_select`, `thinking_level_select`, `user_bash` |
+
+Source: `core/extensions/types.ts` `pi.on(...)`. Only the tool-mutation and
+input/context seams are bound today; the broad session/agent/turn/message event
+fan-out is unported.
+
+### RPC inbound commands (29)
+
+All 29 inbound `RpcCommand` union members are handled by `src/pi/rpc.zig`
+(`prompt`, `steer`, `follow_up`, `abort`, `new_session`, `get_state`,
+`set_model`, `cycle_model`, `get_available_models`, `set_thinking_level`,
+`cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`, `compact`,
+`set_auto_compaction`, `set_auto_retry`, `abort_retry`, `bash`, `abort_bash`,
+`get_session_stats`, `export_html`, `switch_session`, `fork`, `clone`,
+`get_fork_messages`, `get_last_assistant_text`, `set_session_name`,
+`get_messages`, `get_commands`). The `extension_ui_request`/`extension_ui_response`
+request/response pair (outside the inbound union) is **not_started**.
+
+### TUI component groups
+
+| Group | Upstream source | Local status |
+|---|---|---|
+| `@earendil-works/pi-tui` renderer + 12 components | `packages/tui/src/*` | not_started — n/a (needs TUI) |
+| 36 interactive component groups | `modes/interactive/components/*` | not_started — n/a (needs TUI) |
+| Differential rendering / editor / keybindings / images | `packages/tui/src/*` | not_started — n/a (needs TUI) |
+
+The entire terminal UI surface (renderer, editor, autocomplete, selectors,
+dialogs, message components, footer/chrome) is unimplemented; the Preact
+workbench (`frontend/`) is the intended web-side bridge target and is at
+foundation only.
