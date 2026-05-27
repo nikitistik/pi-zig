@@ -409,6 +409,44 @@ const PendingMessageQueue = struct {
     }
 };
 
+const PendingCustomMessageQueue = struct {
+    count: usize = 0,
+    custom_type_lengths: [max_pending_messages]usize = undefined,
+    custom_types: [max_pending_messages][max_custom_type_bytes]u8 = undefined,
+    content_lengths: [max_pending_messages]usize = undefined,
+    contents: [max_pending_messages][max_message_bytes]u8 = undefined,
+    displays: [max_pending_messages]bool = undefined,
+
+    fn enqueue(
+        self: *PendingCustomMessageQueue,
+        custom_type: []const u8,
+        content: []const u8,
+        display: bool,
+    ) !void {
+        if (custom_type.len == 0 or custom_type.len > max_custom_type_bytes) return error.ValueTooLong;
+        if (content.len > max_message_bytes) return error.MessageTooLarge;
+        if (self.count >= max_pending_messages) return error.PendingMessageLimitReached;
+        self.custom_type_lengths[self.count] = custom_type.len;
+        @memcpy(self.custom_types[self.count][0..custom_type.len], custom_type);
+        self.content_lengths[self.count] = content.len;
+        @memcpy(self.contents[self.count][0..content.len], content);
+        self.displays[self.count] = display;
+        self.count += 1;
+    }
+
+    fn clear(self: *PendingCustomMessageQueue) void {
+        self.count = 0;
+    }
+
+    fn at(self: *const PendingCustomMessageQueue, index: usize) PendingCustomMessage {
+        return .{
+            .custom_type = self.custom_types[index][0..self.custom_type_lengths[index]],
+            .content = self.contents[index][0..self.content_lengths[index]],
+            .display = self.displays[index],
+        };
+    }
+};
+
 const SlashCommandInvocation = struct {
     name: []const u8,
     args: []const u8,
@@ -429,6 +467,12 @@ const UserBatchMessage = struct {
     image_parts: []const ai_client.ChatContentPart = &.{},
 };
 
+const PendingCustomMessage = struct {
+    custom_type: []const u8,
+    content: []const u8,
+    display: bool,
+};
+
 const Runtime = struct {
     mutex: Mutex = .{},
     store: session.PersistentStore = .{},
@@ -444,6 +488,7 @@ const Runtime = struct {
     follow_up_mode: QueueMode = .one_at_a_time,
     steering_queue: PendingMessageQueue = .{},
     follow_up_queue: PendingMessageQueue = .{},
+    next_turn_custom_queue: PendingCustomMessageQueue = .{},
     auto_compaction_enabled: bool = false,
     auto_retry_enabled: bool = false,
     auto_retry_max_attempts: usize = max_auto_retry_attempts,
@@ -475,6 +520,7 @@ const Runtime = struct {
         self.clearLoadedImages(allocator);
         self.steering_queue.clear(allocator);
         self.follow_up_queue.clear(allocator);
+        self.next_turn_custom_queue.clear();
     }
 
     fn resetInMemory(self: *Runtime, allocator: std.mem.Allocator) void {
@@ -486,6 +532,7 @@ const Runtime = struct {
         self.thinking_level = .medium;
         self.steering_queue.clear(allocator);
         self.follow_up_queue.clear(allocator);
+        self.next_turn_custom_queue.clear();
         self.auto_compaction_enabled = false;
         self.auto_retry_enabled = false;
         self.auto_retry_max_attempts = max_auto_retry_attempts;
@@ -1204,6 +1251,7 @@ const Runtime = struct {
         prompt_job: ?*ActivePromptJob,
         history_limit: usize,
         batch_history_messages: []const UserBatchMessage,
+        batch_custom_messages: []const PendingCustomMessage,
         prompt: []const u8,
         prompt_image_parts: []const ai_client.ChatContentPart,
     ) !?agent.RunResult {
@@ -1219,6 +1267,9 @@ const Runtime = struct {
         defer deinitAgentHistory(allocator, &history);
         for (batch_history_messages) |message| {
             try appendBatchHistoryMessage(allocator, &history, message);
+        }
+        for (batch_custom_messages) |message| {
+            try appendHistoryMessage(allocator, &history, .user, message.content);
         }
         const prompt_content_parts = try buildPromptContentParts(allocator, prompt, prompt_image_parts);
         defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
@@ -1304,6 +1355,7 @@ const Runtime = struct {
         prompt_job: ?*ActivePromptJob,
         history_limit: usize,
         batch_history_messages: []const UserBatchMessage,
+        batch_custom_messages: []const PendingCustomMessage,
         prompt: []const u8,
         prompt_image_parts: []const ai_client.ChatContentPart,
     ) !?agent.RunResult {
@@ -1311,7 +1363,7 @@ const Runtime = struct {
         self.last_retry_attempts = 0;
         self.last_retry_delay_ms = 0;
         while (true) {
-            const result = self.runAgentIfAuthenticatedOnce(io, allocator, prompt_job, history_limit, batch_history_messages, prompt, prompt_image_parts) catch |err| {
+            const result = self.runAgentIfAuthenticatedOnce(io, allocator, prompt_job, history_limit, batch_history_messages, batch_custom_messages, prompt, prompt_image_parts) catch |err| {
                 if (!self.auto_retry_enabled or !isRetryableAgentError(err)) return err;
                 if (retry_attempts >= self.auto_retry_max_attempts) {
                     if (retry_attempts > 0) {
@@ -1664,6 +1716,7 @@ const Runtime = struct {
             prompt_job,
             history_limit,
             messages[0 .. messages.len - 1],
+            &.{},
             prompt_message.text,
             prompt_message.image_parts,
         ) catch |err| {
@@ -1788,8 +1841,9 @@ const Runtime = struct {
                     started_prompt = true;
                 },
                 .send_message => |custom_message| {
-                    if (custom_message.next_turn) return error.UnsupportedCommandActionNextTurn;
-                    if (custom_message.trigger_turn) {
+                    if (custom_message.next_turn) {
+                        try self.next_turn_custom_queue.enqueue(custom_message.custom_type, custom_message.content, custom_message.display);
+                    } else if (custom_message.trigger_turn) {
                         try self.startCustomPromptAsync(
                             io,
                             allocator,
@@ -1870,7 +1924,22 @@ const Runtime = struct {
         var initial_batch: [1 + max_pending_messages]UserBatchMessage = undefined;
         initial_batch[0] = .{ .text = message, .image_parts = image_parts };
         const steering_count = self.drainQueueBatch(&self.steering_queue, self.steering_mode, initial_batch[1..]);
-        try self.runUserBatch(io, allocator, w, retry_event_output, prompt_job, initial_batch[0 .. 1 + steering_count], &last_result);
+        var next_turn_custom_messages: [max_pending_messages]PendingCustomMessage = undefined;
+        const next_turn_custom_count = self.next_turn_custom_queue.count;
+        for (0..next_turn_custom_count) |index| {
+            next_turn_custom_messages[index] = self.next_turn_custom_queue.at(index);
+        }
+        defer self.next_turn_custom_queue.clear();
+        try self.runInitialPromptBatch(
+            io,
+            allocator,
+            w,
+            retry_event_output,
+            prompt_job,
+            initial_batch[0 .. 1 + steering_count],
+            next_turn_custom_messages[0..next_turn_custom_count],
+            &last_result,
+        );
         self.steering_queue.dropPrefix(allocator, steering_count);
 
         try self.drainQueuedMessages(io, allocator, w, retry_event_output, prompt_job, &last_result);
@@ -1878,6 +1947,55 @@ const Runtime = struct {
         const result = last_result orelse return null;
         last_result = null;
         return result;
+    }
+
+    fn runInitialPromptBatch(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
+        retry_event_output: ?*RpcOutput,
+        prompt_job: ?*ActivePromptJob,
+        messages: []const UserBatchMessage,
+        custom_messages: []const PendingCustomMessage,
+        last_result: *?agent.RunResult,
+    ) !void {
+        if (messages.len == 0) return;
+        const history_limit = self.message_count;
+        for (messages) |message| {
+            try self.addUserMessageWithImages(io, allocator, message.text, message.image_parts);
+        }
+        for (custom_messages) |message| {
+            try self.addCustomMessage(io, allocator, message.custom_type, message.content, message.display);
+        }
+
+        const prompt_message = messages[messages.len - 1];
+        const maybe_run_result = self.runAgentIfAuthenticated(
+            io,
+            allocator,
+            w,
+            retry_event_output,
+            prompt_job,
+            history_limit,
+            messages[0 .. messages.len - 1],
+            custom_messages,
+            prompt_message.text,
+            prompt_message.image_parts,
+        ) catch |err| {
+            if (err != error.RetryCancelled) {
+                const stop_reason: []const u8 = if (err == error.AgentAborted) "aborted" else "error";
+                const error_message: []const u8 = if (err == error.AgentAborted) "Request was aborted" else @errorName(err);
+                try self.addAssistantStatusMessage(io, allocator, "", stop_reason, error_message);
+                try writeRpcAssistantStatusEventsMaybeLocked(retry_event_output, w, self, stop_reason, error_message);
+            }
+            return err;
+        };
+        var run_result = maybe_run_result orelse return;
+        errdefer run_result.deinit(allocator);
+
+        try self.addAgentResultMessages(io, allocator, run_result);
+        if (last_result.*) |previous| previous.deinit(allocator);
+        last_result.* = run_result;
     }
 
     fn runCustomPromptCommand(
@@ -1901,6 +2019,7 @@ const Runtime = struct {
             retry_event_output,
             prompt_job,
             history_limit,
+            &.{},
             &.{},
             content,
             &.{},

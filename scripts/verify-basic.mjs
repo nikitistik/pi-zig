@@ -1057,6 +1057,16 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension bash override complete: ' + toolOutput } }] }));
       return;
     }
+    if (user.includes('rpc next-turn normal prompt')) {
+      if (!userMessages.includes('rpc next-turn custom note')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing rpc nextTurn custom message in provider history', messages: body.messages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc next-turn custom observed' } }] }));
+      return;
+    }
     if (user.includes('rpc extension typescript tool')) {
       if (!hasTool('ext_ts_echo')) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2338,6 +2348,12 @@ fs.writeFileSync(
     '      await pi.sendMessage({ customType: "test-extension", content: args, display: true }, { deliverAs: "nextTurn" });',
     '    }',
     '  });',
+    '  pi.registerCommand("send-next-turn-rpc-provider", {',
+    '    description: "Queue a custom message for the next provider-backed RPC turn",',
+    '    handler: async (args) => {',
+    '      await pi.sendMessage({ customType: "next-turn-extension", content: args, display: true }, { deliverAs: "nextTurn" });',
+    '    }',
+    '  });',
     '  pi.registerCommand("append-entry", {',
     '    description: "Append an extension state entry",',
     '    handler: async (args) => {',
@@ -2827,13 +2843,12 @@ const rpcNextTurnSessionText = fs.existsSync(fixtureRpcCommandNextTurnSession)
   ? fs.readFileSync(fixtureRpcCommandNextTurnSession, 'utf8')
   : '';
 if (
-  rpcCommandNextTurn?.success !== false ||
-  !rpcCommandNextTurn?.error?.includes('UnsupportedCommandActionNextTurn') ||
+  !rpcCommandNextTurn?.success ||
   rpcCommandNextTurnMessages?.data?.messages?.length !== 0 ||
   rpcNextTurnSessionText.includes('"type":"custom_message"') ||
   rpcNextTurnSessionText.includes('queued custom note')
 ) {
-  throw new Error('rpc extension command sendMessage nextTurn action was not rejected visibly');
+  throw new Error('rpc extension command sendMessage nextTurn action did not queue invisibly for the next turn');
 }
 const fixtureRpcCommandAppendEntrySession = path.join(commandsFixtureRoot, 'rpc-command-append-entry.jsonl');
 fs.rmSync(fixtureRpcCommandAppendEntrySession, { force: true });
@@ -6395,8 +6410,10 @@ export default function(pi) {
     throw new Error('rpc provider retry smoke did not recover from a transient provider failure');
   }
 
+  const rpcProviderRetryBodySessionFile = path.resolve('zig-out/pi-zig-rpc-provider-retry-body-smoke.jsonl');
+  fs.rmSync(rpcProviderRetryBodySessionFile, { force: true });
   const rpcProviderRetryBodyOutput = run(
-    ['rpc', path.resolve('zig-out/pi-zig-rpc-provider-retry-body-smoke.jsonl')],
+    ['rpc', rpcProviderRetryBodySessionFile],
     [
       JSON.stringify({ id: 'rpc-retry-body-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
       JSON.stringify({ id: 'rpc-retry-body-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
@@ -6431,8 +6448,10 @@ export default function(pi) {
     throw new Error('rpc provider retry body-text smoke did not recover from retryable provider error text');
   }
 
+  const rpcProviderRetryExhaustedSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-retry-exhausted-smoke.jsonl');
+  fs.rmSync(rpcProviderRetryExhaustedSessionFile, { force: true });
   const rpcProviderRetryExhaustedOutput = run(
-    ['rpc', path.resolve('zig-out/pi-zig-rpc-provider-retry-exhausted-smoke.jsonl')],
+    ['rpc', rpcProviderRetryExhaustedSessionFile],
     [
       JSON.stringify({ id: 'rpc-retry-exhausted-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
       JSON.stringify({ id: 'rpc-retry-exhausted-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
@@ -6487,8 +6506,10 @@ export default function(pi) {
     throw new Error('rpc provider retry exhaustion smoke did not emit upstream-shaped retry events');
   }
 
+  const rpcProviderRetryContextSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-retry-context-overflow-smoke.jsonl');
+  fs.rmSync(rpcProviderRetryContextSessionFile, { force: true });
   const rpcProviderRetryContextOutput = run(
-    ['rpc', path.resolve('zig-out/pi-zig-rpc-provider-retry-context-overflow-smoke.jsonl')],
+    ['rpc', rpcProviderRetryContextSessionFile],
     [
       JSON.stringify({ id: 'rpc-retry-context-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
       JSON.stringify({ id: 'rpc-retry-context-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
@@ -6511,8 +6532,10 @@ export default function(pi) {
     throw new Error('rpc provider retry context-overflow smoke retried a compaction-class error');
   }
 
+  const rpcProviderRetryClientErrorSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-retry-client-error-smoke.jsonl');
+  fs.rmSync(rpcProviderRetryClientErrorSessionFile, { force: true });
   const rpcProviderRetryClientErrorOutput = run(
-    ['rpc', path.resolve('zig-out/pi-zig-rpc-provider-retry-client-error-smoke.jsonl')],
+    ['rpc', rpcProviderRetryClientErrorSessionFile],
     [
       JSON.stringify({ id: 'rpc-retry-client-error-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
       JSON.stringify({ id: 'rpc-retry-client-error-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 5 }),
@@ -6677,6 +6700,42 @@ export default function(pi) {
     !rpcProviderExtensionToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-registered-ok')
   ) {
     throw new Error('rpc provider prompt smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const rpcProviderNextTurnCommandSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-next-turn-command-smoke.jsonl');
+  fs.rmSync(rpcProviderNextTurnCommandSessionFile, { force: true });
+  const rpcProviderNextTurnCommandOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderNextTurnCommandSessionFile, '--extension', 'extensions/command-exec.mjs'],
+    [
+      JSON.stringify({ id: 'rpc-extension-next-turn-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-next-turn-command', type: 'prompt', message: '/send-next-turn-rpc-provider rpc next-turn custom note' }),
+      JSON.stringify({ id: 'rpc-extension-next-turn-prompt', type: 'prompt', message: 'rpc next-turn normal prompt' }),
+      JSON.stringify({ id: 'rpc-extension-next-turn-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { cwd: commandsFixtureRoot, env: { ...rpcProviderEnv, HOME: commandsFixtureHome } }
+  );
+  const rpcProviderNextTurnCommandResponses = rpcProviderNextTurnCommandOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderNextTurnCommand = rpcProviderNextTurnCommandResponses.find((response) => response.id === 'rpc-extension-next-turn-command');
+  const rpcProviderNextTurnPrompt = rpcProviderNextTurnCommandResponses.find((response) => response.id === 'rpc-extension-next-turn-prompt');
+  const rpcProviderNextTurnMessages = rpcProviderNextTurnCommandResponses.find((response) => response.id === 'rpc-extension-next-turn-messages');
+  const rpcProviderNextTurnSessionText = fs.readFileSync(rpcProviderNextTurnCommandSessionFile, 'utf8');
+  if (
+    !rpcProviderNextTurnCommand?.success ||
+    !rpcProviderNextTurnPrompt?.success ||
+    rpcProviderNextTurnPrompt?.data?.text !== 'rpc next-turn custom observed' ||
+    !rpcProviderNextTurnMessages?.data?.messages?.some((message) =>
+      message.role === 'custom' &&
+      message.customType === 'next-turn-extension' &&
+      message.content === 'rpc next-turn custom note' &&
+      message.display === true
+    ) ||
+    rpcProviderNextTurnMessages?.data?.messages?.some((message) => message.content === '/send-next-turn-rpc-provider rpc next-turn custom note') ||
+    !rpcProviderNextTurnSessionText.includes('"type":"custom_message"') ||
+    !rpcProviderNextTurnSessionText.includes('"customType":"next-turn-extension"') ||
+    rpcProviderNextTurnSessionText.includes('/send-next-turn-rpc-provider rpc next-turn custom note')
+  ) {
+    throw new Error('rpc provider extension command nextTurn custom message was not injected into the next prompt');
   }
 
   const rpcProviderExtensionFlagToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-flag-tool-smoke.jsonl');
