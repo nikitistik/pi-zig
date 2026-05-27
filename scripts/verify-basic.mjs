@@ -3994,6 +3994,13 @@ export default function(pi: any): void {
   );
   assertJsonRetryExhaustedEvents(jsonLines(providerJsonRetryExhausted.stdout), 'top-level JSON exhausted retry');
 
+  const providerJsonRetryToolExhausted = runFail(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json retry exhausted tool-capable'],
+    undefined,
+    { env: providerEnv }
+  );
+  assertJsonRetryExhaustedEvents(jsonLines(providerJsonRetryToolExhausted.stdout), 'top-level JSON tool-capable exhausted retry');
+
   const providerRetryDisabledAgentDir = path.resolve('zig-out/pi-zig-json-retry-disabled-agent');
   fs.rmSync(providerRetryDisabledAgentDir, { recursive: true, force: true });
   fs.mkdirSync(providerRetryDisabledAgentDir, { recursive: true });
@@ -4004,6 +4011,13 @@ export default function(pi: any): void {
     { env: { ...providerEnv, PI_CODING_AGENT_DIR: providerRetryDisabledAgentDir } }
   );
   assertNoJsonRetryEvents(jsonLines(providerJsonRetryDisabled.stdout), 'top-level JSON disabled retry');
+
+  const providerJsonRetryToolDisabled = runFail(
+    ['--mode', 'json', '--no-session', '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json retry disabled tool-capable'],
+    undefined,
+    { env: { ...providerEnv, PI_CODING_AGENT_DIR: providerRetryDisabledAgentDir } }
+  );
+  assertNoJsonRetryEvents(jsonLines(providerJsonRetryToolDisabled.stdout), 'top-level JSON tool-capable disabled retry');
 
   const assertJsonProviderErrorLifecycle = (lines, label) => {
     const assistantStartCount = lines.filter((line) => line.type === 'message_start' && line.message?.role === 'assistant').length;
