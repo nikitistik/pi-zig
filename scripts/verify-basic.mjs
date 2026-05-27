@@ -2320,6 +2320,12 @@ fs.writeFileSync(
     '      await pi.sendUserMessage(args);',
     '    }',
     '  });',
+    '  pi.registerCommand("send-custom-message", {',
+    '    description: "Send an extension custom message",',
+    '    handler: async (args) => {',
+    '      await pi.sendMessage({ customType: "test-extension", content: args, display: false });',
+    '    }',
+    '  });',
     '}'
   ].join('\n')
 );
@@ -2742,6 +2748,41 @@ if (
   !rpcCommandSendUserMessages?.data?.messages?.some((message) => message.role === 'user' && message.content === '/write-marker raw user')
 ) {
   throw new Error('rpc extension command sendUserMessage action did not persist raw slash-looking user text');
+}
+const fixtureRpcCommandCustomSession = path.join(commandsFixtureRoot, 'rpc-command-send-custom-message.jsonl');
+fs.rmSync(fixtureRpcCommandCustomSession, { force: true });
+const fixtureRpcCommandCustomOutput = run(
+  [
+    '--mode',
+    'rpc',
+    '--session',
+    fixtureRpcCommandCustomSession,
+    '--extension',
+    'extensions/command-exec.mjs'
+  ],
+  [
+    JSON.stringify({ id: 'rpc-command-send-custom', type: 'prompt', message: '/send-custom-message custom note' }),
+    JSON.stringify({ id: 'rpc-command-send-custom-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { cwd: commandsFixtureRoot, env: commandsFixtureEnv }
+);
+const fixtureRpcCommandCustomResponses = fixtureRpcCommandCustomOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcCommandCustom = fixtureRpcCommandCustomResponses.find((response) => response.id === 'rpc-command-send-custom');
+const rpcCommandCustomMessages = fixtureRpcCommandCustomResponses.find((response) => response.id === 'rpc-command-send-custom-messages');
+const rpcCustomSessionText = fs.readFileSync(fixtureRpcCommandCustomSession, 'utf8');
+if (
+  !rpcCommandCustom?.success ||
+  !rpcCommandCustomMessages?.data?.messages?.some((message) =>
+    message.role === 'custom' &&
+    message.customType === 'test-extension' &&
+    message.content === 'custom note' &&
+    message.display === false
+  ) ||
+  !rpcCustomSessionText.includes('"type":"custom_message"') ||
+  !rpcCustomSessionText.includes('"customType":"test-extension"')
+) {
+  throw new Error('rpc extension command sendMessage action did not persist an upstream-shaped custom message');
 }
 fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
 const topLevelCommandEnv = envWithoutAnthropicAuth({ HOME: commandsFixtureHome });

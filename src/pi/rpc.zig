@@ -27,6 +27,7 @@ const max_tool_thought_signature_bytes = 2 * 1024;
 const max_compaction_kept_id_bytes = 32;
 const max_assistant_stop_reason_bytes = 16;
 const max_assistant_error_message_bytes = 512;
+const max_custom_type_bytes = 128;
 const max_pending_messages = 32;
 const max_auto_retry_attempts = 3;
 const default_auto_retry_base_delay_ms = 0;
@@ -183,6 +184,7 @@ const StoredRole = enum {
     tool,
     bash_execution,
     compaction_summary,
+    custom,
 
     fn label(self: StoredRole) []const u8 {
         return switch (self) {
@@ -192,6 +194,7 @@ const StoredRole = enum {
             .tool => "tool",
             .bash_execution => "bashExecution",
             .compaction_summary => "compactionSummary",
+            .custom => "custom",
         };
     }
 
@@ -280,6 +283,9 @@ const StoredMessage = struct {
     first_kept_entry_id_len: usize = 0,
     first_kept_entry_id: [max_compaction_kept_id_bytes]u8 = undefined,
     tokens_before: usize = 0,
+    custom_type_len: usize = 0,
+    custom_type: [max_custom_type_bytes]u8 = undefined,
+    custom_display: bool = true,
 
     fn entryId(self: *const StoredMessage) []const u8 {
         return self.id[0..self.id_len];
@@ -326,6 +332,10 @@ const StoredMessage = struct {
         if (self.role != .assistant) return false;
         const reason = self.assistantStopReason() orelse return false;
         return std.mem.eql(u8, reason, "error") or std.mem.eql(u8, reason, "aborted");
+    }
+
+    fn customType(self: *const StoredMessage) []const u8 {
+        return self.custom_type[0..self.custom_type_len];
     }
 };
 
@@ -641,6 +651,9 @@ const Runtime = struct {
                 .compaction_summary => {
                     _ = try new_store.appendCompaction(io, allocator, message.text(), message.firstKeptEntryId(), message.tokens_before, null, copy_count);
                 },
+                .custom => {
+                    _ = try new_store.appendCustomMessage(io, allocator, message.customType(), message.text(), message.custom_display);
+                },
             }
         }
         if (previous_model) |model| try new_store.appendModelChange(io, allocator, model.provider, model.id);
@@ -690,8 +703,23 @@ const Runtime = struct {
                 if (models.find(provider, model_id)) |model| self.selected_model = model;
             } else if (std.mem.eql(u8, entry_type, "compaction")) {
                 try self.loadCompactionEntry(parsed.value.object);
+            } else if (std.mem.eql(u8, entry_type, "custom_message")) {
+                try self.loadCustomMessageEntry(parsed.value.object);
             }
         }
+    }
+
+    fn loadCustomMessageEntry(self: *Runtime, object: std.json.ObjectMap) !void {
+        const id = getStringFieldObject(object, "id") orelse return error.InvalidSessionEntry;
+        const custom_type = getStringFieldObject(object, "customType") orelse return error.InvalidSessionEntry;
+        const content = object.get("content") orelse return error.InvalidSessionEntry;
+        const display = getBoolFieldObject(object, "display") orelse true;
+        var text_buf: [max_message_bytes]u8 = undefined;
+        const text_len = try extractContentText(content, &text_buf);
+        try self.addLoadedMessage(.custom, id, text_buf[0..text_len]);
+        var slot = &self.messages[self.message_count - 1];
+        try copyBounded(&slot.custom_type, &slot.custom_type_len, custom_type);
+        slot.custom_display = display;
     }
 
     fn loadCompactionEntry(self: *Runtime, object: std.json.ObjectMap) !void {
@@ -775,6 +803,8 @@ const Runtime = struct {
         slot.assistant_error_message_len = 0;
         slot.first_kept_entry_id_len = 0;
         slot.tokens_before = 0;
+        slot.custom_type_len = 0;
+        slot.custom_display = true;
         self.message_count += 1;
     }
 
@@ -814,6 +844,26 @@ const Runtime = struct {
         const entry_id = try self.store.appendMessageWithContentParts(io, allocator, .user, content, image_parts);
         try self.addLoadedMessage(.user, entry_id, content);
         self.messages[self.message_count - 1].image_parts = owned_image_parts;
+    }
+
+    fn addCustomMessage(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        custom_type: []const u8,
+        content: []const u8,
+        display: bool,
+    ) !void {
+        if (content.len > max_message_bytes) return error.MessageTooLarge;
+        if (custom_type.len > max_custom_type_bytes) return error.ValueTooLong;
+        if (self.message_count >= max_messages) return error.MessageLimitReached;
+
+        const entry_id = try self.store.appendCustomMessage(io, allocator, custom_type, content, display);
+        try self.addLoadedMessage(.custom, entry_id, content);
+        var slot = &self.messages[self.message_count - 1];
+        slot.custom_type_len = custom_type.len;
+        @memcpy(slot.custom_type[0..custom_type.len], custom_type);
+        slot.custom_display = display;
     }
 
     fn addLoadedBash(self: *Runtime, entry_id: []const u8, command: []const u8, result: tools.ShellResult) !void {
@@ -1238,6 +1288,7 @@ const Runtime = struct {
             .tool => try appendToolHistoryMessage(allocator, history, message),
             .bash_execution => try appendOwnedHistoryMessage(allocator, history, .user, try self.bashExecutionHistoryText(allocator, message)),
             .compaction_summary => {},
+            .custom => try appendHistoryMessage(allocator, history, .user, message.text()),
             else => {},
         }
     }
@@ -1624,6 +1675,10 @@ const Runtime = struct {
                     if (started_prompt) return error.MultipleCommandPromptActionsUnsupported;
                     try self.startPromptAsync(io, allocator, output, id, content, &.{});
                     started_prompt = true;
+                },
+                .send_message => |custom_message| {
+                    if (custom_message.trigger_turn) return error.UnsupportedCommandActionTriggerTurn;
+                    try self.addCustomMessage(io, allocator, custom_message.custom_type, custom_message.content, custom_message.display);
                 },
             }
         }
@@ -2125,6 +2180,12 @@ const Runtime = struct {
         } else {
             try w.writeAll(",\"content\":");
             try writeJsonString(w, message.text());
+            if (message.role == .custom) {
+                try w.writeAll(",\"customType\":");
+                try writeJsonString(w, message.customType());
+                try w.writeAll(",\"display\":");
+                try w.writeAll(if (message.custom_display) "true" else "false");
+            }
             if ((message.role == .user or message.role == .tool) and message.image_parts.len > 0) {
                 try w.writeAll(",\"images\":");
                 try writeImagePartsJson(w, message.image_parts);
@@ -3006,6 +3067,7 @@ fn parseStoredRole(role: []const u8) ?StoredRole {
     if (std.mem.eql(u8, role, "tool") or std.mem.eql(u8, role, "toolResult")) return .tool;
     if (std.mem.eql(u8, role, "bashExecution")) return .bash_execution;
     if (std.mem.eql(u8, role, "compactionSummary")) return .compaction_summary;
+    if (std.mem.eql(u8, role, "custom")) return .custom;
     return null;
 }
 
@@ -3065,6 +3127,10 @@ fn copyBounded(buffer: []u8, len: *usize, value: []const u8) !void {
 
 fn extractMessageText(object: std.json.ObjectMap, buffer: []u8) !usize {
     const content = object.get("content") orelse return 0;
+    return extractContentText(content, buffer);
+}
+
+fn extractContentText(content: std.json.Value, buffer: []u8) !usize {
     var writer = std.Io.Writer.fixed(buffer);
     switch (content) {
         .string => |text| try appendBoundedText(&writer, text),

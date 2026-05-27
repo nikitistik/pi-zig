@@ -105,11 +105,25 @@ pub const Runner = struct {
 
     pub const CommandAction = union(enum) {
         send_user_message: []u8,
+        send_message: CommandCustomMessageAction,
 
         pub fn deinit(self: CommandAction, allocator: std.mem.Allocator) void {
             switch (self) {
                 .send_user_message => |message| allocator.free(message),
+                .send_message => |message| message.deinit(allocator),
             }
+        }
+    };
+
+    pub const CommandCustomMessageAction = struct {
+        custom_type: []u8,
+        content: []u8,
+        display: bool = true,
+        trigger_turn: bool = false,
+
+        pub fn deinit(self: CommandCustomMessageAction, allocator: std.mem.Allocator) void {
+            allocator.free(self.custom_type);
+            allocator.free(self.content);
         }
     };
 
@@ -560,6 +574,47 @@ fn commandActionsToOwned(allocator: std.mem.Allocator, value: std.json.Value) ![
                 allocator.free(owned_content);
                 return err;
             };
+        } else if (std.mem.eql(u8, kind.string, "send_message")) {
+            const message = item.object.get("message") orelse return error.ExtensionHookInvalidResponse;
+            if (message != .object) return error.ExtensionHookInvalidResponse;
+            const custom_type = message.object.get("customType") orelse return error.ExtensionHookInvalidResponse;
+            if (custom_type != .string or custom_type.string.len == 0) return error.ExtensionHookInvalidResponse;
+            const content = message.object.get("content") orelse return error.ExtensionHookInvalidResponse;
+            const owned_content = switch (content) {
+                .string => try allocator.dupe(u8, content.string),
+                .array => try textContentToOwnedString(allocator, content),
+                else => return error.ExtensionHookInvalidResponse,
+            };
+            const owned_custom_type = try allocator.dupe(u8, custom_type.string);
+            var appended = false;
+            errdefer if (!appended) {
+                allocator.free(owned_content);
+                allocator.free(owned_custom_type);
+            };
+            var display = true;
+            if (message.object.get("display")) |display_value| {
+                if (display_value != .bool) return error.ExtensionHookInvalidResponse;
+                display = display_value.bool;
+            }
+            var trigger_turn = false;
+            if (item.object.get("options")) |options| {
+                if (options != .object) return error.ExtensionHookInvalidResponse;
+                if (options.object.get("triggerTurn")) |trigger_value| {
+                    if (trigger_value != .bool) return error.ExtensionHookInvalidResponse;
+                    trigger_turn = trigger_value.bool;
+                }
+            }
+            actions.append(allocator, .{ .send_message = .{
+                .custom_type = owned_custom_type,
+                .content = owned_content,
+                .display = display,
+                .trigger_turn = trigger_turn,
+            } }) catch |err| {
+                allocator.free(owned_content);
+                allocator.free(owned_custom_type);
+                return err;
+            };
+            appended = true;
         } else {
             return error.ExtensionHookInvalidResponse;
         }
@@ -744,6 +799,9 @@ const hook_runner_script =
     \\  sendUserMessage(content, options = {}) {
     \\    void options;
     \\    actions.push({ type: "send_user_message", content });
+    \\  },
+    \\  sendMessage(message, options = {}) {
+    \\    actions.push({ type: "send_message", message, options });
     \\  },
     \\  events: { on() {}, emit() {} },
     \\};
@@ -1184,6 +1242,40 @@ test "extension runner returns send user message command actions" {
     try std.testing.expectEqual(@as(usize, 1), result.actions.len);
     switch (result.actions[0]) {
         .send_user_message => |message| try std.testing.expectEqualStrings("/write-marker raw user", message),
+        else => return error.UnexpectedCommandAction,
+    }
+}
+
+test "extension runner returns send custom message command actions" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-command-custom-message-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const extension_path = fixture_dir ++ "/command-custom-message.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerCommand("send-custom", {
+        \\    description: "Send a custom message",
+        \\    handler: async (args) => {
+        \\      await pi.sendMessage({ customType: "test-extension", content: args, display: false });
+        \\    }
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const result = try runner.runRegisteredCommand("send-custom", "custom note");
+    defer result.deinit(allocator);
+    try std.testing.expect(result.handled);
+    try std.testing.expectEqual(@as(usize, 1), result.actions.len);
+    switch (result.actions[0]) {
+        .send_message => |message| {
+            try std.testing.expectEqualStrings("test-extension", message.custom_type);
+            try std.testing.expectEqualStrings("custom note", message.content);
+            try std.testing.expect(!message.display);
+            try std.testing.expect(!message.trigger_turn);
+        },
+        else => return error.UnexpectedCommandAction,
     }
 }
 

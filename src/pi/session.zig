@@ -302,6 +302,39 @@ pub const PersistentStore = struct {
         return self.leaf_id_buf[0..self.leaf_id_len];
     }
 
+    pub fn appendCustomMessage(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        custom_type: []const u8,
+        content: []const u8,
+        display: bool,
+    ) ![]const u8 {
+        var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
+        const id = try self.nextEntryId(&entry_id_buf);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll("{\"type\":\"custom_message\",\"id\":");
+        try writeJsonString(w, id);
+        try w.writeAll(",\"parentId\":");
+        try self.writeLeafParent(w);
+        try w.writeAll(",\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll(",\"customType\":");
+        try writeJsonString(w, custom_type);
+        try w.writeAll(",\"content\":");
+        try writeJsonString(w, content);
+        try w.writeAll(",\"display\":");
+        try w.writeAll(if (display) "true" else "false");
+        try w.writeAll("}\n");
+
+        try appendBytes(io, self.path(), out.written());
+        try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
+        return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+
     pub fn appendAssistantToolCallMessage(
         self: *PersistentStore,
         io: std.Io,
