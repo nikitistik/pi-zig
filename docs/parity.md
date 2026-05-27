@@ -97,7 +97,8 @@ These tables map every upstream surface enumerated by
 `node scripts/upstream-inventory.mjs` to a local status, so no command, provider,
 extension API, RPC command, or TUI group is invisible. Every unknown is marked
 explicitly. Status values reuse the legend above; `n/a (needs TUI)` means the
-surface is interactive-only and blocked on the unstarted TUI renderer.
+surface is interactive-only and still blocked on live TUI behavior, not on a
+missing renderer foundation.
 
 ### Top-level CLI commands (6)
 
@@ -108,7 +109,7 @@ surface is interactive-only and blocked on the unstarted TUI renderer.
 | `uninstall` (alias) | `package-manager-cli.ts` | in_progress | alias for `remove` |
 | `update` | `package-manager-cli.ts` | in_progress | `--extension(s)`, unpinned npm, git reconcile, `--self` checks |
 | `list` | `package-manager-cli.ts` | in_progress | lists user/project packages with installed paths |
-| `config` | `package-manager-cli.ts` → `cli/config-selector.ts` | not_started | TUI resource enable/disable selector; blocked on TUI renderer |
+| `config` | `package-manager-cli.ts` → `cli/config-selector.ts` | not_started | TUI resource enable/disable selector itself is not ported; renderer foundation exists |
 
 ### App modes (4)
 
@@ -117,7 +118,7 @@ surface is interactive-only and blocked on the unstarted TUI renderer.
 | `print` (text) | `modes/print-mode.ts` | in_progress | provider-backed `-p` runs through agent loop |
 | `json` | `modes/print-mode.ts` (json output) | in_progress | full JSON event stream for provider/tool runs |
 | `rpc` | `modes/rpc/rpc-mode.ts` | in_progress | 29/29 inbound commands handled |
-| `interactive` | `modes/interactive/interactive-mode.ts` | not_started | n/a (needs TUI) |
+| `interactive` | `modes/interactive/interactive-mode.ts` | in_progress | Flow 10 terminal renderer, editor/key modules, interactive entrypoint, and non-TTY fallback exist; live controls and automated pty verification remain |
 
 ### Transport APIs (9 registered)
 
@@ -142,9 +143,9 @@ generation/resize worker.
 | Surface | Upstream source | Local status | Evidence / gap |
 |---|---|---|---|
 | API-key env providers (30) | `env-api-keys.ts` | in_progress | `src/pi/providers.zig` maps all 30; `provider-env`/`auth status` JSON |
-| OAuth `anthropic` | `utils/oauth/anthropic.ts` | foundation | stored token resolve/status; no login/refresh flow |
-| OAuth `github-copilot` | `utils/oauth/github-copilot.ts` | foundation | env token only; device-code login missing |
-| OAuth `openai-codex` | `utils/oauth/openai-codex.ts` | not_started | no PKCE/device-code login or refresh |
+| OAuth `anthropic` | `utils/oauth/anthropic.ts` | in_progress | stored token resolve/status plus fake-token-server refresh/persistence smoke; live token endpoint and login flow unexercised |
+| OAuth `github-copilot` | `utils/oauth/github-copilot.ts` | in_progress | stored/env token resolve plus fake-token-server session-token refresh smoke; device-code login and live endpoint unexercised |
+| OAuth `openai-codex` | `utils/oauth/openai-codex.ts` | in_progress | stored token resolve plus fake-token-server refresh/account-id persistence smoke; PKCE/device-code login and live endpoint unexercised |
 | Ambient AWS / Google ADC | `env-api-keys.ts` (excluded) | not_started | intentionally unmapped upstream; not ported |
 
 ### Extension API methods (22)
@@ -185,11 +186,11 @@ request/response pair (outside the inbound union) is **not_started**.
 
 | Group | Upstream source | Local status |
 |---|---|---|
-| `@earendil-works/pi-tui` renderer + 12 components | `packages/tui/src/*` | not_started — n/a (needs TUI) |
-| 36 interactive component groups | `modes/interactive/components/*` | not_started — n/a (needs TUI) |
-| Differential rendering / editor / keybindings / images | `packages/tui/src/*` | not_started — n/a (needs TUI) |
+| `@earendil-works/pi-tui` renderer + 12 components | `packages/tui/src/*` | in_progress — renderer/editor/key/fuzzy/terminal modules exist; component parity pending |
+| 36 interactive component groups | `modes/interactive/components/*` | foundation — prompt shell and non-TTY fallback exist; command palette, selectors, dialogs, and session controls pending |
+| Differential rendering / editor / keybindings / images | `packages/tui/src/*` | in_progress — differential renderer, editor, and key parsing exist; image rendering and automated live harness pending |
 
-The entire terminal UI surface (renderer, editor, autocomplete, selectors,
-dialogs, message components, footer/chrome) is unimplemented; the Preact
-workbench (`frontend/`) is the intended web-side bridge target and is at
-foundation only.
+The terminal UI surface is no longer unimplemented: the renderer foundation,
+editor/key handling, interactive entrypoint, and non-TTY fallback are present.
+Most component-level parity is still pending, and the Preact workbench
+(`frontend/`) remains the intended web-side bridge target.

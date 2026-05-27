@@ -115,6 +115,8 @@ Controller status report for the wave defined in `docs/12-agent-implementation-w
 
 ## Required next steps to approach 100%
 
+Detailed controller task: `docs/tasks/2026-05-28-parity-closure-task.md`.
+
 1. Flow 10: automated TUI interaction harness (pty-driven) + remaining controls/bridge.
 2. Flow 11: wire the SPA to a live backend child over NDJSON in the packaged path.
 3. Flow 06: Google/Vertex thinking-signature persistence; cross-mode retry parity.
