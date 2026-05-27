@@ -405,6 +405,28 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'json provider client error fixture' }));
       return;
     }
+    if (user.includes('json retry disabled')) {
+      const count = (requestCounts.get(user) ?? 0) + 1;
+      requestCounts.set(user, count);
+      if (count === 1) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'temporary json provider failure with retry disabled' }));
+        return;
+      }
+      const content = 'json retry disabled unexpectedly recovered';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
+    if (user.includes('json retry exhausted')) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'temporary json provider failure' }));
+      return;
+    }
     if (user.includes('native mistral stream tool events')) {
       if (
         body.stream !== true ||
@@ -3827,6 +3849,34 @@ export default function(pi: any): void {
     }
   };
 
+  const assertJsonRetryExhaustedEvents = (lines, label) => {
+    const summary = lines
+      .filter((line) => ['agent_end', 'auto_retry_start', 'auto_retry_end'].includes(line.type))
+      .map((line) => {
+        if (line.type === 'agent_end') return `agent_end:${line.willRetry}`;
+        if (line.type === 'auto_retry_start') return `auto_retry_start:${line.attempt}:${line.maxAttempts}:${line.delayMs}:${line.errorMessage}`;
+        return `auto_retry_end:${line.success}:${line.attempt}:${line.finalError ?? ''}`;
+      });
+    if (
+      JSON.stringify(summary) !== JSON.stringify([
+        'agent_end:true',
+        'auto_retry_start:1:2:0:ProviderRequestFailed',
+        'agent_end:true',
+        'auto_retry_start:2:2:0:ProviderRequestFailed',
+        'agent_end:false',
+        'auto_retry_end:false:2:ProviderRequestFailed'
+      ])
+    ) {
+      throw new Error(label + ' did not emit exhausted JSON retry events');
+    }
+  };
+
+  const assertNoJsonRetryEvents = (lines, label) => {
+    if (lines.some((line) => line.type === 'auto_retry_start' || line.type === 'auto_retry_end' || line.willRetry === true)) {
+      throw new Error(label + ' unexpectedly emitted JSON retry events');
+    }
+  };
+
   const providerJsonRetryStreamLines = run(
     ['--mode', 'json', '--no-session', '--no-tools', '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json retry transient stream'],
     undefined,
@@ -3848,6 +3898,24 @@ export default function(pi: any): void {
     .filter(Boolean)
     .map((line) => JSON.parse(line));
   assertJsonRetryEvents(providerJsonRetryToolLines, 'top-level JSON tool-capable retry', 'json retry tool-capable recovered');
+
+  const providerJsonRetryExhausted = runFail(
+    ['--mode', 'json', '--no-session', '--no-tools', '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json retry exhausted stream'],
+    undefined,
+    { env: providerEnv }
+  );
+  assertJsonRetryExhaustedEvents(jsonLines(providerJsonRetryExhausted.stdout), 'top-level JSON exhausted retry');
+
+  const providerRetryDisabledAgentDir = path.resolve('zig-out/pi-zig-json-retry-disabled-agent');
+  fs.rmSync(providerRetryDisabledAgentDir, { recursive: true, force: true });
+  fs.mkdirSync(providerRetryDisabledAgentDir, { recursive: true });
+  fs.writeFileSync(path.join(providerRetryDisabledAgentDir, 'settings.json'), JSON.stringify({ retry: { enabled: false, maxRetries: 2, baseDelayMs: 0 } }));
+  const providerJsonRetryDisabled = runFail(
+    ['--mode', 'json', '--no-session', '--no-tools', '--provider', 'openai', '--model', 'gpt-4o', '-p', 'json retry disabled stream'],
+    undefined,
+    { env: { ...providerEnv, PI_CODING_AGENT_DIR: providerRetryDisabledAgentDir } }
+  );
+  assertNoJsonRetryEvents(jsonLines(providerJsonRetryDisabled.stdout), 'top-level JSON disabled retry');
 
   const assertJsonProviderErrorLifecycle = (lines, label) => {
     const assistantStartCount = lines.filter((line) => line.type === 'message_start' && line.message?.role === 'assistant').length;
@@ -3894,7 +3962,9 @@ export default function(pi: any): void {
     undefined,
     { env: providerEnv }
   );
-  assertJsonProviderErrorLifecycle(jsonLines(providerJsonStreamError.stdout), 'top-level JSON no-tools provider failure');
+  const providerJsonStreamErrorLines = jsonLines(providerJsonStreamError.stdout);
+  assertJsonProviderErrorLifecycle(providerJsonStreamErrorLines, 'top-level JSON no-tools provider failure');
+  assertNoJsonRetryEvents(providerJsonStreamErrorLines, 'top-level JSON no-tools client failure');
   assertJsonProviderErrorSession(providerJsonStreamErrorSessionFile, 'top-level JSON no-tools provider failure');
 
   const providerJsonToolErrorSessionFile = path.resolve('zig-out/pi-zig-json-tool-provider-error-smoke.jsonl');
@@ -3904,7 +3974,9 @@ export default function(pi: any): void {
     undefined,
     { env: providerEnv }
   );
-  assertJsonProviderErrorLifecycle(jsonLines(providerJsonToolProviderError.stdout), 'top-level JSON tool-capable provider failure');
+  const providerJsonToolProviderErrorLines = jsonLines(providerJsonToolProviderError.stdout);
+  assertJsonProviderErrorLifecycle(providerJsonToolProviderErrorLines, 'top-level JSON tool-capable provider failure');
+  assertNoJsonRetryEvents(providerJsonToolProviderErrorLines, 'top-level JSON tool-capable client failure');
   assertJsonProviderErrorSession(providerJsonToolErrorSessionFile, 'top-level JSON tool-capable provider failure');
 
   const providerImageFixture = path.resolve('zig-out/pi-zig-provider-image-fixture');
