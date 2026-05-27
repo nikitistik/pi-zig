@@ -6,9 +6,15 @@ const max_hook_payload_bytes = 1024 * 1024;
 const max_hook_output_bytes = 1024 * 1024;
 
 pub const Runner = struct {
+    pub const FlagValue = struct {
+        name: []const u8,
+        value: ?[]const u8 = null,
+    };
+
     io: std.Io,
     allocator: std.mem.Allocator,
     extension_paths: []const []const u8,
+    flag_values: []const FlagValue = &.{},
 
     pub fn hasExtensions(self: Runner) bool {
         return self.extension_paths.len > 0;
@@ -341,7 +347,18 @@ pub const Runner = struct {
             if (index != 0) try w.writeByte(',');
             try writeJsonString(w, path);
         }
-        try w.writeByte(']');
+        try w.writeAll("],\"flags\":{");
+        for (self.flag_values, 0..) |flag, index| {
+            if (index != 0) try w.writeByte(',');
+            try writeJsonString(w, flag.name);
+            try w.writeByte(':');
+            if (flag.value) |value| {
+                try writeJsonString(w, value);
+            } else {
+                try w.writeAll("true");
+            }
+        }
+        try w.writeByte('}');
     }
 
     fn runNodeHook(self: *Runner, payload: []const u8) !?[]u8 {
@@ -597,8 +614,11 @@ const hook_runner_script =
     \\const handlers = new Map();
     \\const extensionToolMaps = [];
     \\const extensionCommandMaps = [];
+    \\const extensionFlagMaps = [];
     \\let activeToolMap = null;
     \\let activeCommandMap = null;
+    \\let activeFlagMap = null;
+    \\const payloadFlags = payload.flags && typeof payload.flags === "object" ? payload.flags : {};
     \\const diagnostics = [];
     \\const api = {
     \\  on(type, handler) {
@@ -611,7 +631,22 @@ const hook_runner_script =
     \\  registerCommand(name, options) {
     \\    if (typeof name === "string" && name.length > 0 && activeCommandMap) activeCommandMap.set(name, { name, ...(options || {}) });
     \\  },
-    \\  registerFlag() {},
+    \\  registerFlag(name, options) {
+    \\    if (typeof name === "string" && name.length > 0 && activeFlagMap) activeFlagMap.set(name, { name, ...(options || {}) });
+    \\  },
+    \\  getFlag(name) {
+    \\    if (Object.prototype.hasOwnProperty.call(payloadFlags, name)) return payloadFlags[name];
+    \\    const active = activeFlagMap && activeFlagMap.get(name);
+    \\    if (active && Object.prototype.hasOwnProperty.call(active, "default")) return active.default;
+    \\    if (active && Object.prototype.hasOwnProperty.call(active, "defaultValue")) return active.defaultValue;
+    \\    for (const flagMap of extensionFlagMaps) {
+    \\      const flag = flagMap.get(name);
+    \\      if (!flag) continue;
+    \\      if (Object.prototype.hasOwnProperty.call(flag, "default")) return flag.default;
+    \\      if (Object.prototype.hasOwnProperty.call(flag, "defaultValue")) return flag.defaultValue;
+    \\    }
+    \\    return undefined;
+    \\  },
     \\  events: { on() {}, emit() {} },
     \\};
     \\const ctx = {
@@ -630,18 +665,23 @@ const hook_runner_script =
     \\  const factory = typeof mod.default === "function" ? mod.default : typeof mod === "function" ? mod : null;
     \\  const toolMap = new Map();
     \\  const commandMap = new Map();
+    \\  const flagMap = new Map();
     \\  const previousToolMap = activeToolMap;
     \\  const previousCommandMap = activeCommandMap;
+    \\  const previousFlagMap = activeFlagMap;
     \\  activeToolMap = toolMap;
     \\  activeCommandMap = commandMap;
+    \\  activeFlagMap = flagMap;
     \\  try {
     \\    if (factory) await factory(api);
     \\  } finally {
     \\    activeToolMap = previousToolMap;
     \\    activeCommandMap = previousCommandMap;
+    \\    activeFlagMap = previousFlagMap;
     \\  }
     \\  extensionToolMaps.push(toolMap);
     \\  extensionCommandMaps.push({ extensionPath: resolvedExtensionPath, commands: commandMap });
+    \\  extensionFlagMaps.push(flagMap);
     \\}
     \\function allRegisteredTools() {
     \\  const toolsByName = new Map();
@@ -1006,4 +1046,58 @@ test "extension runner loads TypeScript registered tools" {
     defer allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("ts: world", result.content);
+}
+
+test "extension runner exposes registered flag defaults and overrides" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-flag-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const extension_path = fixture_dir ++ "/flags.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerFlag("mode", { default: "default-mode" });
+        \\  pi.registerFlag("debug", { default: false });
+        \\  pi.registerTool({
+        \\    name: "flag_echo",
+        \\    description: "Echo extension flag values",
+        \\    parameters: { type: "object", properties: {}, additionalProperties: false },
+        \\    execute: async () => ({
+        \\      content: [{
+        \\        type: "text",
+        \\        text: `mode=${String(pi.getFlag("mode"))};debug=${String(pi.getFlag("debug"))};missing=${String(pi.getFlag("missing"))}`
+        \\      }],
+        \\      isError: false
+        \\    })
+        \\  });
+        \\}
+    });
+
+    var call = ai_client.ChatToolCall{
+        .id = try allocator.dupe(u8, "call_flag_ext_1"),
+        .name = try allocator.dupe(u8, "flag_echo"),
+        .arguments_json = try allocator.dupe(u8, "{}"),
+    };
+    defer call.deinit(allocator);
+
+    var default_runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const default_result = try default_runner.runRegisteredTool(call);
+    defer allocator.free(default_result.content);
+    try std.testing.expect(!default_result.is_error);
+    try std.testing.expectEqualStrings("mode=default-mode;debug=false;missing=undefined", default_result.content);
+
+    const flag_values = [_]Runner.FlagValue{
+        .{ .name = "mode", .value = "override-mode" },
+        .{ .name = "debug", .value = null },
+    };
+    var override_runner = Runner{
+        .io = std.testing.io,
+        .allocator = allocator,
+        .extension_paths = &.{extension_path},
+        .flag_values = &flag_values,
+    };
+    const override_result = try override_runner.runRegisteredTool(call);
+    defer allocator.free(override_result.content);
+    try std.testing.expect(!override_result.is_error);
+    try std.testing.expectEqualStrings("mode=override-mode;debug=true;missing=undefined", override_result.content);
 }

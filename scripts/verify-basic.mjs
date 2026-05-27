@@ -980,6 +980,41 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension tool complete: ' + toolOutput } }] }));
       return;
     }
+    if (user.includes('rpc extension flag registered tool')) {
+      if (!hasTool('ext_flag_echo')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing rpc extension flag tool definition', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_rpc_extension_flag_tool_1',
+                type: 'function',
+                function: {
+                  name: 'ext_flag_echo',
+                  arguments: '{}'
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_rpc_extension_flag_tool_1' || toolOutput !== 'ext-flag: plan=review;debug=true;missing=undefined') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'rpc extension flag registered tool did not receive CLI flags', toolMessages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'rpc extension flag tool complete: ' + toolOutput } }] }));
+      return;
+    }
     if (user.includes('rpc extension bash override tool')) {
       const definitionError = extensionBashOverrideDefinitionError();
       if (definitionError) {
@@ -1082,6 +1117,35 @@ const server = http.createServer((req, res) => {
       }
       writeStreamEvents([
         { choices: [{ delta: { content: 'extension tool ' } }] },
+        { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
+      ]);
+      return;
+    }
+    if (user.includes('extension flag registered tool')) {
+      if (body.stream !== true) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'expected extension flag registered tool stream request' }));
+        return;
+      }
+      if (!hasTool('ext_flag_echo')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing extension flag tool definition', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        writeStreamEvents([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_extension_flag_tool_1', type: 'function', function: { name: 'ext_flag_echo', arguments: '{}' } }] } }] }
+        ]);
+        return;
+      }
+      const toolOutput = toolMessages.at(-1).content.trim();
+      if (toolMessages.at(-1).tool_call_id !== 'call_extension_flag_tool_1' || toolOutput !== 'ext-flag: plan=review;debug=true;missing=undefined') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'extension flag registered tool did not receive CLI flags', toolMessages }));
+        return;
+      }
+      writeStreamEvents([
+        { choices: [{ delta: { content: 'extension flag tool ' } }] },
         { choices: [{ delta: { content: 'complete: ' + toolOutput } }] }
       ]);
       return;
@@ -3631,6 +3695,30 @@ export default function(pi) {
   });
 }
 `);
+  const extensionFlagToolPath = path.join(extensionHookFixture, 'flag-tool.mjs');
+  fs.writeFileSync(extensionFlagToolPath, `
+export default function(pi) {
+  pi.registerFlag("plan", { default: "default-plan" });
+  pi.registerFlag("debug-flag", { default: false });
+  pi.registerTool({
+    name: "ext_flag_echo",
+    label: "Extension Flag Echo",
+    description: "Echo values from extension flags",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    },
+    execute: async () => ({
+      content: [{
+        type: "text",
+        text: "ext-flag: plan=" + String(pi.getFlag("plan")) + ";debug=" + String(pi.getFlag("debug-flag")) + ";missing=" + String(pi.getFlag("missing"))
+      }],
+      isError: false
+    })
+  });
+}
+`);
   const extensionPermissionGatePath = path.join(extensionHookFixture, 'permission-gate.mjs');
   fs.writeFileSync(extensionPermissionGatePath, `
 export default function(pi) {
@@ -4185,6 +4273,24 @@ export default function(pi: any): void {
     !providerJsonExtensionToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension tool complete: ext-echo: registered-ok'))
   ) {
     throw new Error('top-level JSON mode smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const providerJsonExtensionFlagToolLines = run(
+    ['--mode', 'json', '--no-session', '--extension', extensionFlagToolPath, '--plan', 'review', '--debug-flag', '--provider', 'openai', '--model', 'mock-json-extension-flag-tool-model', '-p', 'please run extension flag registered tool'],
+    undefined,
+    { env: providerEnv }
+  )
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  if (
+    !providerJsonExtensionFlagToolLines.some((line) => line.type === 'tool_execution_start' && line.toolName === 'ext_flag_echo' && line.toolCallId === 'call_extension_flag_tool_1') ||
+    !providerJsonExtensionFlagToolLines.some((line) => line.type === 'tool_execution_end' && line.toolName === 'ext_flag_echo' && JSON.stringify(line.result).includes('ext-flag: plan=review;debug=true;missing=undefined')) ||
+    !providerJsonExtensionFlagToolLines.some((line) => line.type === 'turn_end' && line.toolResults?.some((result) => result.toolCallId === 'call_extension_flag_tool_1' && JSON.stringify(result).includes('ext-flag: plan=review;debug=true;missing=undefined'))) ||
+    !providerJsonExtensionFlagToolLines.some((line) => line.type === 'message_update' && JSON.stringify(line).includes('extension flag tool complete: ext-flag: plan=review;debug=true;missing=undefined'))
+  ) {
+    throw new Error('top-level JSON mode smoke did not pass CLI extension flags to a registered extension tool');
   }
 
   const providerJsonExtensionNoBuiltinToolLines = run(
@@ -5325,6 +5431,30 @@ export default function(pi) {
   });
 }
 `);
+  const rpcExtensionFlagToolPath = path.join(rpcExtensionHookFixture, 'flag-tool.mjs');
+  fs.writeFileSync(rpcExtensionFlagToolPath, `
+export default function(pi) {
+  pi.registerFlag("plan", { default: "default-plan" });
+  pi.registerFlag("debug-flag", { default: false });
+  pi.registerTool({
+    name: "ext_flag_echo",
+    label: "Extension Flag Echo",
+    description: "Echo values from extension flags",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    },
+    execute: async () => ({
+      content: [{
+        type: "text",
+        text: "ext-flag: plan=" + String(pi.getFlag("plan")) + ";debug=" + String(pi.getFlag("debug-flag")) + ";missing=" + String(pi.getFlag("missing"))
+      }],
+      isError: false
+    })
+  });
+}
+`);
   const rpcExtensionPermissionGatePath = path.join(rpcExtensionHookFixture, 'permission-gate.mjs');
   fs.writeFileSync(rpcExtensionPermissionGatePath, `
 export default function(pi) {
@@ -6007,6 +6137,32 @@ export default function(pi: any): void {
     !rpcProviderExtensionToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_tool_1' && message.toolName === 'ext_echo' && message.content === 'ext-echo: rpc-registered-ok')
   ) {
     throw new Error('rpc provider prompt smoke did not expose and execute an explicit registered extension tool');
+  }
+
+  const rpcProviderExtensionFlagToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-flag-tool-smoke.jsonl');
+  fs.rmSync(rpcProviderExtensionFlagToolSessionFile, { force: true });
+  const rpcProviderExtensionFlagToolOutput = run(
+    ['--mode', 'rpc', '--session', rpcProviderExtensionFlagToolSessionFile, '--extension', rpcExtensionFlagToolPath, '--plan', 'review', '--debug-flag'],
+    [
+      JSON.stringify({ id: 'rpc-extension-flag-tool-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'rpc-extension-flag-tool-prompt', type: 'prompt', message: 'rpc extension flag registered tool' }),
+      JSON.stringify({ id: 'rpc-extension-flag-tool-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcProviderExtensionFlagToolResponses = rpcProviderExtensionFlagToolOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcProviderExtensionFlagToolPrompt = rpcProviderExtensionFlagToolResponses.find((response) => response.id === 'rpc-extension-flag-tool-prompt');
+  const rpcProviderExtensionFlagToolMessages = rpcProviderExtensionFlagToolResponses.find((response) => response.id === 'rpc-extension-flag-tool-messages');
+  if (
+    !rpcProviderExtensionFlagToolPrompt?.success ||
+    rpcProviderExtensionFlagToolPrompt?.data?.text !== 'rpc extension flag tool complete: ext-flag: plan=review;debug=true;missing=undefined' ||
+    rpcProviderExtensionFlagToolPrompt?.data?.toolResults?.[0]?.toolCallId !== 'call_rpc_extension_flag_tool_1' ||
+    rpcProviderExtensionFlagToolPrompt?.data?.toolResults?.[0]?.toolName !== 'ext_flag_echo' ||
+    rpcProviderExtensionFlagToolPrompt?.data?.toolResults?.[0]?.content !== 'ext-flag: plan=review;debug=true;missing=undefined' ||
+    !rpcProviderExtensionFlagToolMessages?.data?.messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call_rpc_extension_flag_tool_1' && message.toolName === 'ext_flag_echo' && message.content === 'ext-flag: plan=review;debug=true;missing=undefined')
+  ) {
+    throw new Error('rpc provider prompt smoke did not pass CLI extension flags to a registered extension tool');
   }
 
   const rpcProviderExtensionNoBuiltinToolSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-extension-no-builtin-tool-smoke.jsonl');

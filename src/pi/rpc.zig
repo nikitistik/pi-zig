@@ -38,6 +38,7 @@ const compaction_summary_suffix = "\n</summary>";
 pub const RunOptions = struct {
     command_options: commands.Options = .{},
     extension_paths: []const []const u8 = &.{},
+    extension_flag_values: []const extension_runner.Runner.FlagValue = &.{},
     tool_set: agent.ToolSet = .all,
     custom_tools_enabled: bool = true,
     tool_allowlist: ?[]const u8 = null,
@@ -1050,6 +1051,7 @@ const Runtime = struct {
             .io = io,
             .allocator = allocator,
             .extension_paths = self.run_options.extension_paths,
+            .flag_values = self.run_options.extension_flag_values,
         };
         const has_extension_hooks = extension_runner_instance.hasExtensions();
         var extension_tool_definitions: []ai_client.ChatToolDefinition = if (has_extension_hooks and self.run_options.custom_tools_enabled)

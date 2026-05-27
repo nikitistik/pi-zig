@@ -113,9 +113,12 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         defer runtime_extensions.deinit(init.gpa);
         var command_options = commandOptionsFromParsed(init, &parsed);
         command_options.extension_paths = runtime_extensions.paths;
+        const extension_flag_values = try extensionFlagValuesFromParsed(init.gpa, parsed);
+        defer if (extension_flag_values.len > 0) init.gpa.free(extension_flag_values);
         return rpc.run(init.io, init.gpa, init.environ_map, path.path, .{
             .command_options = command_options,
             .extension_paths = runtime_extensions.paths,
+            .extension_flag_values = extension_flag_values,
             .tool_set = toolSetFromParsed(parsed),
             .custom_tools_enabled = !parsed.no_tools,
             .tool_allowlist = parsed.tools,
@@ -994,10 +997,13 @@ fn buildPrintResponse(
     defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
     var runtime_extensions = try discoverRuntimeExtensionPaths(io, allocator, env, parsed);
     defer runtime_extensions.deinit(allocator);
+    const extension_flag_values = try extensionFlagValuesFromParsed(allocator, parsed);
+    defer if (extension_flag_values.len > 0) allocator.free(extension_flag_values);
     var hooks = extension_runner.Runner{
         .io = io,
         .allocator = allocator,
         .extension_paths = runtime_extensions.paths,
+        .flag_values = extension_flag_values,
     };
     const has_extension_hooks = hooks.hasExtensions();
     var extension_tool_definitions: []ai_client.ChatToolDefinition = if (has_extension_hooks)
@@ -1083,6 +1089,15 @@ fn filterExtensionToolDefinitions(
     allocator.free(definitions);
     if (kept.items.len == 0) return &.{};
     return kept.toOwnedSlice(allocator);
+}
+
+fn extensionFlagValuesFromParsed(allocator: std.mem.Allocator, parsed: cli.ParsedArgs) ![]extension_runner.Runner.FlagValue {
+    if (parsed.unknown_flags_len == 0) return &.{};
+    const values = try allocator.alloc(extension_runner.Runner.FlagValue, parsed.unknown_flags_len);
+    for (parsed.unknown_flags[0..parsed.unknown_flags_len], 0..) |flag, index| {
+        values[index] = .{ .name = flag.name, .value = flag.value };
+    }
+    return values;
 }
 
 fn extensionToolAllowed(parsed: cli.ParsedArgs, name: []const u8) bool {
