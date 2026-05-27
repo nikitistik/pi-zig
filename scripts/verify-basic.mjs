@@ -2710,6 +2710,90 @@ if (
 ) {
   throw new Error('rpc extension command execution smoke did not match upstream prompt/queue semantics');
 }
+fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
+const topLevelCommandEnv = envWithoutAnthropicAuth({ HOME: commandsFixtureHome });
+const topLevelTextCommandSession = path.join(commandsFixtureRoot, 'top-level-command-text.jsonl');
+fs.rmSync(topLevelTextCommandSession, { force: true });
+const topLevelTextCommandOutput = run(
+  [
+    '--session',
+    topLevelTextCommandSession,
+    '--provider',
+    'anthropic',
+    '--model',
+    'claude-haiku-4-5',
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/write-marker top text'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelTextCommandSessionText = fs.existsSync(topLevelTextCommandSession)
+  ? fs.readFileSync(topLevelTextCommandSession, 'utf8')
+  : '';
+if (
+  topLevelTextCommandOutput !== '' ||
+  fs.readFileSync(commandsFixtureCommandExecMarker, 'utf8') !== 'top text|hasUI:false' ||
+  topLevelTextCommandSessionText.includes('"type":"message"')
+) {
+  throw new Error('top-level text mode extension command did not execute without provider output/auth');
+}
+fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
+const topLevelJsonCommandSession = path.join(commandsFixtureRoot, 'top-level-command-json.jsonl');
+fs.rmSync(topLevelJsonCommandSession, { force: true });
+const topLevelJsonCommandOutput = run(
+  [
+    '--mode',
+    'json',
+    '--provider',
+    'anthropic',
+    '--model',
+    'claude-haiku-4-5',
+    '--session',
+    topLevelJsonCommandSession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/write-marker top json'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelJsonCommandLines = jsonLines(topLevelJsonCommandOutput);
+const topLevelJsonCommandSessionText = fs.readFileSync(topLevelJsonCommandSession, 'utf8');
+if (
+  fs.readFileSync(commandsFixtureCommandExecMarker, 'utf8') !== 'top json|hasUI:false' ||
+  topLevelJsonCommandLines.length !== 1 ||
+  topLevelJsonCommandLines[0]?.type !== 'session' ||
+  topLevelJsonCommandLines.some((line) => line.type === 'agent_start' || line.type === 'turn_start') ||
+  topLevelJsonCommandSessionText.includes('"type":"message"') ||
+  topLevelJsonCommandSessionText.includes('/write-marker top json')
+) {
+  throw new Error('top-level JSON mode extension command did not match upstream command-only prompt semantics');
+}
+const topLevelUnknownSlashSession = path.join(commandsFixtureRoot, 'top-level-unknown-slash.jsonl');
+fs.rmSync(topLevelUnknownSlashSession, { force: true });
+const topLevelUnknownSlashOutput = run(
+  [
+    '--session',
+    topLevelUnknownSlashSession,
+    '--extension',
+    'extensions/command-exec.mjs',
+    '-p',
+    '/not-an-extension-command ordinary prompt'
+  ],
+  undefined,
+  { cwd: commandsFixtureRoot, env: topLevelCommandEnv }
+);
+const topLevelUnknownSlashSessionText = fs.readFileSync(topLevelUnknownSlashSession, 'utf8');
+if (
+  !topLevelUnknownSlashOutput.includes('pi-zig print-mode foundation accepted') ||
+  !topLevelUnknownSlashSessionText.includes('/not-an-extension-command ordinary prompt')
+) {
+  throw new Error('top-level unknown slash prompt should continue through the normal prompt path');
+}
 
 const packageCommandRoot = path.resolve('zig-out/pi-zig-package-command-fixture');
 const packageCommandHome = path.join(packageCommandRoot, 'home');

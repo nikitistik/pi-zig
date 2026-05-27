@@ -192,6 +192,8 @@ fn runTextPrintFoundation(
     prompt: []const u8,
     image_parts: []const ai_client.ChatContentPart,
 ) !void {
+    if (try runTopLevelRegisteredCommand(io, allocator, env, parsed, prompt)) return;
+
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
         if (prompt.len > 0) _ = try persistent.appendMessage(io, allocator, .user, prompt);
@@ -216,6 +218,13 @@ fn runJsonPrintFoundation(
     prompt: []const u8,
     image_parts: []const ai_client.ChatContentPart,
 ) !void {
+    if (try runTopLevelRegisteredCommand(io, allocator, env, parsed, prompt)) {
+        var store = try maybeOpenStore(io, allocator, env, parsed);
+        const session_id = if (store) |*persistent| persistent.sessionId() else "pi-zig-ephemeral";
+        try emitJsonSessionHeader(io, allocator, session_id);
+        return;
+    }
+
     if (shouldUseProviderTextStream(parsed)) {
         return runJsonProviderTextStream(io, allocator, env, parsed, prompt, image_parts);
     }
@@ -339,6 +348,45 @@ fn runJsonPrintFoundation(
 
 fn shouldUseProviderTextStream(parsed: cli.ParsedArgs) bool {
     return parsed.provider != null and parsed.model != null and parsed.no_tools;
+}
+
+const SlashCommandInvocation = struct {
+    name: []const u8,
+    args: []const u8,
+};
+
+fn parseSlashCommandInvocation(message: []const u8) ?SlashCommandInvocation {
+    if (message.len < 2 or message[0] != '/') return null;
+    const rest = message[1..];
+    const space_index = std.mem.indexOfScalar(u8, rest, ' ');
+    const name = if (space_index) |index| rest[0..index] else rest;
+    if (name.len == 0) return null;
+    const args = if (space_index) |index| rest[index + 1 ..] else "";
+    return .{ .name = name, .args = args };
+}
+
+fn runTopLevelRegisteredCommand(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+    prompt: []const u8,
+) !bool {
+    const invocation = parseSlashCommandInvocation(prompt) orelse return false;
+    var runtime_extensions = try discoverRuntimeExtensionPaths(io, allocator, env, parsed);
+    defer runtime_extensions.deinit(allocator);
+    if (runtime_extensions.paths.len == 0) return false;
+
+    const extension_flag_values = try extensionFlagValuesFromParsed(allocator, parsed);
+    defer if (extension_flag_values.len > 0) allocator.free(extension_flag_values);
+    var runner = extension_runner.Runner{
+        .io = io,
+        .allocator = allocator,
+        .extension_paths = runtime_extensions.paths,
+        .flag_values = extension_flag_values,
+    };
+    const result = try runner.runRegisteredCommand(invocation.name, invocation.args);
+    return result.handled;
 }
 
 fn runJsonProviderTextStream(
@@ -490,6 +538,16 @@ fn runJsonProviderTextStream(
     try w.writeAll("{\"type\":\"agent_end\",\"messages\":[");
     try writeAssistantMessageJson(w, final_text.written());
     try w.writeAll("],\"willRetry\":false}\n");
+    try writeStreamingJsonLine(io, allocator, line.written());
+}
+
+fn emitJsonSessionHeader(io: std.Io, allocator: std.mem.Allocator, session_id: []const u8) !void {
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    try w.writeAll("{\"type\":\"session\",\"version\":3,\"id\":");
+    try writeJsonString(w, session_id);
+    try w.writeAll(",\"timestamp\":\"local-foundation\",\"cwd\":\".\"}\n");
     try writeStreamingJsonLine(io, allocator, line.written());
 }
 
