@@ -130,6 +130,7 @@ pub const RunResult = struct {
     tool_call_batches: []ToolCallBatch = &.{},
     tool_results: []ToolResult = &.{},
     tool_results_count: usize = 0,
+    stopped_after_turn: bool = false,
 
     pub fn deinit(self: RunResult, allocator: std.mem.Allocator) void {
         allocator.free(self.final_text);
@@ -449,6 +450,7 @@ pub fn runPrompt(
                 .tool_call_batches = try tool_call_batches.toOwnedSlice(allocator),
                 .tool_results = try tool_results.toOwnedSlice(allocator),
                 .tool_results_count = tool_results_count,
+                .stopped_after_turn = true,
             };
         }
 

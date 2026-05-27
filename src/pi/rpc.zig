@@ -1349,6 +1349,7 @@ const Runtime = struct {
             &.{};
         extension_tool_definitions = try self.filterExtensionToolDefinitions(allocator, extension_tool_definitions);
         defer if (extension_tool_definitions.len > 0) extension_runner_instance.deinitToolDefinitions(extension_tool_definitions);
+        var turn_lifecycle_context = RuntimeTurnLifecycleContext{ .runtime = self };
 
         return try agent.runPrompt(io, allocator, env, .{
             .provider = model.provider,
@@ -1368,6 +1369,8 @@ const Runtime = struct {
             .tool_hook_context = if (has_extension_hooks) &extension_runner_instance else null,
             .before_tool_call = if (has_extension_hooks) extension_runner.Runner.beforeToolCall else null,
             .after_tool_call = if (has_extension_hooks) extension_runner.Runner.afterToolCall else null,
+            .turn_lifecycle_context = &turn_lifecycle_context,
+            .should_stop_after_turn = shouldStopAfterTurnForRuntimeSteering,
             .cancellation_context = if (prompt_job) |job| job else null,
             .should_cancel = if (prompt_job != null) shouldCancelActivePrompt else null,
         });
@@ -1671,7 +1674,9 @@ const Runtime = struct {
         while (next_tool_result_index < result.tool_results_count) : (next_tool_result_index += 1) {
             try self.addToolResultMessage(io, allocator, result.tool_results[next_tool_result_index]);
         }
-        try self.addMessage(io, allocator, .assistant, result.final_text);
+        if (!(result.stopped_after_turn and result.final_text.len == 0)) {
+            try self.addMessage(io, allocator, .assistant, result.final_text);
+        }
     }
 
     fn addAssistantStatusMessage(
@@ -2734,6 +2739,18 @@ const Runtime = struct {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = out.written() });
     }
 };
+
+const RuntimeTurnLifecycleContext = struct {
+    runtime: *Runtime,
+};
+
+fn shouldStopAfterTurnForRuntimeSteering(ctx: *anyopaque, turn: agent.TurnContext) anyerror!bool {
+    _ = turn;
+    const context: *RuntimeTurnLifecycleContext = @ptrCast(@alignCast(ctx));
+    context.runtime.mutex.lock();
+    defer context.runtime.mutex.unlock();
+    return context.runtime.steering_queue.count > 0;
+}
 
 fn promptThreadMain(job: *ActivePromptJob) void {
     const maybe_result = switch (job.kind) {

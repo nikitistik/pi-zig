@@ -1799,13 +1799,8 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [toolCall] } }] }));
         return;
       }
-      const content = 'rpc active extension steer base complete';
-      if (body.stream === true) {
-        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      res.writeHead(409, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'active extension steer was not drained before tool-result continuation', userMessages, toolMessages }));
       return;
     }
     if (userMessages.includes('rpc active extension follow start')) {
@@ -6173,6 +6168,7 @@ try {
     const customType = isFollow ? 'active-follow-extension' : 'active-steer-extension';
     const customText = isFollow ? 'rpc active custom follow' : 'rpc active custom steer';
     const sessionText = fs.readFileSync(sessionFile, 'utf8');
+    const steerBaseIndex = assistantTexts.indexOf('rpc active extension steer base complete');
     const followBaseIndex = assistantTexts.indexOf('rpc active extension follow base complete');
     const followObservedIndex = assistantTexts.indexOf('rpc active extension follow observed');
     if (
@@ -6188,6 +6184,7 @@ try {
       messages.some((message) => typeof message.content === 'string' && message.content.includes(`/send-custom-${isFollow ? 'follow' : 'steer'}-active`)) ||
       !sessionText.includes('"type":"custom_message"') ||
       !sessionText.includes(`"customType":"${customType}"`) ||
+      (!isFollow && steerBaseIndex !== -1) ||
       (isFollow && (followBaseIndex === -1 || followObservedIndex === -1 || followBaseIndex > followObservedIndex))
     ) {
       throw new Error(`active extension ${kind} queue smoke failed\nstdout:\n${stdout}\nstderr:\n${stderr}`);
