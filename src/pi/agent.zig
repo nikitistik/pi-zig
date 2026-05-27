@@ -222,6 +222,12 @@ const ls_parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"number","description":"Maximum number of entries to return (default: 500)"}},"additionalProperties":false}
 ;
 const non_vision_image_note = "[Current model does not support images. The image will be omitted from this request.]";
+const image_resize_omitted_note = "[Image omitted: could not be resized below the inline image size limit.]";
+// 4.5MB of base64 payload, matching upstream image-resize-core DEFAULT_MAX_BYTES. Provides
+// headroom below Anthropic's 5MB inline-image limit. pi-zig has no embedded WASM image decoder
+// (upstream's Photon), so it can enforce this encoded-size gate but cannot pixel-downscale an
+// over-limit image; such images are omitted exactly like upstream's no-Photon resize path.
+const image_resize_max_base64_bytes: usize = (9 * 1024 * 1024) / 2;
 
 const all_tool_definitions = [_]ai_client.ChatToolDefinition{
     .{
@@ -900,6 +906,20 @@ fn executeReadImageTool(io: std.Io, allocator: std.mem.Allocator, path: []const 
     defer allocator.free(bytes);
 
     const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+
+    // Upstream resizes images to fit within 2000x2000 and 4.5MB of base64 before sending them to
+    // the model. pi-zig has no embedded image decoder, so it can only honor the encoded-size gate:
+    // images already under the limit pass through unchanged (upstream's "already within limits"
+    // path), and oversized images are omitted with the same note upstream emits when Photon cannot
+    // produce an under-limit encoding.
+    if (encoded_len >= image_resize_max_base64_bytes) {
+        const content = if (model_supports_images)
+            try std.fmt.allocPrint(allocator, "Read image file [{s}]\n{s}", .{ mime_type, image_resize_omitted_note })
+        else
+            try std.fmt.allocPrint(allocator, "Read image file [{s}]\n{s}\n{s}", .{ mime_type, image_resize_omitted_note, non_vision_image_note });
+        return toolOk(content);
+    }
+
     const encoded = try allocator.alloc(u8, encoded_len);
     errdefer allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, bytes);
@@ -1249,6 +1269,70 @@ test "read image keeps image parts for vision model" {
         },
         .text => return error.ExpectedImageContentPart,
     }
+}
+
+test "read image omits oversized image with upstream resize note" {
+    const path = "zig-out/pi-zig-read-oversized-image-test.png";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const oversized = try std.testing.allocator.alloc(u8, image_resize_max_base64_bytes);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'A');
+    try tools.writeFile(std.testing.io, path, oversized);
+
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_read_oversized_image"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path}),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "amazon-bedrock",
+        .model = "amazon.nova-pro-v1:0",
+        .api_key = "",
+        .prompt = "",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings(
+        "Read image file [image/png]\n" ++ image_resize_omitted_note,
+        result.content,
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.content_parts.len);
+}
+
+test "read oversized image for non-vision model appends both resize and non-vision notes" {
+    const path = "zig-out/pi-zig-read-oversized-nonvision-test.png";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const oversized = try std.testing.allocator.alloc(u8, image_resize_max_base64_bytes);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'A');
+    try tools.writeFile(std.testing.io, path, oversized);
+
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_read_oversized_nonvision_image"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path}),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "amazon-bedrock",
+        .model = "amazon.nova-micro-v1:0",
+        .api_key = "",
+        .prompt = "",
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings(
+        "Read image file [image/png]\n" ++ image_resize_omitted_note ++ "\n" ++ non_vision_image_note,
+        result.content,
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.content_parts.len);
 }
 
 test "invalid tool argument JSON returns a tool error result" {

@@ -95,6 +95,7 @@ pub const ChatCompletionError = error{
     ProviderClientError,
     ProviderRequestFailed,
     ProviderResponseInvalid,
+    ProviderStreamIncomplete,
     EmptyPrompt,
     AgentAborted,
 } || std.mem.Allocator.Error || std.http.Client.FetchError;
@@ -471,7 +472,7 @@ fn readDoneTerminatedSseStream(
     while (true) {
         try checkCancellation(cancellation);
         const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
-            error.ReadFailed => return error.ProviderResponseInvalid,
+            error.ReadFailed => return error.ProviderStreamIncomplete,
             else => return err,
         };
         const line_with_cr = raw_line orelse break;
@@ -487,7 +488,7 @@ fn readDoneTerminatedSseStream(
         try callback(callback_context, data);
         try checkCancellation(cancellation);
     }
-    if (!saw_done) return error.ProviderResponseInvalid;
+    if (!saw_done) return error.ProviderStreamIncomplete;
 }
 
 const StreamTextContext = struct {
@@ -989,6 +990,7 @@ fn runBedrockConverseTurn(
         error.ProviderClientError => return error.ProviderClientError,
         error.ProviderRequestFailed => return error.ProviderRequestFailed,
         error.ProviderResponseInvalid => return error.ProviderResponseInvalid,
+        error.ProviderStreamIncomplete => return error.ProviderStreamIncomplete,
         else => return error.ProviderRequestFailed,
     };
     return accumulator.toResult() catch |err| switch (err) {
@@ -2150,7 +2152,7 @@ fn readAnthropicSseStream(
     while (true) {
         try checkCancellation(cancellation);
         const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
-            error.ReadFailed => return error.ProviderResponseInvalid,
+            error.ReadFailed => return error.ProviderStreamIncomplete,
             else => return err,
         };
         const line_with_cr = raw_line orelse break;
@@ -2186,7 +2188,7 @@ fn readAnthropicSseStream(
         try checkCancellation(cancellation);
         if (try isAnthropicMessageStopData(allocator, data)) saw_stop = true;
     }
-    if (!saw_stop) return error.ProviderResponseInvalid;
+    if (!saw_stop) return error.ProviderStreamIncomplete;
 }
 
 fn readGoogleSseStream(
@@ -2199,7 +2201,7 @@ fn readGoogleSseStream(
     while (true) {
         try checkCancellation(cancellation);
         const raw_line = reader.takeDelimiter('\n') catch |err| switch (err) {
-            error.ReadFailed => return error.ProviderResponseInvalid,
+            error.ReadFailed => return error.ProviderStreamIncomplete,
             else => return err,
         };
         const line_with_cr = raw_line orelse break;
@@ -2213,7 +2215,7 @@ fn readGoogleSseStream(
         try checkCancellation(cancellation);
         saw_data = true;
     }
-    if (!saw_data) return error.ProviderResponseInvalid;
+    if (!saw_data) return error.ProviderStreamIncomplete;
 }
 
 fn readBedrockEventStream(
@@ -2228,7 +2230,7 @@ fn readBedrockEventStream(
         try checkCancellation(cancellation);
         const prelude = reader.takeArray(12) catch |err| switch (err) {
             error.EndOfStream => break,
-            error.ReadFailed => return error.ProviderResponseInvalid,
+            error.ReadFailed => return error.ProviderStreamIncomplete,
         };
         const total_len = std.mem.readInt(u32, prelude[0..4], .big);
         const headers_len = std.mem.readInt(u32, prelude[4..8], .big);
@@ -2261,7 +2263,7 @@ fn readBedrockEventStream(
         try checkCancellation(cancellation);
         saw_event = true;
     }
-    if (!saw_event) return error.ProviderResponseInvalid;
+    if (!saw_event) return error.ProviderStreamIncomplete;
 }
 
 fn bedrockEventStreamHeader(headers: []const u8, wanted: []const u8) !?[]const u8 {

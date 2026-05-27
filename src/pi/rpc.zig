@@ -3313,7 +3313,12 @@ fn getBoolFieldObject(object: std.json.ObjectMap, name: []const u8) ?bool {
 
 fn isRetryableAgentError(err: anyerror) bool {
     return switch (err) {
-        error.ProviderRequestFailed => true,
+        // A request that the provider explicitly rejected as transient (429/5xx/overloaded/
+        // retryable body text), and a stream that ended before its terminal event (network
+        // connection lost, socket hang up, "stream ended before message_stop") both map to
+        // upstream agent-session retryable errors. Structurally malformed responses stay
+        // non-retryable as ProviderResponseInvalid.
+        error.ProviderRequestFailed, error.ProviderStreamIncomplete => true,
         else => false,
     };
 }
@@ -3861,6 +3866,14 @@ test "json string escaping covers control characters" {
     var writer = std.Io.Writer.fixed(&buf);
     try writeJsonString(&writer, "a\"b\nc");
     try std.testing.expectEqualStrings("\"a\\\"b\\nc\"", writer.buffered());
+}
+
+test "retryable agent errors cover transient failures and incomplete streams" {
+    try std.testing.expect(isRetryableAgentError(error.ProviderRequestFailed));
+    try std.testing.expect(isRetryableAgentError(error.ProviderStreamIncomplete));
+    try std.testing.expect(!isRetryableAgentError(error.ProviderResponseInvalid));
+    try std.testing.expect(!isRetryableAgentError(error.ProviderClientError));
+    try std.testing.expect(!isRetryableAgentError(error.AgentAborted));
 }
 
 test "runtime stores prompt messages and resets sessions" {

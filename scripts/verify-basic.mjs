@@ -1792,6 +1792,51 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content: 'read image result complete' } }] }));
       return;
     }
+    if (userMessages.some((message) => message.includes('read oversized image result'))) {
+      if (!hasTool('read')) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'missing read tool definition for oversized image smoke', tools: body.tools }));
+        return;
+      }
+      if (toolMessages.length === 0) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call_read_oversized_image_1',
+                type: 'function',
+                function: {
+                  name: 'read',
+                  arguments: JSON.stringify({ path: 'zig-out/pi-zig-agent-oversized-image-fixture/input.png' })
+                }
+              }]
+            }
+          }]
+        }));
+        return;
+      }
+      const readToolMessage = toolMessages.find((message) => message.tool_call_id === 'call_read_oversized_image_1');
+      const syntheticImageMessage = body.messages.find((message) =>
+        message.role === 'user' &&
+        Array.isArray(message.content) &&
+        message.content.some((part) => part?.type === 'text' && part.text === 'Attached image(s) from tool result:')
+      );
+      // The oversized image must be omitted (no inline image bytes, no synthetic replay turn) and
+      // the tool result must carry the upstream resize-omit note.
+      if (
+        !readToolMessage?.content?.includes('[Image omitted: could not be resized below the inline image size limit.]') ||
+        syntheticImageMessage
+      ) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'oversized read image was not omitted with the resize note', messages: body.messages }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'read oversized image result complete' } }] }));
+      return;
+    }
     if (user.includes('tool loop')) {
       if (!hasBashTool) {
         res.writeHead(400, { 'content-type': 'application/json' });
@@ -2186,6 +2231,25 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
       return;
     }
+    if (user.includes('rpc retry connection lost')) {
+      // Reproduces upstream issue #3317: a transient "Network connection lost." failure that is
+      // retried and recovers. pi-zig classifies the connection-lost body text as retryable.
+      const count = (requestCounts.get(user) ?? 0) + 1;
+      requestCounts.set(user, count);
+      if (count === 1) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Network connection lost.' } }));
+        return;
+      }
+      const content = 'rpc retry connection lost recovered';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
     if (user.includes('rpc retry abort delay')) {
       const count = (requestCounts.get(user) ?? 0) + 1;
       requestCounts.set(user, count);
@@ -2195,6 +2259,23 @@ const server = http.createServer((req, res) => {
         return;
       }
       const content = 'rpc retry abort delay unexpectedly recovered';
+      if (body.stream === true) {
+        writeStreamEvents([{ choices: [{ delta: { content } }] }]);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      return;
+    }
+    if (user.includes('flow06 abort during retry')) {
+      const count = (requestCounts.get(user) ?? 0) + 1;
+      requestCounts.set(user, count);
+      if (count === 1) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'temporary provider failure before flow06 abortable retry delay' }));
+        return;
+      }
+      const content = 'flow06 abort during retry unexpectedly recovered';
       if (body.stream === true) {
         writeStreamEvents([{ choices: [{ delta: { content } }] }]);
         return;
@@ -8096,6 +8177,173 @@ export default function(pi) {
     rpcProviderCompactionHistoryMessages?.data?.messages?.some((message) => message.content === 'raw compacted provider message')
   ) {
     throw new Error('rpc provider prompt smoke did not replay compacted context as summary plus kept messages');
+  }
+
+  // ===== FLOW 06: runtime =====
+  // Upstream issue #3317: a transient "Network connection lost." stream failure is retried and
+  // recovers. pi-zig classifies the connection-lost body text as retryable and replays the prompt.
+  const rpcConnectionLostSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-connection-lost-smoke.jsonl');
+  fs.rmSync(rpcConnectionLostSessionFile, { force: true });
+  const rpcConnectionLostOutput = run(
+    ['rpc', rpcConnectionLostSessionFile],
+    [
+      JSON.stringify({ id: 'flow06-connlost-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' }),
+      JSON.stringify({ id: 'flow06-connlost-enable', type: 'set_auto_retry', enabled: true, maxRetries: 3, baseDelayMs: 0, maxDelayMs: 5 }),
+      JSON.stringify({ id: 'flow06-connlost-prompt', type: 'prompt', message: 'rpc retry connection lost' }),
+      JSON.stringify({ id: 'flow06-connlost-state', type: 'get_state' }),
+      JSON.stringify({ id: 'flow06-connlost-messages', type: 'get_messages' }),
+      ''
+    ].join('\n'),
+    { env: rpcProviderEnv }
+  );
+  const rpcConnectionLostResponses = rpcConnectionLostOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const rpcConnectionLostPrompt = rpcConnectionLostResponses.find((response) => response.id === 'flow06-connlost-prompt');
+  const rpcConnectionLostState = rpcConnectionLostResponses.find((response) => response.id === 'flow06-connlost-state');
+  const rpcConnectionLostMessages = rpcConnectionLostResponses.find((response) => response.id === 'flow06-connlost-messages');
+  const rpcConnectionLostEventSummary = rpcConnectionLostResponses
+    .filter((response) => ['agent_end', 'auto_retry_start', 'auto_retry_end'].includes(response.type))
+    .map((response) => {
+      if (response.type === 'agent_end') return `agent_end:${response.willRetry}`;
+      if (response.type === 'auto_retry_start') return `auto_retry_start:${response.attempt}:${response.maxAttempts}:${response.delayMs}:${response.errorMessage}`;
+      return `auto_retry_end:${response.success}:${response.attempt}`;
+    });
+  if (
+    !rpcConnectionLostPrompt?.success ||
+    rpcConnectionLostPrompt?.data?.text !== 'rpc retry connection lost recovered' ||
+    rpcConnectionLostPrompt?.data?.retry?.attempts !== 1 ||
+    rpcConnectionLostPrompt?.data?.retry?.maxAttempts !== 3 ||
+    rpcConnectionLostState?.data?.lastRetryAttempts !== 1 ||
+    rpcConnectionLostMessages?.data?.messages?.filter((message) => message.role === 'assistant').length !== 1 ||
+    rpcConnectionLostMessages?.data?.messages?.some((message) => message.role === 'assistant' && message.stopReason === 'error') ||
+    JSON.stringify(rpcConnectionLostEventSummary) !== JSON.stringify([
+      'agent_end:true',
+      'auto_retry_start:1:3:0:ProviderRequestFailed',
+      'auto_retry_end:true:1',
+      'agent_end:false'
+    ])
+  ) {
+    throw new Error('flow06 rpc connection-lost retry smoke did not recover from a transient network failure');
+  }
+
+  // A full `abort` (not `abort_retry`) issued while a prompt is mid retry-sleep cancels the entire
+  // active prompt: the retry sleep ends as cancelled, no second attempt fires, and the prompt
+  // resolves as RetryCancelled without persisting an assistant error turn.
+  await (async function runFlow06AbortDuringRetrySmoke() {
+    const sessionFile = path.resolve('zig-out/pi-zig-rpc-provider-flow06-abort-during-retry-smoke.jsonl');
+    fs.rmSync(sessionFile, { force: true });
+    const child = spawn(bin, ['rpc', sessionFile], { env: rpcProviderEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let pending = '';
+    const lines = [];
+    const waiters = [];
+    function resolveWaiters(line) {
+      for (let index = 0; index < waiters.length;) {
+        const waiter = waiters[index];
+        if (waiter.predicate(line)) {
+          waiters.splice(index, 1);
+          clearTimeout(waiter.timeout);
+          waiter.resolve(line);
+        } else {
+          index += 1;
+        }
+      }
+    }
+    function waitForLine(predicate, timeoutMs = 2500) {
+      const existing = lines.find(predicate);
+      if (existing) return Promise.resolve(existing);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          const index = waiters.findIndex((waiter) => waiter.reject === reject);
+          if (index !== -1) waiters.splice(index, 1);
+          reject(new Error(`flow06 abort-during-retry timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+        }, timeoutMs);
+        waiters.push({ predicate, resolve, reject, timeout });
+      });
+    }
+    function writeCommand(command) {
+      child.stdin.write(`${JSON.stringify(command)}\n`);
+    }
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      pending += chunk;
+      while (pending.includes('\n')) {
+        const newline = pending.indexOf('\n');
+        const rawLine = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (rawLine.trim().length === 0) continue;
+        const line = JSON.parse(rawLine);
+        lines.push(line);
+        resolveWaiters(line);
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const exitPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`flow06 abort-during-retry exit timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      }, 7000);
+      child.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once('exit', (code, signal) => {
+        clearTimeout(timeout);
+        if (code !== 0) {
+          reject(new Error(`flow06 abort-during-retry exited with ${code ?? signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+          return;
+        }
+        resolve();
+      });
+    });
+
+    writeCommand({ id: 'flow06-abort-retry-model', type: 'set_model', provider: 'openai', modelId: 'gpt-4o' });
+    await waitForLine((line) => line.id === 'flow06-abort-retry-model' && line.success === true);
+    writeCommand({ id: 'flow06-abort-retry-enable', type: 'set_auto_retry', enabled: true, maxRetries: 2, baseDelayMs: 1000, maxDelayMs: 1000 });
+    await waitForLine((line) => line.id === 'flow06-abort-retry-enable' && line.success === true);
+    writeCommand({ id: 'flow06-abort-retry-prompt', type: 'prompt', message: 'flow06 abort during retry' });
+    await waitForLine((line) => line.type === 'auto_retry_start' && line.attempt === 1);
+    writeCommand({ id: 'flow06-abort-retry-abort', type: 'abort' });
+    const abortResponse = await waitForLine((line) => line.id === 'flow06-abort-retry-abort');
+    const retryEnd = await waitForLine((line) => line.type === 'auto_retry_end' && line.success === false);
+    const promptResponse = await waitForLine((line) => line.id === 'flow06-abort-retry-prompt');
+    writeCommand({ id: 'flow06-abort-retry-messages', type: 'get_messages' });
+    const messagesResponse = await waitForLine((line) => line.id === 'flow06-abort-retry-messages');
+    child.stdin.end();
+    await exitPromise;
+
+    if (
+      !abortResponse?.success ||
+      retryEnd?.finalError !== 'Retry cancelled' ||
+      promptResponse?.success !== false ||
+      promptResponse?.error !== 'RetryCancelled' ||
+      lines.some((line) => line.type === 'auto_retry_start' && line.attempt === 2) ||
+      lines.some((line) => line.type === 'auto_retry_end' && line.success === true) ||
+      messagesResponse?.data?.messages?.some((message) => message.role === 'assistant') ||
+      stdout.includes('flow06 abort during retry unexpectedly recovered')
+    ) {
+      throw new Error(`flow06 abort-during-retry smoke did not cancel the active retrying prompt\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+    }
+  })();
+
+  // The read tool resizes images to fit the inline size limit before sending them to the model.
+  // pi-zig has no embedded image decoder, so an oversized image is omitted with the upstream
+  // resize-omit note and no inline image bytes are forwarded to the provider.
+  const flow06OversizedImageFixture = path.resolve('zig-out/pi-zig-agent-oversized-image-fixture');
+  fs.rmSync(flow06OversizedImageFixture, { recursive: true, force: true });
+  fs.mkdirSync(flow06OversizedImageFixture, { recursive: true });
+  fs.writeFileSync(path.join(flow06OversizedImageFixture, 'input.png'), Buffer.alloc(6 * 1024 * 1024, 0x41));
+  const flow06OversizedImageOutput = run(
+    ['--no-session', '--provider', 'openai', '--model', 'mock-read-image-tool-model', '-p', 'please run read oversized image result'],
+    undefined,
+    { env: rpcProviderEnv }
+  );
+  if (!flow06OversizedImageOutput.includes('read oversized image result complete')) {
+    throw new Error('flow06 oversized read image smoke did not omit the image with the resize note');
   }
 } finally {
   rpcFakeProvider.stop();
