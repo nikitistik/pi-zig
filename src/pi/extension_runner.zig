@@ -210,6 +210,224 @@ pub const Runner = struct {
         self.allocator.free(definitions);
     }
 
+    /// `unspecified` mirrors upstream extensions that call registerFlag without a `type`.
+    /// Upstream treats such flags like string flags for value handling (see
+    /// applyExtensionFlagValues in agent-session-services.ts) and like boolean flags for
+    /// the help `<value>` hint (printHelp checks `flag.type === "string"`).
+    pub const FlagType = enum { boolean, string, unspecified };
+
+    pub const FlagDefinition = struct {
+        name: []const u8,
+        flag_type: FlagType = .unspecified,
+        description: ?[]const u8 = null,
+        /// Default value serialized as JSON (e.g. "true", "false", "\"text\"") or null when none.
+        default_json: ?[]const u8 = null,
+        extension_path: []const u8,
+    };
+
+    /// Discover CLI flags registered by extensions. First registration per name wins,
+    /// matching ExtensionRunner.getFlags() (upstream runner.ts).
+    pub fn discoverFlagDefinitions(self: *Runner) ![]FlagDefinition {
+        if (!self.hasExtensions()) return &.{};
+
+        const payload = try self.buildDiscoverFlagsPayload();
+        defer self.allocator.free(payload);
+        const output = try self.runNodeHook(payload);
+        defer if (output) |bytes| self.allocator.free(bytes);
+        const bytes = output orelse return &.{};
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch return error.ExtensionHookInvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ExtensionHookInvalidResponse;
+        const flags = parsed.value.object.get("flags") orelse return &.{};
+        if (flags != .array) return error.ExtensionHookInvalidResponse;
+
+        var definitions: std.ArrayList(FlagDefinition) = .empty;
+        errdefer deinitFlagDefinitionList(self.allocator, &definitions);
+
+        for (flags.array.items) |item| {
+            if (item != .object) return error.ExtensionHookInvalidResponse;
+            const name = item.object.get("name") orelse return error.ExtensionHookInvalidResponse;
+            if (name != .string or name.string.len == 0) return error.ExtensionHookInvalidResponse;
+            var flag_type: FlagType = .unspecified;
+            if (item.object.get("type")) |type_value| {
+                if (type_value != .null) {
+                    if (type_value != .string) return error.ExtensionHookInvalidResponse;
+                    if (std.mem.eql(u8, type_value.string, "boolean")) {
+                        flag_type = .boolean;
+                    } else if (std.mem.eql(u8, type_value.string, "string")) {
+                        flag_type = .string;
+                    } else {
+                        return error.ExtensionHookInvalidResponse;
+                    }
+                }
+            }
+            const extension_path = item.object.get("extensionPath") orelse return error.ExtensionHookInvalidResponse;
+            if (extension_path != .string) return error.ExtensionHookInvalidResponse;
+
+            var description: ?[]const u8 = null;
+            errdefer if (description) |value| self.allocator.free(value);
+            if (item.object.get("description")) |value| {
+                if (value != .null) {
+                    if (value != .string) return error.ExtensionHookInvalidResponse;
+                    description = try self.allocator.dupe(u8, value.string);
+                }
+            }
+
+            var default_json: ?[]const u8 = null;
+            errdefer if (default_json) |value| self.allocator.free(value);
+            if (item.object.get("default")) |value| {
+                if (value != .null) default_json = try jsonValueToOwnedString(self.allocator, value);
+            }
+
+            const owned_name = try self.allocator.dupe(u8, name.string);
+            errdefer self.allocator.free(owned_name);
+            const owned_path = try self.allocator.dupe(u8, extension_path.string);
+            errdefer self.allocator.free(owned_path);
+            try definitions.append(self.allocator, .{
+                .name = owned_name,
+                .flag_type = flag_type,
+                .description = description,
+                .default_json = default_json,
+                .extension_path = owned_path,
+            });
+            description = null;
+            default_json = null;
+        }
+        if (definitions.items.len == 0) return &.{};
+        return definitions.toOwnedSlice(self.allocator);
+    }
+
+    pub fn deinitFlagDefinitions(self: *Runner, definitions: []FlagDefinition) void {
+        for (definitions) |definition| {
+            self.allocator.free(definition.name);
+            if (definition.description) |value| self.allocator.free(value);
+            if (definition.default_json) |value| self.allocator.free(value);
+            self.allocator.free(definition.extension_path);
+        }
+        self.allocator.free(definitions);
+    }
+
+    pub const FlagValidationError = struct {
+        name: []const u8,
+        message: []const u8,
+
+        pub fn deinit(self: FlagValidationError, allocator: std.mem.Allocator) void {
+            allocator.free(self.name);
+            allocator.free(self.message);
+        }
+    };
+
+    /// Validate CLI-provided flag values against registered extension flag definitions.
+    ///
+    /// Mirrors upstream applyExtensionFlagValues (agent-session-services.ts):
+    /// - A boolean flag accepts any presence and coerces to `true`; it never errors.
+    /// - A string flag requires a value; a bare flag (no value) errors with
+    ///   `Extension flag "--name" requires a value`.
+    ///
+    /// DIVERGENCE: upstream also routes flags registered without an explicit `type`
+    /// through the string branch (so a bare untyped flag errors). pi-zig keeps untyped
+    /// flags as passthrough — they are not value-validated — because pi-zig captures and
+    /// forwards untyped flags to getFlag() rather than rejecting them, and example
+    /// extensions register flags without a type. Flags unknown to every extension are
+    /// likewise ignored (upstream reports `Unknown option`; pi-zig passes them through).
+    /// Returns owned errors; empty slice when all provided flags pass.
+    pub fn validateFlags(
+        self: *Runner,
+        definitions: []const FlagDefinition,
+        provided: []const FlagValue,
+    ) ![]FlagValidationError {
+        var errors: std.ArrayList(FlagValidationError) = .empty;
+        errdefer {
+            for (errors.items) |err| err.deinit(self.allocator);
+            errors.deinit(self.allocator);
+        }
+        for (provided) |flag| {
+            const definition = findFlagDefinition(definitions, flag.name) orelse continue;
+            switch (definition.flag_type) {
+                .boolean, .unspecified => {},
+                .string => {
+                    if (flag.value == null) {
+                        try appendFlagError(self.allocator, &errors, flag.name, "Extension flag \"--{s}\" requires a value");
+                    }
+                },
+            }
+        }
+        if (errors.items.len == 0) return &.{};
+        return errors.toOwnedSlice(self.allocator);
+    }
+
+    pub fn deinitFlagValidationErrors(self: *Runner, errors: []FlagValidationError) void {
+        for (errors) |err| err.deinit(self.allocator);
+        if (errors.len > 0) self.allocator.free(errors);
+    }
+
+    pub const LifecycleEvent = struct {
+        type: []const u8,
+        /// Optional extra fields merged into the emitted event object, serialized as a JSON object.
+        fields_json: ?[]const u8 = null,
+    };
+
+    pub const LifecycleResult = struct {
+        /// Per-event observable markers returned by the extension handler (JSON-encoded), in order.
+        observations: [][]u8 = &.{},
+        /// Actions accumulated across the whole sequence (sendUserMessage/sendMessage/appendEntry).
+        actions: []CommandAction = &.{},
+
+        pub fn deinit(self: LifecycleResult, allocator: std.mem.Allocator) void {
+            for (self.observations) |observation| allocator.free(observation);
+            if (self.observations.len > 0) allocator.free(self.observations);
+            for (self.actions) |action| action.deinit(allocator);
+            if (self.actions.len > 0) allocator.free(self.actions);
+        }
+    };
+
+    /// Drive a sequence of lifecycle events through a single long-lived runner process.
+    ///
+    /// Extensions are loaded once and the same module instances handle every event in the
+    /// sequence, so module-level state persists across events exactly as it does in the
+    /// upstream long-lived ExtensionRunner. Each handler may return a value which is
+    /// captured per-event as an observation, and queued actions accumulate across events.
+    pub fn runLifecycleSequence(self: *Runner, events: []const LifecycleEvent) !LifecycleResult {
+        if (!self.hasExtensions()) return .{};
+
+        const payload = try self.buildLifecycleSequencePayload(events);
+        defer self.allocator.free(payload);
+        const output = try self.runNodeHook(payload);
+        defer if (output) |bytes| self.allocator.free(bytes);
+        const bytes = output orelse return .{};
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch return error.ExtensionHookInvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ExtensionHookInvalidResponse;
+
+        var observations: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (observations.items) |observation| self.allocator.free(observation);
+            observations.deinit(self.allocator);
+        }
+        if (parsed.value.object.get("observations")) |observations_value| {
+            if (observations_value != .array) return error.ExtensionHookInvalidResponse;
+            for (observations_value.array.items) |observation| {
+                try observations.append(self.allocator, try jsonValueToOwnedString(self.allocator, observation));
+            }
+        }
+
+        var actions: []CommandAction = &.{};
+        errdefer {
+            for (actions) |action| action.deinit(self.allocator);
+            if (actions.len > 0) self.allocator.free(actions);
+        }
+        if (parsed.value.object.get("actions")) |action_value| {
+            actions = try commandActionsToOwned(self.allocator, action_value);
+        }
+
+        return .{
+            .observations = try observations.toOwnedSlice(self.allocator),
+            .actions = actions,
+        };
+    }
+
     pub fn runRegisteredCommand(self: *Runner, command_name: []const u8, args: []const u8) !CommandExecutionResult {
         if (!self.hasExtensions()) return .{};
 
@@ -380,6 +598,35 @@ pub const Runner = struct {
         const w = &out.writer;
         try self.writePayloadHead(w);
         try w.writeAll(",\"event\":{\"type\":\"discover_commands\"}}");
+        return out.toOwnedSlice();
+    }
+
+    fn buildDiscoverFlagsPayload(self: *Runner) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try self.writePayloadHead(w);
+        try w.writeAll(",\"event\":{\"type\":\"discover_flags\"}}");
+        return out.toOwnedSlice();
+    }
+
+    fn buildLifecycleSequencePayload(self: *Runner, events: []const LifecycleEvent) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try self.writePayloadHead(w);
+        try w.writeAll(",\"event\":{\"type\":\"lifecycle_sequence\",\"events\":[");
+        for (events, 0..) |event, index| {
+            if (index != 0) try w.writeByte(',');
+            try w.writeAll("{\"type\":");
+            try writeJsonString(w, event.type);
+            if (event.fields_json) |fields| {
+                try w.writeAll(",\"fields\":");
+                try writeJsonObjectOrEmpty(self.allocator, w, fields);
+            }
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}}");
         return out.toOwnedSlice();
     }
 
@@ -727,6 +974,36 @@ fn parseCommandDelivery(value: std.json.Value, allow_next_turn: bool) !Runner.Co
     return error.ExtensionHookInvalidResponse;
 }
 
+fn findFlagDefinition(definitions: []const Runner.FlagDefinition, name: []const u8) ?Runner.FlagDefinition {
+    for (definitions) |definition| {
+        if (std.mem.eql(u8, definition.name, name)) return definition;
+    }
+    return null;
+}
+
+fn appendFlagError(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(Runner.FlagValidationError),
+    name: []const u8,
+    comptime template: []const u8,
+) !void {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const message = try std.fmt.allocPrint(allocator, template, .{name});
+    errdefer allocator.free(message);
+    try errors.append(allocator, .{ .name = owned_name, .message = message });
+}
+
+fn deinitFlagDefinitionList(allocator: std.mem.Allocator, definitions: *std.ArrayList(Runner.FlagDefinition)) void {
+    for (definitions.items) |definition| {
+        allocator.free(definition.name);
+        if (definition.description) |value| allocator.free(value);
+        if (definition.default_json) |value| allocator.free(value);
+        allocator.free(definition.extension_path);
+    }
+    definitions.deinit(allocator);
+}
+
 fn freeContentParts(allocator: std.mem.Allocator, parts: []ai_client.ChatContentPart) void {
     if (parts.len == 0) return;
     for (parts) |part| {
@@ -892,8 +1169,8 @@ const hook_runner_script =
     \\    const active = activeFlagMap && activeFlagMap.get(name);
     \\    if (active && Object.prototype.hasOwnProperty.call(active, "default")) return active.default;
     \\    if (active && Object.prototype.hasOwnProperty.call(active, "defaultValue")) return active.defaultValue;
-    \\    for (const flagMap of extensionFlagMaps) {
-    \\      const flag = flagMap.get(name);
+    \\    for (const entry of extensionFlagMaps) {
+    \\      const flag = entry.flags.get(name);
     \\      if (!flag) continue;
     \\      if (Object.prototype.hasOwnProperty.call(flag, "default")) return flag.default;
     \\      if (Object.prototype.hasOwnProperty.call(flag, "defaultValue")) return flag.defaultValue;
@@ -955,7 +1232,22 @@ const hook_runner_script =
     \\  }
     \\  extensionToolMaps.push(toolMap);
     \\  extensionCommandMaps.push({ extensionPath: resolvedExtensionPath, commands: commandMap });
-    \\  extensionFlagMaps.push(flagMap);
+    \\  extensionFlagMaps.push({ extensionPath: extensionPath, flags: flagMap });
+    \\}
+    \\function allRegisteredFlags() {
+    \\  const flagsByName = new Map();
+    \\  for (const entry of extensionFlagMaps) {
+    \\    for (const flag of entry.flags.values()) {
+    \\      if (flagsByName.has(flag.name)) continue;
+    \\      const out = { name: String(flag.name), extensionPath: entry.extensionPath };
+    \\      if (flag.type === "boolean" || flag.type === "string") out.type = flag.type;
+    \\      if (flag.description !== undefined && flag.description !== null) out.description = String(flag.description);
+    \\      if (Object.prototype.hasOwnProperty.call(flag, "default") && flag.default !== undefined) out.default = flag.default;
+    \\      else if (Object.prototype.hasOwnProperty.call(flag, "defaultValue") && flag.defaultValue !== undefined) out.default = flag.defaultValue;
+    \\      flagsByName.set(flag.name, out);
+    \\    }
+    \\  }
+    \\  return Array.from(flagsByName.values());
     \\}
     \\function allRegisteredTools() {
     \\  const toolsByName = new Map();
@@ -1034,6 +1326,29 @@ const hook_runner_script =
     \\      description: String(command.description ?? ""),
     \\      sourceInfo: sourceInfoForExtension(command.extensionPath),
     \\    })) }) + "\n");
+    \\    return;
+    \\  }
+    \\  if (event?.type === "discover_flags") {
+    \\    process.stdout.write(JSON.stringify({ flags: allRegisteredFlags() }) + "\n");
+    \\    return;
+    \\  }
+    \\  if (event?.type === "lifecycle_sequence") {
+    \\    const observations = [];
+    \\    for (const step of event.events || []) {
+    \\      const lifecycleEvent = { type: String(step?.type ?? ""), ...(step?.fields && typeof step.fields === "object" ? step.fields : {}) };
+    \\      const stepHandlers = handlers.get(lifecycleEvent.type) || [];
+    \\      let observation = null;
+    \\      for (const handler of stepHandlers) {
+    \\        try {
+    \\          const result = await handler(lifecycleEvent, ctx);
+    \\          if (result !== undefined && result !== null) observation = result;
+    \\        } catch (err) {
+    \\          diagnostics.push({ extensionPath: `lifecycle:${lifecycleEvent.type}`, event: lifecycleEvent.type, error: err && err.message ? err.message : String(err) });
+    \\        }
+    \\      }
+    \\      observations.push(observation);
+    \\    }
+    \\    process.stdout.write(JSON.stringify({ observations, actions, diagnostics }) + "\n");
     \\    return;
     \\  }
     \\  if (event?.type === "execute_command") {
@@ -1742,4 +2057,159 @@ test "extension runner exposes registered flag defaults and overrides" {
     defer allocator.free(override_result.content);
     try std.testing.expect(!override_result.is_error);
     try std.testing.expectEqualStrings("mode=override-mode;debug=true;missing=undefined", override_result.content);
+}
+
+test "extension runner discovers registered flag definitions with first-wins precedence" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-flag-discovery-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const first_path = fixture_dir ++ "/a-first.mjs";
+    const second_path = fixture_dir ++ "/b-second.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = first_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerFlag("mode", { description: "Pick a mode", type: "string", default: "fast" });
+        \\  pi.registerFlag("verbose", { description: "Verbose logging", type: "boolean", default: false });
+        \\}
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = second_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerFlag("mode", { description: "Second mode flag", type: "string" });
+        \\  pi.registerFlag("trace", { type: "boolean" });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{ first_path, second_path } };
+    const definitions = try runner.discoverFlagDefinitions();
+    defer runner.deinitFlagDefinitions(definitions);
+    try std.testing.expectEqual(@as(usize, 3), definitions.len);
+
+    const mode = findFlagDefinition(definitions, "mode").?;
+    try std.testing.expect(mode.flag_type == .string);
+    try std.testing.expectEqualStrings("Pick a mode", mode.description.?);
+    try std.testing.expectEqualStrings("\"fast\"", mode.default_json.?);
+    try std.testing.expectEqualStrings(first_path, mode.extension_path);
+
+    const verbose = findFlagDefinition(definitions, "verbose").?;
+    try std.testing.expect(verbose.flag_type == .boolean);
+    try std.testing.expectEqualStrings("false", verbose.default_json.?);
+
+    const trace = findFlagDefinition(definitions, "trace").?;
+    try std.testing.expect(trace.flag_type == .boolean);
+    try std.testing.expect(trace.description == null);
+    try std.testing.expect(trace.default_json == null);
+}
+
+test "extension runner validates flag values against registered types" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-flag-validation-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const extension_path = fixture_dir ++ "/flags.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\export default function(pi) {
+        \\  pi.registerFlag("mode", { type: "string" });
+        \\  pi.registerFlag("verbose", { type: "boolean" });
+        \\  pi.registerFlag("untyped", {});
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const definitions = try runner.discoverFlagDefinitions();
+    defer runner.deinitFlagDefinitions(definitions);
+    try std.testing.expect(findFlagDefinition(definitions, "untyped").?.flag_type == .unspecified);
+
+    // Valid (matches upstream applyExtensionFlagValues):
+    // - string flag with value
+    // - boolean flag bare (coerced to true, never errors)
+    // - boolean flag given a value (coerced to true, never errors)
+    // - untyped flag bare (pi-zig passthrough, not validated)
+    // - unknown flag ignored (pi-zig passthrough)
+    const valid = [_]Runner.FlagValue{
+        .{ .name = "mode", .value = "plan" },
+        .{ .name = "verbose", .value = null },
+        .{ .name = "verbose", .value = "loud" },
+        .{ .name = "untyped", .value = null },
+        .{ .name = "trace", .value = "anything" },
+    };
+    const valid_errors = try runner.validateFlags(definitions, &valid);
+    defer runner.deinitFlagValidationErrors(valid_errors);
+    try std.testing.expectEqual(@as(usize, 0), valid_errors.len);
+
+    // Invalid: an explicitly typed string flag given no value.
+    const invalid = [_]Runner.FlagValue{.{ .name = "mode", .value = null }};
+    const invalid_errors = try runner.validateFlags(definitions, &invalid);
+    defer runner.deinitFlagValidationErrors(invalid_errors);
+    try std.testing.expectEqual(@as(usize, 1), invalid_errors.len);
+    try std.testing.expectEqualStrings("mode", invalid_errors[0].name);
+    try std.testing.expectEqualStrings("Extension flag \"--mode\" requires a value", invalid_errors[0].message);
+}
+
+test "extension runner keeps long-lived state across a lifecycle sequence" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-lifecycle-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const extension_path = fixture_dir ++ "/lifecycle.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\let startCount = 0;
+        \\let turns = 0;
+        \\export default function(pi) {
+        \\  pi.on("session_start", (event) => {
+        \\    startCount++;
+        \\    pi.appendEntry("start-state", { count: startCount, reason: event.reason });
+        \\    return { startCount, reason: event.reason };
+        \\  });
+        \\  pi.on("turn_start", (event) => {
+        \\    turns++;
+        \\    return { turnIndex: event.turnIndex, turns, startCount };
+        \\  });
+        \\  pi.on("session_shutdown", (event) => {
+        \\    return { shuttingDown: true, totalStarts: startCount, totalTurns: turns, reason: event.reason };
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const events = [_]Runner.LifecycleEvent{
+        .{ .type = "session_start", .fields_json = "{\"reason\":\"startup\"}" },
+        .{ .type = "turn_start", .fields_json = "{\"turnIndex\":0,\"timestamp\":1}" },
+        .{ .type = "turn_start", .fields_json = "{\"turnIndex\":1,\"timestamp\":2}" },
+        .{ .type = "session_shutdown", .fields_json = "{\"reason\":\"quit\"}" },
+    };
+    const result = try runner.runLifecycleSequence(&events);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), result.observations.len);
+
+    var start_obs = try std.json.parseFromSlice(std.json.Value, allocator, result.observations[0], .{});
+    defer start_obs.deinit();
+    try std.testing.expectEqual(@as(i64, 1), start_obs.value.object.get("startCount").?.integer);
+
+    var turn0 = try std.json.parseFromSlice(std.json.Value, allocator, result.observations[1], .{});
+    defer turn0.deinit();
+    try std.testing.expectEqual(@as(i64, 1), turn0.value.object.get("turns").?.integer);
+
+    var turn1 = try std.json.parseFromSlice(std.json.Value, allocator, result.observations[2], .{});
+    defer turn1.deinit();
+    // Second turn observes accumulated state from the same long-lived module instance.
+    try std.testing.expectEqual(@as(i64, 2), turn1.value.object.get("turns").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), turn1.value.object.get("startCount").?.integer);
+
+    var shutdown_obs = try std.json.parseFromSlice(std.json.Value, allocator, result.observations[3], .{});
+    defer shutdown_obs.deinit();
+    try std.testing.expectEqual(@as(i64, 2), shutdown_obs.value.object.get("totalTurns").?.integer);
+    try std.testing.expect(shutdown_obs.value.object.get("shuttingDown").?.bool);
+
+    // The session_start handler queued a persistent appendEntry action.
+    try std.testing.expectEqual(@as(usize, 1), result.actions.len);
+    switch (result.actions[0]) {
+        .append_entry => |entry| {
+            try std.testing.expectEqualStrings("start-state", entry.custom_type);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry.data_json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+        },
+        else => return error.UnexpectedCommandAction,
+    }
 }
