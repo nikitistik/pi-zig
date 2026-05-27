@@ -151,42 +151,42 @@ pub fn parse(argv: []const []const u8) ParsedArgs {
             result.help = true;
         } else if (equals(arg, "--version") or equals(arg, "-v")) {
             result.version = true;
-        } else if (equals(arg, "--mode")) {
+        } else if (equals(arg, "--mode") and hasValue(argv, i)) {
+            // Upstream silently ignores an invalid --mode value (no diagnostic).
             if (takeValue(argv, &i)) |value| {
-                result.mode = Mode.parse(value);
-                if (result.mode == null) result.addDiagnostic(.warning, "invalid mode");
+                if (Mode.parse(value)) |mode| result.mode = mode;
             }
         } else if (equals(arg, "--continue") or equals(arg, "-c")) {
             result.continue_session = true;
         } else if (equals(arg, "--resume") or equals(arg, "-r")) {
             result.resume_session = true;
-        } else if (equals(arg, "--provider")) {
+        } else if (equals(arg, "--provider") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.provider = value;
-        } else if (equals(arg, "--model")) {
+        } else if (equals(arg, "--model") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.model = value;
-        } else if (equals(arg, "--api-key")) {
+        } else if (equals(arg, "--api-key") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.api_key = value;
-        } else if (equals(arg, "--system-prompt")) {
+        } else if (equals(arg, "--system-prompt") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.system_prompt = value;
-        } else if (equals(arg, "--append-system-prompt")) {
+        } else if (equals(arg, "--append-system-prompt") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.addAppendSystemPrompt(value);
         } else if (equals(arg, "--no-session")) {
             result.no_session = true;
-        } else if (equals(arg, "--session")) {
+        } else if (equals(arg, "--session") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.session = value;
-        } else if (equals(arg, "--fork")) {
+        } else if (equals(arg, "--fork") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.fork = value;
-        } else if (equals(arg, "--session-dir")) {
+        } else if (equals(arg, "--session-dir") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.session_dir = value;
-        } else if (equals(arg, "--models")) {
+        } else if (equals(arg, "--models") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.models = value;
         } else if (equals(arg, "--no-tools") or equals(arg, "-nt")) {
             result.no_tools = true;
         } else if (equals(arg, "--no-builtin-tools") or equals(arg, "-nbt")) {
             result.no_builtin_tools = true;
-        } else if (equals(arg, "--tools") or equals(arg, "-t")) {
+        } else if ((equals(arg, "--tools") or equals(arg, "-t")) and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.tools = value;
-        } else if (equals(arg, "--thinking")) {
+        } else if (equals(arg, "--thinking") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| {
                 result.thinking = types.ThinkingLevel.parse(value);
                 if (result.thinking == null) result.addDiagnostic(.warning, "invalid thinking level");
@@ -197,17 +197,17 @@ pub fn parse(argv: []const []const u8) ParsedArgs {
                 i += 1;
                 result.addMessage(argv[i]);
             }
-        } else if (equals(arg, "--export")) {
+        } else if (equals(arg, "--export") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.export_path = value;
-        } else if (equals(arg, "--extension") or equals(arg, "-e")) {
+        } else if ((equals(arg, "--extension") or equals(arg, "-e")) and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.addExtension(value);
         } else if (equals(arg, "--no-extensions") or equals(arg, "-ne")) {
             result.no_extensions = true;
-        } else if (equals(arg, "--skill")) {
+        } else if (equals(arg, "--skill") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.addSkill(value);
-        } else if (equals(arg, "--prompt-template")) {
+        } else if (equals(arg, "--prompt-template") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.addPromptTemplate(value);
-        } else if (equals(arg, "--theme")) {
+        } else if (equals(arg, "--theme") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| result.addTheme(value);
         } else if (equals(arg, "--no-skills") or equals(arg, "-ns")) {
             result.no_skills = true;
@@ -342,6 +342,13 @@ fn takeValue(argv: []const []const u8, index: *usize) ?[]const u8 {
     return argv[index.*];
 }
 
+/// Mirrors upstream's `i + 1 < args.length` guard on value-taking flags.
+/// When false, the flag falls through to the generic unknown-flag / unknown
+/// short-option handling (matching upstream/pi/.../cli/args.ts parseArgs).
+fn hasValue(argv: []const []const u8, index: usize) bool {
+    return index + 1 < argv.len;
+}
+
 fn isPrintInlinePrompt(value: []const u8) bool {
     if (std.mem.startsWith(u8, value, "@")) return false;
     if (!std.mem.startsWith(u8, value, "-")) return true;
@@ -472,4 +479,70 @@ test "invalid thinking level creates warning" {
     try std.testing.expect(parsed.thinking == null);
     try std.testing.expectEqual(@as(usize, 1), parsed.diagnostics_len);
     try std.testing.expectEqual(DiagnosticKind.warning, parsed.diagnostics[0].kind);
+}
+
+test "value flag without value falls through to unknown flag (upstream parity)" {
+    // Upstream args.ts guards value flags with `&& i + 1 < args.length`; when the
+    // value is missing the flag falls through to the generic `--` handler and is
+    // recorded as an unknown flag with value true (serialized as `true`).
+    const parsed = parse(&.{"--provider"});
+    try std.testing.expect(parsed.provider == null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics_len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.unknown_flags_len);
+    try std.testing.expectEqualStrings("provider", parsed.unknown_flags[0].name);
+    try std.testing.expect(parsed.unknown_flags[0].value == null);
+
+    // --export, --models, --mode behave the same way at end-of-argv.
+    const export_parsed = parse(&.{"--export"});
+    try std.testing.expect(export_parsed.export_path == null);
+    try std.testing.expectEqual(@as(usize, 1), export_parsed.unknown_flags_len);
+    try std.testing.expectEqualStrings("export", export_parsed.unknown_flags[0].name);
+
+    const mode_parsed = parse(&.{"--mode"});
+    try std.testing.expect(mode_parsed.mode == null);
+    try std.testing.expectEqual(@as(usize, 1), mode_parsed.unknown_flags_len);
+    try std.testing.expectEqualStrings("mode", mode_parsed.unknown_flags[0].name);
+}
+
+test "short value alias without value is an unknown short option error (upstream parity)" {
+    // `-t` / `-e` at end-of-argv fall through to the single-dash branch, which
+    // upstream reports as `Unknown option: -t` (an error diagnostic), not an
+    // unknown long flag.
+    const parsed_t = parse(&.{"-t"});
+    try std.testing.expect(parsed_t.tools == null);
+    try std.testing.expectEqual(@as(usize, 0), parsed_t.unknown_flags_len);
+    try std.testing.expectEqual(@as(usize, 1), parsed_t.diagnostics_len);
+    try std.testing.expectEqual(DiagnosticKind.@"error", parsed_t.diagnostics[0].kind);
+
+    const parsed_e = parse(&.{"-e"});
+    try std.testing.expectEqual(@as(usize, 1), parsed_e.diagnostics_len);
+    try std.testing.expectEqual(DiagnosticKind.@"error", parsed_e.diagnostics[0].kind);
+}
+
+test "invalid mode value is silently ignored (upstream parity)" {
+    // Upstream only assigns mode when the value is text|json|rpc; an invalid value
+    // is dropped with no diagnostic (unlike --thinking which warns).
+    const parsed = parse(&.{ "--mode", "bogus" });
+    try std.testing.expect(parsed.mode == null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics_len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.unknown_flags_len);
+}
+
+test "value flag consumes following dash-prefixed token as literal value (upstream parity)" {
+    // `--provider --model x`: since a token follows, --provider greedily consumes
+    // `--model` as its literal value, leaving `x` as a positional message.
+    const parsed = parse(&.{ "--provider", "--model", "x" });
+    try std.testing.expectEqualStrings("--model", parsed.provider.?);
+    try std.testing.expect(parsed.model == null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.messages_len);
+    try std.testing.expectEqualStrings("x", parsed.messages[0]);
+}
+
+test "tools and models still parse when value present" {
+    const parsed = parse(&.{ "--tools", "read,bash", "-e", "ext.ts", "--models", "a,b" });
+    try std.testing.expectEqualStrings("read,bash", parsed.tools.?);
+    try std.testing.expectEqualStrings("a,b", parsed.models.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.extensions_len);
+    try std.testing.expectEqualStrings("ext.ts", parsed.extensions[0]);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostics_len);
 }

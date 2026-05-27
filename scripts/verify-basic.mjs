@@ -8572,4 +8572,206 @@ if (!cloneJsonl.includes(`"parentSession":"${cloneSessionFile}"`) || !cloneJsonl
   throw new Error('rpc clone JSONL did not record parent session and copied prompt');
 }
 
+// ===== FLOW 02: CLI =====
+// CLI parser, aliases, help, stdin/print precedence, and entry-point dispatch
+// parity. Ground truth: upstream/pi/packages/coding-agent/src/cli/args.ts
+// (parseArgs / printHelp) and src/main.ts (resolveAppMode / readPipedStdin /
+// buildInitialMessage via cli/initial-message.ts).
+
+// Short and long flag aliases must resolve to the same parsed fields.
+const flowCliAliasLong = JSON.parse(run([
+  'parse-args',
+  '--continue', '--resume', '--no-tools', '--no-builtin-tools',
+  '--tools', 'read,bash', '--extension', 'ext.ts', '--no-extensions',
+  '--no-skills', '--no-prompt-templates', '--no-context-files'
+]));
+const flowCliAliasShort = JSON.parse(run([
+  'parse-args',
+  '-c', '-r', '-nt', '-nbt', '-t', 'read,bash', '-e', 'ext.ts', '-ne', '-ns', '-np', '-nc'
+]));
+for (const key of [
+  'continue', 'resume', 'noTools', 'noBuiltinTools', 'tools',
+  'noExtensions', 'noSkills', 'noPromptTemplates', 'noContextFiles'
+]) {
+  if (JSON.stringify(flowCliAliasLong[key]) !== JSON.stringify(flowCliAliasShort[key])) {
+    throw new Error(`FLOW 02: alias mismatch for ${key}: long=${JSON.stringify(flowCliAliasLong[key])} short=${JSON.stringify(flowCliAliasShort[key])}`);
+  }
+}
+if (
+  flowCliAliasShort.tools !== 'read,bash' ||
+  flowCliAliasShort.extensions[0] !== 'ext.ts' ||
+  flowCliAliasShort.continue !== true ||
+  flowCliAliasShort.resume !== true ||
+  flowCliAliasShort.noTools !== true ||
+  flowCliAliasShort.noBuiltinTools !== true ||
+  flowCliAliasShort.noExtensions !== true ||
+  flowCliAliasShort.noSkills !== true ||
+  flowCliAliasShort.noPromptTemplates !== true ||
+  flowCliAliasShort.noContextFiles !== true
+) {
+  throw new Error('FLOW 02: short-form aliases did not parse like their long-form counterparts');
+}
+
+// Value flag without a value falls through to the generic unknown-flag handler
+// (upstream guards each value flag with `&& i + 1 < args.length`). Value true
+// is serialized as `true`, never an error.
+const flowCliMissingValue = JSON.parse(run(['parse-args', '--provider']));
+if (
+  flowCliMissingValue.provider !== null ||
+  flowCliMissingValue.diagnostics.length !== 0 ||
+  flowCliMissingValue.unknownFlags.length !== 1 ||
+  flowCliMissingValue.unknownFlags[0].name !== 'provider' ||
+  flowCliMissingValue.unknownFlags[0].value !== true
+) {
+  throw new Error('FLOW 02: --provider without a value did not fall through to an unknown flag');
+}
+const flowCliMissingExport = JSON.parse(run(['parse-args', '--export']));
+if (
+  flowCliMissingExport.export !== null ||
+  flowCliMissingExport.unknownFlags[0]?.name !== 'export'
+) {
+  throw new Error('FLOW 02: --export without a value did not fall through to an unknown flag');
+}
+
+// A short value alias (-t / -e) at end-of-argv is reported as an unknown short
+// option error (upstream: `Unknown option: -t`), not an unknown long flag.
+const flowCliMissingShort = JSON.parse(run(['parse-args', '-t']));
+if (
+  flowCliMissingShort.tools !== null ||
+  flowCliMissingShort.unknownFlags.length !== 0 ||
+  flowCliMissingShort.diagnostics.length !== 1 ||
+  flowCliMissingShort.diagnostics[0].type !== 'error'
+) {
+  throw new Error('FLOW 02: -t without a value did not produce an unknown short option error');
+}
+
+// A value flag greedily consumes the following token even when it looks like a
+// flag (upstream has no look-ahead guard on the value itself).
+const flowCliGreedyValue = JSON.parse(run(['parse-args', '--provider', '--model', 'x']));
+if (
+  flowCliGreedyValue.provider !== '--model' ||
+  flowCliGreedyValue.model !== null ||
+  flowCliGreedyValue.messages[0] !== 'x'
+) {
+  throw new Error('FLOW 02: value flag did not greedily consume the following dash token');
+}
+
+// Invalid --mode value is silently ignored (no diagnostic), unlike --thinking
+// which warns. Both are negative cases that upstream handles distinctly.
+const flowCliInvalidMode = JSON.parse(run(['parse-args', '--mode', 'bogus']));
+if (
+  flowCliInvalidMode.mode !== null ||
+  flowCliInvalidMode.diagnostics.length !== 0 ||
+  flowCliInvalidMode.unknownFlags.length !== 0
+) {
+  throw new Error('FLOW 02: invalid --mode value was not silently ignored');
+}
+const flowCliInvalidThinking = JSON.parse(run(['parse-args', '--thinking', 'bogus']));
+if (
+  flowCliInvalidThinking.thinking !== null ||
+  flowCliInvalidThinking.diagnostics.length !== 1 ||
+  flowCliInvalidThinking.diagnostics[0].type !== 'warning'
+) {
+  throw new Error('FLOW 02: invalid --thinking value did not produce a warning');
+}
+
+// Each valid mode value parses; valid modes do not inherit a print-only default.
+for (const mode of ['text', 'json', 'rpc']) {
+  const parsedMode = JSON.parse(run(['parse-args', '--mode', mode]));
+  if (parsedMode.mode !== mode || parsedMode.print !== false) {
+    throw new Error(`FLOW 02: --mode ${mode} did not parse cleanly without implying --print`);
+  }
+}
+
+// Piped stdin is read and used as the prompt in non-interactive entry-point
+// dispatch (upstream readPipedStdin + resolveAppMode flips interactive->print).
+const flowCliStdinNoFlag = run([], 'piped stdin prompt');
+if (
+  !flowCliStdinNoFlag.includes('pi-zig print-mode foundation') ||
+  !flowCliStdinNoFlag.includes('Prompt:\npiped stdin prompt')
+) {
+  throw new Error('FLOW 02: piped stdin without -p was not treated as a print-mode prompt');
+}
+const flowCliStdinWithPrint = run(['-p'], 'stdin only prompt');
+if (!flowCliStdinWithPrint.includes('Prompt:\nstdin only prompt')) {
+  throw new Error('FLOW 02: piped stdin with -p (no inline prompt) was dropped');
+}
+// Upstream orders [stdin, fileText, firstMessage]; stdin must come first.
+const flowCliStdinPrecedence = run(['-p', 'INLINE_MSG'], 'STDIN_FIRST');
+if (
+  flowCliStdinPrecedence.indexOf('STDIN_FIRST') === -1 ||
+  flowCliStdinPrecedence.indexOf('INLINE_MSG') === -1 ||
+  flowCliStdinPrecedence.indexOf('STDIN_FIRST') > flowCliStdinPrecedence.indexOf('INLINE_MSG')
+) {
+  throw new Error('FLOW 02: piped stdin did not precede the inline prompt message');
+}
+// Empty/whitespace-only piped stdin is treated as absent (upstream trims and
+// returns undefined), so the entry point falls back to the interactive notice
+// and prints help. This path exits 0, so capture stdout via run().
+const flowCliStdinEmpty = run([], '   \n  ');
+if (!flowCliStdinEmpty.includes('pi-zig - Zig + Preact port')) {
+  throw new Error('FLOW 02: empty piped stdin did not fall back to the interactive notice');
+}
+
+// Mixed/invalid mode combinations: RPC mode rejects @file arguments.
+const flowCliRpcFileArgs = runFail(['--mode', 'rpc', '@README.md']);
+if (
+  flowCliRpcFileArgs.status === 0 ||
+  !flowCliRpcFileArgs.stderr.includes('@file arguments are not supported in RPC mode')
+) {
+  throw new Error('FLOW 02: --mode rpc with @file did not error');
+}
+// --fork cannot be combined with other session-selection flags.
+const flowCliForkConflict = runFail(['--fork', 'a.jsonl', '--continue']);
+if (
+  flowCliForkConflict.status === 0 ||
+  !flowCliForkConflict.stderr.includes('--fork cannot be combined with')
+) {
+  throw new Error('FLOW 02: --fork combined with --continue did not error');
+}
+// An unknown short option is a hard error that aborts the top-level run.
+const flowCliBadShort = runFail(['-z']);
+if (flowCliBadShort.status === 0 || !flowCliBadShort.stderr.includes('Error:')) {
+  throw new Error('FLOW 02: unknown short option did not abort the top-level run');
+}
+
+// Top-level --help must cover the full supported flag surface.
+const flowCliTopHelp = run(['--help']);
+for (const flag of [
+  '--provider', '--model', '--api-key', '--system-prompt', '--append-system-prompt',
+  '--mode', '--print, -p', '--continue, -c', '--resume, -r', '--session', '--fork',
+  '--session-dir', '--no-session', '--models', '--no-tools, -nt', '--no-builtin-tools, -nbt',
+  '--tools, -t', '--thinking', '--extension, -e', '--no-extensions, -ne', '--skill',
+  '--no-skills, -ns', '--prompt-template', '--no-prompt-templates, -np', '--theme',
+  '--no-themes', '--no-context-files, -nc', '--export', '--list-models', '--verbose',
+  '--offline', '--help, -h', '--version, -v'
+]) {
+  if (!flowCliTopHelp.includes(flag)) {
+    throw new Error(`FLOW 02: top-level --help is missing flag coverage for ${flag}`);
+  }
+}
+
+// Command-specific help for at least three subcommands routes correctly.
+const flowCliInstallHelp = run(['install', '--help']);
+if (!flowCliInstallHelp.includes('pi-zig install <source>') || !flowCliInstallHelp.includes('--local')) {
+  throw new Error('FLOW 02: install --help did not render command-specific help');
+}
+const flowCliRemoveHelp = run(['remove', '--help']);
+if (!flowCliRemoveHelp.includes('pi-zig remove <source>')) {
+  throw new Error('FLOW 02: remove --help did not render command-specific help');
+}
+const flowCliUpdateHelp = run(['update', '--help']);
+if (!flowCliUpdateHelp.includes('pi-zig update')) {
+  throw new Error('FLOW 02: update --help did not render command-specific help');
+}
+const flowCliListHelp = run(['list', '--help']);
+if (!flowCliListHelp.includes('pi-zig list')) {
+  throw new Error('FLOW 02: list --help did not render command-specific help');
+}
+// uninstall is an alias of remove and must route to the same help.
+const flowCliUninstallHelp = run(['uninstall', '--help']);
+if (!flowCliUninstallHelp.includes('pi-zig remove <source>')) {
+  throw new Error('FLOW 02: uninstall --help did not alias to remove help');
+}
+
 console.log('basic pi-zig smokes passed');

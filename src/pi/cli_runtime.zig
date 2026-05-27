@@ -125,10 +125,16 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
         });
     }
 
-    const prompt = try buildPrompt(init.io, init.gpa, parsed);
+    // Read piped stdin for non-rpc modes (rpc reads stdin as JSONL commands).
+    // Upstream treats piped stdin as the initial prompt and flips an otherwise
+    // interactive invocation into print mode.
+    const stdin_content = try readPipedStdin(init.io, init.gpa);
+    defer if (stdin_content) |content| init.gpa.free(content);
+
+    const prompt = try buildPrompt(init.io, init.gpa, parsed, stdin_content);
     defer prompt.deinit(init.gpa);
 
-    if (prompt.text.len == 0 and !parsed.print and parsed.messages_len == 0 and parsed.file_args_len == 0) {
+    if (prompt.text.len == 0 and !parsed.print and parsed.messages_len == 0 and parsed.file_args_len == 0 and stdin_content == null) {
         try writeStderr(init.io, "pi-zig interactive TUI mode is not implemented yet. Use -p, --mode json, or --mode rpc for the current foundation runtime.\n");
         return writeTopLevelHelp(init.io);
     }
@@ -148,21 +154,41 @@ pub fn writeTopLevelHelp(io: std.Io) !void {
         \\  pi-zig [options] [@files...] [messages...]
         \\
         \\Top-level options:
-        \\  --mode <text|json|rpc>        Output mode; rpc reads JSONL commands from stdin
-        \\  --print, -p [prompt]          Non-interactive text mode
-        \\  --session <path|id>           Use a session JSONL file or id prefix
-        \\  --session-dir <dir>           Store and look up sessions under a directory
-        \\  --continue, -c                Continue the newest session in the session directory
-        \\  --resume, -r                  Foundation alias for newest session lookup
-        \\  --fork <path|id>              Fork a session into the current session directory
-        \\  --no-session                  Do not persist prompt-mode messages
-        \\  --provider <name>             Provider name parsed for upstream CLI parity
-        \\  --model <pattern>             Model pattern parsed for upstream CLI parity
-        \\  --thinking <level>            Thinking level parsed for upstream CLI parity
-        \\  --list-models [search]        List generated upstream model catalog
-        \\  --export <session> [output]   Export a session JSONL file to HTML
-        \\  --help, -h                    Show this help
-        \\  --version, -v                 Show version
+        \\  --provider <name>              Provider name (delegated to the model resolver)
+        \\  --model <pattern>              Model pattern or ID (supports "provider/id" and ":<thinking>")
+        \\  --api-key <key>                API key (defaults to env vars)
+        \\  --system-prompt <text>         System prompt (default: coding assistant prompt)
+        \\  --append-system-prompt <text>  Append text or file contents to the system prompt (repeatable)
+        \\  --mode <text|json|rpc>         Output mode; text (default), json, or rpc (JSONL on stdin)
+        \\  --print, -p [prompt]           Non-interactive mode: process prompt and exit
+        \\  --continue, -c                 Continue the newest session in the session directory
+        \\  --resume, -r                   Select a session to resume (newest-session lookup)
+        \\  --session <path|id>            Use a session JSONL file or partial id
+        \\  --fork <path|id>               Fork a session file or partial id into a new session
+        \\  --session-dir <dir>            Directory for session storage and lookup
+        \\  --no-session                   Don't persist the session (ephemeral)
+        \\  --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
+        \\  --no-tools, -nt                Disable all tools by default (built-in and extension)
+        \\  --no-builtin-tools, -nbt       Disable built-in tools but keep extension/custom tools
+        \\  --tools, -t <tools>            Comma-separated allowlist of tool names to enable
+        \\  --thinking <level>             Thinking level: off, minimal, low, medium, high, xhigh
+        \\  --extension, -e <path>         Load an extension file (repeatable)
+        \\  --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
+        \\  --skill <path>                 Load a skill file or directory (repeatable)
+        \\  --no-skills, -ns               Disable skills discovery and loading
+        \\  --prompt-template <path>       Load a prompt template file or directory (repeatable)
+        \\  --no-prompt-templates, -np     Disable prompt template discovery and loading
+        \\  --theme <path>                 Load a theme file or directory (repeatable)
+        \\  --no-themes                    Disable theme discovery and loading
+        \\  --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
+        \\  --export <session> [output]    Export a session JSONL file to HTML and exit
+        \\  --list-models [search]         List available models (with optional fuzzy search)
+        \\  --verbose                      Force verbose startup
+        \\  --offline                      Disable startup network operations (same as PI_OFFLINE=1)
+        \\  --help, -h                     Show this help
+        \\  --version, -v                  Show version number
+        \\
+        \\Extensions can register additional flags (passed through as unknown long flags).
         \\
         \\Package commands:
         \\  install <source> [-l]          Local path package settings foundation
@@ -1045,8 +1071,30 @@ fn currentPathOwned(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, buf[0..len]);
 }
 
-fn buildPrompt(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !PromptResult {
-    if (parsed.file_args_len == 0 and parsed.messages_len == 1) {
+/// Mirrors upstream readPipedStdin(): if stdin is a TTY (interactive terminal)
+/// return null; otherwise read all of stdin, trim it, and return null when the
+/// trimmed content is empty. Caller owns the returned slice.
+fn readPipedStdin(io: std.Io, allocator: std.mem.Allocator) !?[]u8 {
+    const stdin = std.Io.File.stdin();
+    if (stdin.isTty(io) catch true) return null;
+
+    var in_buf: [16 * 1024]u8 = undefined;
+    var stdin_reader = stdin.reader(io, &in_buf);
+    const r = &stdin_reader.interface;
+
+    const raw = try r.allocRemaining(allocator, .limited(10 * 1024 * 1024));
+    defer allocator.free(raw);
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn buildPrompt(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs, stdin_content: ?[]const u8) !PromptResult {
+    // Upstream buildInitialMessage() orders prompt segments as
+    // [stdinContent, fileText, firstMessage]. The single-message fast path is
+    // only valid when there is no piped stdin to prepend.
+    if (stdin_content == null and parsed.file_args_len == 0 and parsed.messages_len == 1) {
         return .{ .text = parsed.messages[0] };
     }
 
@@ -1062,6 +1110,10 @@ fn buildPrompt(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs)
             }
         }
         image_parts.deinit(allocator);
+    }
+
+    if (stdin_content) |stdin| {
+        try w.writeAll(stdin);
     }
 
     for (parsed.file_args[0..parsed.file_args_len]) |path| {
@@ -1679,9 +1731,23 @@ fn commandOptionsFromParsed(init: std.process.Init, parsed: *const cli.ParsedArg
 
 test "top-level prompt builder combines messages" {
     const parsed = cli.parse(&.{ "hello", "world" });
-    const prompt = try buildPrompt(std.testing.io, std.testing.allocator, parsed);
+    const prompt = try buildPrompt(std.testing.io, std.testing.allocator, parsed, null);
     defer prompt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("hello\n\nworld", prompt.text);
+}
+
+test "top-level prompt builder prepends piped stdin (upstream parity)" {
+    // Upstream buildInitialMessage() places stdin content before file text and
+    // the first CLI message.
+    const parsed = cli.parse(&.{"world"});
+    const prompt = try buildPrompt(std.testing.io, std.testing.allocator, parsed, "from-stdin");
+    defer prompt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("from-stdin\n\nworld", prompt.text);
+
+    const empty_args = cli.parse(&.{});
+    const stdin_only = try buildPrompt(std.testing.io, std.testing.allocator, empty_args, "only-stdin");
+    defer stdin_only.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("only-stdin", stdin_only.text);
 }
 
 test "provider tools follow tool flags" {
