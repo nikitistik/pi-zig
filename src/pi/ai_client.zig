@@ -1065,7 +1065,7 @@ const AnthropicAuthHeader = struct {
 };
 
 fn anthropicAuthHeader(allocator: std.mem.Allocator, api_key: []const u8) !AnthropicAuthHeader {
-    if (std.mem.startsWith(u8, api_key, "sk-ant-oat")) {
+    if (isAnthropicOAuthToken(api_key)) {
         return .{
             .authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}),
             .oauth = true,
@@ -1074,12 +1074,20 @@ fn anthropicAuthHeader(allocator: std.mem.Allocator, api_key: []const u8) !Anthr
     return .{};
 }
 
+fn isAnthropicOAuthToken(api_key: []const u8) bool {
+    // Mirror upstream `isOAuthToken` (packages/ai/src/providers/anthropic.ts):
+    // OAuth access tokens contain "sk-ant-oat" anywhere, not only as a prefix.
+    return std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
+}
+
 fn anthropicExtraHeaders(buf: *[5]std.http.Header, api_key: []const u8, oauth: bool) []const std.http.Header {
     var len: usize = 0;
     buf[len] = .{ .name = "anthropic-version", .value = "2023-06-01" };
     len += 1;
     if (oauth) {
-        buf[len] = .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" };
+        // Upstream OAuth clients send the Claude Code identity beta alongside the
+        // OAuth beta: anthropic-beta: claude-code-20250219,oauth-2025-04-20
+        buf[len] = .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" };
         len += 1;
         buf[len] = .{ .name = "x-app", .value = "cli" };
         len += 1;
@@ -4298,6 +4306,38 @@ test "Google Vertex provider base URL appends express and project generate conte
         "http://127.0.0.1:43123/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-3-flash-preview:generateContent",
         project_endpoint,
     );
+}
+
+test "Anthropic OAuth auth sends Claude Code identity headers" {
+    var oauth_auth = try anthropicAuthHeader(std.testing.allocator, "sk-ant-oat01-oauth-access-token");
+    defer oauth_auth.deinit(std.testing.allocator);
+    try std.testing.expect(oauth_auth.oauth);
+    try std.testing.expectEqualStrings("Bearer sk-ant-oat01-oauth-access-token", oauth_auth.authorization.?);
+
+    var oauth_buf: [5]std.http.Header = undefined;
+    const oauth_headers = anthropicExtraHeaders(&oauth_buf, "sk-ant-oat01-oauth-access-token", oauth_auth.oauth);
+    try std.testing.expectEqual(@as(usize, 3), oauth_headers.len);
+    try std.testing.expectEqualStrings("anthropic-version", oauth_headers[0].name);
+    try std.testing.expectEqualStrings("2023-06-01", oauth_headers[0].value);
+    try std.testing.expectEqualStrings("anthropic-beta", oauth_headers[1].name);
+    try std.testing.expectEqualStrings("claude-code-20250219,oauth-2025-04-20", oauth_headers[1].value);
+    try std.testing.expectEqualStrings("x-app", oauth_headers[2].name);
+    try std.testing.expectEqualStrings("cli", oauth_headers[2].value);
+
+    // API key tokens with the oauth marker embedded mid-string still route through OAuth (upstream uses substring match).
+    try std.testing.expect(isAnthropicOAuthToken("prefix-sk-ant-oat99-suffix"));
+
+    var api_key_auth_header = try anthropicAuthHeader(std.testing.allocator, "sk-ant-api03-regular-key");
+    defer api_key_auth_header.deinit(std.testing.allocator);
+    try std.testing.expect(!api_key_auth_header.oauth);
+    try std.testing.expect(api_key_auth_header.authorization == null);
+
+    var api_key_buf: [5]std.http.Header = undefined;
+    const api_key_headers = anthropicExtraHeaders(&api_key_buf, "sk-ant-api03-regular-key", api_key_auth_header.oauth);
+    try std.testing.expectEqual(@as(usize, 2), api_key_headers.len);
+    try std.testing.expectEqualStrings("anthropic-version", api_key_headers[0].name);
+    try std.testing.expectEqualStrings("x-api-key", api_key_headers[1].name);
+    try std.testing.expectEqualStrings("sk-ant-api03-regular-key", api_key_headers[1].value);
 }
 
 test "Google Vertex auth uses API key or explicit access token for placeholders" {
