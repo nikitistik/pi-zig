@@ -8572,4 +8572,80 @@ if (!cloneJsonl.includes(`"parentSession":"${cloneSessionFile}"`) || !cloneJsonl
   throw new Error('rpc clone JSONL did not record parent session and copied prompt');
 }
 
+// ===== FLOW 12: packaging =====
+// Verifies the Prin7r release/integration artifacts without building or
+// writing anything: the packaging dry-run must succeed, the static integration
+// files must exist, and the JSON manifests must be well-formed and pinned to
+// the upstream commit. No secret values may appear in the app manifest.
+{
+  const repoRoot = path.resolve('.');
+  const upstreamPin = 'fc8a1559017f1e581cfa971aa3cef11a507a4975';
+
+  // 1. release/package.sh --dry-run is a no-op-safe smoke (no builds, no writes).
+  const releaseBefore = fs.existsSync('zig-out/release')
+    ? fs.readdirSync('zig-out/release').sort().join(',')
+    : null;
+  const dryRun = execFileSync('bash', [path.join(repoRoot, 'release/package.sh'), '--dry-run'], {
+    encoding: 'utf8'
+  });
+  if (!dryRun.includes('dry-run OK') || !dryRun.includes(upstreamPin)) {
+    throw new Error('flow 12 packaging dry-run did not report success with the upstream pin');
+  }
+  const releaseAfter = fs.existsSync('zig-out/release')
+    ? fs.readdirSync('zig-out/release').sort().join(',')
+    : null;
+  if (releaseBefore !== releaseAfter) {
+    throw new Error('flow 12 packaging dry-run mutated zig-out/release (must be a no-op)');
+  }
+
+  // 2. Required integration artifacts exist.
+  for (const file of [
+    'release/package.sh',
+    'release/prin7r-app.manifest.json',
+    'release/assets/icon.svg',
+    'docs/prin7r-integration.md',
+    'patches/prin7r-pi-zig-integration/README.md',
+    'patches/prin7r-pi-zig-integration/apply.sh'
+  ]) {
+    if (!fs.existsSync(file)) {
+      throw new Error(`flow 12 integration artifact missing: ${file}`);
+    }
+  }
+
+  // 3. The Prin7r app manifest is well-formed, correctly classed, pinned, and secret-free.
+  const appManifestText = fs.readFileSync('release/prin7r-app.manifest.json', 'utf8');
+  const appManifest = JSON.parse(appManifestText);
+  if (appManifest.schema !== 'prin7r.application.v1') {
+    throw new Error('flow 12 app manifest has wrong schema');
+  }
+  if (appManifest.applicationClass !== 'integrated_prin7r_app') {
+    throw new Error('flow 12 app manifest applicationClass is not integrated_prin7r_app');
+  }
+  if (appManifest.backend?.applicationClass !== 'backend_service_app') {
+    throw new Error('flow 12 app manifest backend.applicationClass is not backend_service_app');
+  }
+  if (appManifest.backend?.protocol !== 'ndjson-stdio' || appManifest.backend?.shutdown !== 'close-stdin-eof') {
+    throw new Error('flow 12 app manifest backend launch contract is wrong');
+  }
+  if (appManifest.upstreamPin !== upstreamPin) {
+    throw new Error('flow 12 app manifest is not pinned to the upstream commit');
+  }
+  // Keys must be referenced by name/path only — never sk- style secret values.
+  if (/sk-[A-Za-z0-9]/.test(appManifestText)) {
+    throw new Error('flow 12 app manifest appears to contain a secret value');
+  }
+
+  // 4. The integration patch is dry-run-only safe (refuses to write without --prin7r).
+  const patchDryRun = execFileSync(
+    'bash',
+    [path.join(repoRoot, 'patches/prin7r-pi-zig-integration/apply.sh'), '--dry-run'],
+    { encoding: 'utf8' }
+  );
+  if (!patchDryRun.includes('DRY RUN') || !patchDryRun.includes('WOULD NOT edit any existing Dockerfile')) {
+    throw new Error('flow 12 integration patch dry-run did not honor the no-write / no-Dockerfile contract');
+  }
+
+  console.log('flow 12 packaging smokes passed');
+}
+
 console.log('basic pi-zig smokes passed');

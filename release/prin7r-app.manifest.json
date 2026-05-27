@@ -1,0 +1,45 @@
+{
+  "schema": "prin7r.application.v1",
+  "id": "dev.prin7r.pi-zig",
+  "name": "pi-zig",
+  "displayName": "pi-zig Coding Agent",
+  "applicationClass": "integrated_prin7r_app",
+  "icon": "assets/icon.svg",
+  "version": "0.1.0",
+  "description": "Zig port of earendil-works/pi: a coding agent backend (RPC over NDJSON) with a Preact inspection/control surface.",
+  "upstreamPin": "fc8a1559017f1e581cfa971aa3cef11a507a4975",
+  "frontend": {
+    "kind": "static-spa",
+    "dir": "frontend",
+    "entry": "index.html",
+    "spaFallback": true
+  },
+  "backend": {
+    "applicationClass": "backend_service_app",
+    "binary": "bin/pi-zig",
+    "launch": ["bin/pi-zig", "rpc", "${PI_ZIG_SESSION_FILE}"],
+    "protocol": "ndjson-stdio",
+    "shutdown": "close-stdin-eof",
+    "healthcheck": { "command": ["bin/pi-zig", "status"], "expectExit": 0 },
+    "env": {
+      "passthrough": ["HOME", "PATH"],
+      "keyFile": "${PRIN7R_KEYS_FILE:-${HOME}/.nth-kir-keys.env}",
+      "keysReferenced": [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GROQ_API_KEY"
+      ]
+    },
+    "sessionStorage": {
+      "dirEnv": "PI_ZIG_SESSION_DIR",
+      "defaultDir": "${PRIN7R_STATE_ROOT}/pi-zig/sessions",
+      "fileFormat": "jsonl"
+    }
+  },
+  "notes": [
+    "Keys are referenced by path only; the integration never copies secret values into manifests or images.",
+    "The backend is a long-lived child driven over stdin/stdout; closing stdin (EOF) terminates it cleanly.",
+    "Both surfaces are produced by release/package.sh; this manifest describes the staged layout under that release dir."
+  ]
+}
