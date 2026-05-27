@@ -388,6 +388,21 @@ const PendingMessageQueue = struct {
     }
 };
 
+const SlashCommandInvocation = struct {
+    name: []const u8,
+    args: []const u8,
+};
+
+fn parseSlashCommandInvocation(message: []const u8) ?SlashCommandInvocation {
+    if (message.len < 2 or message[0] != '/') return null;
+    const rest = message[1..];
+    const space_index = std.mem.indexOfScalar(u8, rest, ' ');
+    const name = if (space_index) |index| rest[0..index] else rest;
+    if (name.len == 0) return null;
+    const args = if (space_index) |index| rest[index + 1 ..] else "";
+    return .{ .name = name, .args = args };
+}
+
 const UserBatchMessage = struct {
     text: []const u8,
     image_parts: []const ai_client.ChatContentPart = &.{},
@@ -1566,6 +1581,65 @@ const Runtime = struct {
         try w.writeAll("}}\n");
     }
 
+    fn makeExtensionRunner(self: *Runtime, io: std.Io, allocator: std.mem.Allocator) extension_runner.Runner {
+        return .{
+            .io = io,
+            .allocator = allocator,
+            .extension_paths = self.run_options.extension_paths,
+            .flag_values = self.run_options.extension_flag_values,
+        };
+    }
+
+    fn isRegisteredExtensionCommand(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, invocation: SlashCommandInvocation) !bool {
+        if (self.run_options.extension_paths.len == 0) return false;
+        var runner = self.makeExtensionRunner(io, allocator);
+        const definitions = try runner.discoverCommandDefinitions();
+        defer if (definitions.len > 0) runner.deinitCommandDefinitions(definitions);
+        for (definitions) |definition| {
+            if (std.mem.eql(u8, definition.name, invocation.name)) return true;
+        }
+        return false;
+    }
+
+    fn handleExtensionPromptCommand(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
+        id: ?[]const u8,
+        command: []const u8,
+        message: []const u8,
+    ) !bool {
+        const invocation = parseSlashCommandInvocation(message) orelse return false;
+        if (self.run_options.extension_paths.len == 0) return false;
+        var runner = self.makeExtensionRunner(io, allocator);
+        const result = try runner.runRegisteredCommand(invocation.name, invocation.args);
+        if (!result.handled) return false;
+        try writeSuccess(w, id, command);
+        return true;
+    }
+
+    fn rejectQueuedExtensionCommand(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        w: *std.Io.Writer,
+        id: ?[]const u8,
+        command: []const u8,
+        message: []const u8,
+    ) !bool {
+        const invocation = parseSlashCommandInvocation(message) orelse return false;
+        if (!try self.isRegisteredExtensionCommand(io, allocator, invocation)) return false;
+        var error_buffer: [256]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&error_buffer);
+        try writer.print(
+            "Extension command \"/{s}\" cannot be queued. Use prompt() or execute the command when not streaming.",
+            .{invocation.name},
+        );
+        try writeError(w, id, command, writer.buffered());
+        return true;
+    }
+
     fn handlePromptCommand(
         self: *Runtime,
         io: std.Io,
@@ -1622,6 +1696,9 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "prompt requires a string message");
             };
+            if (self.handleExtensionPromptCommand(io, allocator, w, id, command, message) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            }) return;
             const image_parts = parseRpcImages(allocator, value) catch {
                 return writeError(w, id, command, "prompt images must be ImageContent objects with type=image, data, and mimeType");
             };
@@ -1636,6 +1713,9 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "steer requires a string message");
             };
+            if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            }) return;
             const image_parts = parseRpcImages(allocator, value) catch {
                 return writeError(w, id, command, "steer images must be ImageContent objects with type=image, data, and mimeType");
             };
@@ -1647,6 +1727,9 @@ const Runtime = struct {
             const message = getStringField(value, "message") orelse {
                 return writeError(w, id, command, "follow_up requires a string message");
             };
+            if (self.rejectQueuedExtensionCommand(io, allocator, w, id, command, message) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            }) return;
             const image_parts = parseRpcImages(allocator, value) catch {
                 return writeError(w, id, command, "follow_up images must be ImageContent objects with type=image, data, and mimeType");
             };

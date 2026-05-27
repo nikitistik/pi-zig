@@ -93,6 +93,10 @@ pub const Runner = struct {
         source_info_json: []const u8,
     };
 
+    pub const CommandExecutionResult = struct {
+        handled: bool = false,
+    };
+
     pub fn discoverCommandDefinitions(self: *Runner) ![]CommandDefinition {
         if (!self.hasExtensions()) return &.{};
 
@@ -144,6 +148,23 @@ pub const Runner = struct {
             self.allocator.free(definition.source_info_json);
         }
         self.allocator.free(definitions);
+    }
+
+    pub fn runRegisteredCommand(self: *Runner, command_name: []const u8, args: []const u8) !CommandExecutionResult {
+        if (!self.hasExtensions()) return .{};
+
+        const payload = try self.buildExecuteCommandPayload(command_name, args);
+        defer self.allocator.free(payload);
+        const output = try self.runNodeHook(payload);
+        defer if (output) |bytes| self.allocator.free(bytes);
+        const bytes = output orelse return .{};
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch return error.ExtensionHookInvalidResponse;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ExtensionHookInvalidResponse;
+        const handled = parsed.value.object.get("handled") orelse return error.ExtensionHookInvalidResponse;
+        if (handled != .bool) return error.ExtensionHookInvalidResponse;
+        return .{ .handled = handled.bool };
     }
 
     fn runBeforeToolCall(self: *Runner, call: ai_client.ChatToolCall) !agent.BeforeToolCallResult {
@@ -289,6 +310,19 @@ pub const Runner = struct {
         const w = &out.writer;
         try self.writePayloadHead(w);
         try w.writeAll(",\"event\":{\"type\":\"discover_commands\"}}");
+        return out.toOwnedSlice();
+    }
+
+    fn buildExecuteCommandPayload(self: *Runner, command_name: []const u8, args: []const u8) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try self.writePayloadHead(w);
+        try w.writeAll(",\"event\":{\"type\":\"execute_command\",\"commandName\":");
+        try writeJsonString(w, command_name);
+        try w.writeAll(",\"args\":");
+        try writeJsonString(w, args);
+        try w.writeAll("}}");
         return out.toOwnedSlice();
     }
 
@@ -654,11 +688,23 @@ const hook_runner_script =
     \\  ui: {
     \\    notify() {},
     \\    select: async (_message, options) => Array.isArray(options) ? options[0] : undefined,
+    \\    input: async () => undefined,
     \\    prompt: async () => undefined,
     \\    confirm: async () => false,
     \\  },
     \\  diagnostics,
     \\};
+    \\function createCommandContext() {
+    \\  return {
+    \\    ...ctx,
+    \\    waitForIdle: async () => {},
+    \\    newSession: async () => ({ cancelled: true }),
+    \\    fork: async () => ({ cancelled: true }),
+    \\    navigateTree: async () => ({ cancelled: true }),
+    \\    switchSession: async () => ({ cancelled: true }),
+    \\    reload: async () => {},
+    \\  };
+    \\}
     \\async function loadExtension(extensionPath) {
     \\  const resolvedExtensionPath = path.resolve(extensionPath);
     \\  const mod = await importExtensionModule(resolvedExtensionPath);
@@ -760,6 +806,27 @@ const hook_runner_script =
     \\      description: String(command.description ?? ""),
     \\      sourceInfo: sourceInfoForExtension(command.extensionPath),
     \\    })) }) + "\n");
+    \\    return;
+    \\  }
+    \\  if (event?.type === "execute_command") {
+    \\    const commandName = String(event.commandName ?? "");
+    \\    const command = allRegisteredCommands().find((candidate) => candidate.invocationName === commandName);
+    \\    if (!command) {
+    \\      process.stdout.write(JSON.stringify({ handled: false }) + "\n");
+    \\      return;
+    \\    }
+    \\    try {
+    \\      if (typeof command.handler !== "function") throw new Error(`Extension command has no handler: ${commandName}`);
+    \\      await command.handler(String(event.args ?? ""), createCommandContext());
+    \\    } catch (err) {
+    \\      diagnostics.push({
+    \\        extensionPath: `command:${commandName}`,
+    \\        event: "command",
+    \\        error: err && err.message ? err.message : String(err),
+    \\        stack: err && err.stack ? err.stack : undefined,
+    \\      });
+    \\    }
+    \\    process.stdout.write(JSON.stringify({ handled: true, diagnostics }) + "\n");
     \\    return;
     \\  }
     \\  if (event?.type === "execute_tool") {
@@ -994,6 +1061,80 @@ test "extension runner discovers registered commands with upstream invocation na
     try std.testing.expectEqualStrings("Review from first", definitions[1].description);
     try std.testing.expectEqualStrings("deploy:2", definitions[2].name);
     try std.testing.expectEqualStrings("Deploy from second", definitions[2].description);
+}
+
+test "extension runner executes registered commands by invocation name" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-command-exec-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const extension_path = fixture_dir ++ "/command.mjs";
+    const marker_path = fixture_dir ++ "/marker.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = extension_path, .data =
+        \\import fs from "node:fs";
+        \\
+        \\export default function(pi) {
+        \\  pi.registerCommand("write-marker", {
+        \\    description: "Write command args to a marker file",
+        \\    handler: async (args, ctx) => {
+        \\      await ctx.waitForIdle();
+        \\      fs.writeFileSync("zig-out/pi-zig-extension-runner-command-exec-test/marker.txt", `${args}|hasUI:${ctx.hasUI}`);
+        \\    }
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{extension_path} };
+    const result = try runner.runRegisteredCommand("write-marker", "hello world");
+    try std.testing.expect(result.handled);
+
+    const marker = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, marker_path, allocator, .limited(1024));
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("hello world|hasUI:false", marker);
+
+    const missing = try runner.runRegisteredCommand("missing-command", "ignored");
+    try std.testing.expect(!missing.handled);
+}
+
+test "extension runner executes duplicate registered commands by suffix" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extension-runner-command-exec-duplicate-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const first_path = fixture_dir ++ "/a-first.mjs";
+    const second_path = fixture_dir ++ "/b-second.mjs";
+    const marker_path = fixture_dir ++ "/marker.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = first_path, .data =
+        \\import fs from "node:fs";
+        \\
+        \\export default function(pi) {
+        \\  pi.registerCommand("deploy", {
+        \\    description: "first deploy",
+        \\    handler: async (args) => fs.writeFileSync("zig-out/pi-zig-extension-runner-command-exec-duplicate-test/marker.txt", `first:${args}`)
+        \\  });
+        \\}
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = second_path, .data =
+        \\import fs from "node:fs";
+        \\
+        \\export default function(pi) {
+        \\  pi.registerCommand("deploy", {
+        \\    description: "second deploy",
+        \\    handler: async (args) => fs.writeFileSync("zig-out/pi-zig-extension-runner-command-exec-duplicate-test/marker.txt", `second:${args}`)
+        \\  });
+        \\}
+    });
+
+    var runner = Runner{ .io = std.testing.io, .allocator = allocator, .extension_paths = &.{ first_path, second_path } };
+    try std.testing.expect((try runner.runRegisteredCommand("deploy:1", "one")).handled);
+    const marker = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, marker_path, allocator, .limited(1024));
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("first:one", marker);
+
+    try std.testing.expect((try runner.runRegisteredCommand("deploy:2", "two")).handled);
+    const marker_second = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, marker_path, allocator, .limited(1024));
+    defer allocator.free(marker_second);
+    try std.testing.expectEqualStrings("second:two", marker_second);
 }
 
 test "extension runner loads TypeScript registered tools" {

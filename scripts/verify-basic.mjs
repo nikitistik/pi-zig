@@ -2060,6 +2060,7 @@ if (!Array.isArray(emptyCommands.commands)) {
 const commandsFixtureRoot = path.resolve('zig-out/pi-zig-commands-fixture');
 const commandsFixtureHome = path.join(commandsFixtureRoot, 'home');
 const commandsFixtureEnv = { ...process.env, HOME: commandsFixtureHome };
+const commandsFixtureCommandExecMarker = path.join(commandsFixtureRoot, 'extensions/command-exec-marker.txt');
 fs.rmSync(commandsFixtureRoot, { recursive: true, force: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, '.git'), { recursive: true });
 fs.mkdirSync(path.join(commandsFixtureRoot, '.pi/agent/prompts'), { recursive: true });
@@ -2297,6 +2298,22 @@ fs.writeFileSync(
   [
     'export default function(pi) {',
     '  pi.registerCommand("deploy", { description: "Deploy from extension B", handler: async () => {} });',
+    '}'
+  ].join('\n')
+);
+fs.writeFileSync(
+  path.join(commandsFixtureRoot, 'extensions/command-exec.mjs'),
+  [
+    'import fs from "node:fs";',
+    '',
+    'export default function(pi) {',
+    '  pi.registerCommand("write-marker", {',
+    '    description: "Write marker from extension command",',
+    '    handler: async (args, ctx) => {',
+    '      await ctx.waitForIdle();',
+    `      fs.writeFileSync(${JSON.stringify(commandsFixtureCommandExecMarker)}, args + "|hasUI:" + ctx.hasUI);`,
+    '    }',
+    '  });',
     '}'
   ].join('\n')
 );
@@ -2651,6 +2668,47 @@ if (
 const unexpectedRpcCommand = rpcCommandsResponse.data.commands.find((command) => unexpectedFixtureCommandNames.has(command.name));
 if (unexpectedRpcCommand) {
   throw new Error(`rpc get_commands smoke returned disabled or pattern-only command ${unexpectedRpcCommand.name}`);
+}
+fs.rmSync(commandsFixtureCommandExecMarker, { force: true });
+const fixtureRpcCommandExecOutput = run(
+  [
+    '--mode',
+    'rpc',
+    '--session',
+    path.join(commandsFixtureRoot, 'rpc-command-exec.jsonl'),
+    '--extension',
+    'extensions/command-exec.mjs'
+  ],
+  [
+    JSON.stringify({ id: 'rpc-command-exec-prompt', type: 'prompt', message: '/write-marker hello world' }),
+    JSON.stringify({ id: 'rpc-command-exec-messages', type: 'get_messages' }),
+    JSON.stringify({ id: 'rpc-command-exec-steer', type: 'steer', message: '/write-marker queued steer' }),
+    JSON.stringify({ id: 'rpc-command-exec-follow', type: 'follow_up', message: '/write-marker queued follow' }),
+    JSON.stringify({ id: 'rpc-command-exec-unknown', type: 'prompt', message: '/not-an-extension-command ordinary prompt' }),
+    JSON.stringify({ id: 'rpc-command-exec-unknown-messages', type: 'get_messages' }),
+    ''
+  ].join('\n'),
+  { cwd: commandsFixtureRoot, env: commandsFixtureEnv }
+);
+const fixtureRpcCommandExecResponses = fixtureRpcCommandExecOutput.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const rpcCommandExecPrompt = fixtureRpcCommandExecResponses.find((response) => response.id === 'rpc-command-exec-prompt');
+const rpcCommandExecMessages = fixtureRpcCommandExecResponses.find((response) => response.id === 'rpc-command-exec-messages');
+const rpcCommandExecSteer = fixtureRpcCommandExecResponses.find((response) => response.id === 'rpc-command-exec-steer');
+const rpcCommandExecFollow = fixtureRpcCommandExecResponses.find((response) => response.id === 'rpc-command-exec-follow');
+const rpcCommandExecUnknown = fixtureRpcCommandExecResponses.find((response) => response.id === 'rpc-command-exec-unknown');
+const rpcCommandExecUnknownMessages = fixtureRpcCommandExecResponses.find((response) => response.id === 'rpc-command-exec-unknown-messages');
+if (
+  !rpcCommandExecPrompt?.success ||
+  fs.readFileSync(commandsFixtureCommandExecMarker, 'utf8') !== 'hello world|hasUI:false' ||
+  rpcCommandExecMessages?.data?.messages?.length !== 0 ||
+  rpcCommandExecSteer?.success !== false ||
+  !rpcCommandExecSteer?.error?.includes('Extension command "/write-marker" cannot be queued') ||
+  rpcCommandExecFollow?.success !== false ||
+  !rpcCommandExecFollow?.error?.includes('Extension command "/write-marker" cannot be queued') ||
+  !rpcCommandExecUnknown?.success ||
+  !rpcCommandExecUnknownMessages?.data?.messages?.some((message) => message.role === 'user' && message.content === '/not-an-extension-command ordinary prompt')
+) {
+  throw new Error('rpc extension command execution smoke did not match upstream prompt/queue semantics');
 }
 
 const packageCommandRoot = path.resolve('zig-out/pi-zig-package-command-fixture');
