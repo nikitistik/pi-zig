@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "bridge": "node server.mjs",
+    "fake-provider": "node fake-provider.mjs"
   },
   "dependencies": {
     "@preact/preset-vite": "2.10.2",
@@ -14,5 +17,7 @@
     "typescript": "6.0.3",
     "vite": "6.4.2"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "ws": "8.18.0"
+  }
 }
