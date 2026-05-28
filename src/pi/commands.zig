@@ -40,24 +40,179 @@ pub fn writeCommandsDataJsonWithOptions(
     w: *std.Io.Writer,
     options: Options,
 ) !void {
+    // Build the raw, precedence-ordered command list, then dedup by name
+    // (first-wins) so the emitted list matches upstream's resolved+deduped
+    // getPrompts()/getSkills() output. The raw pass already emits in upstream
+    // precedence order, so the first entry per name is the highest-precedence
+    // resource (project over user, settings over auto, top-level over package).
+    // Wrap the comma-joined entries in brackets so the whole list parses as a
+    // single JSON array value.
+    var raw: std.Io.Writer.Allocating = .init(allocator);
+    defer raw.deinit();
+    try raw.writer.writeByte('[');
+    try emitCommandsArrayBody(io, allocator, &raw.writer, options);
+    try raw.writer.writeByte(']');
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw.written(), .{}) catch {
+        // Defensive fallback: if anything failed to parse, emit the raw body
+        // verbatim rather than dropping commands.
+        try w.writeAll("{\"commands\":");
+        try w.writeAll(raw.written());
+        try w.writeAll("}");
+        return;
+    };
+    defer parsed.deinit();
+
     try w.writeAll("{\"commands\":[");
+    // Buffer collision diagnostics produced during dedup so we can emit them in
+    // a sibling `diagnostics` array after the deduped command list. Mirrors
+    // upstream resource-loader dedupePrompts/dedupeSkills, which return both the
+    // first-wins resource list and a `collision` diagnostic per shadowed
+    // duplicate. The winner (first occurrence) is never changed.
+    var collisions: std.Io.Writer.Allocating = .init(allocator);
+    defer collisions.deinit();
+    var collision_count: usize = 0;
+
+    if (parsed.value == .array) {
+        // Map each seen name to its winning entry so loser diagnostics can
+        // reference the winner's path (upstream `existing.filePath`).
+        var seen = std.StringHashMap(std.json.Value).init(allocator);
+        defer seen.deinit();
+        var written: usize = 0;
+        for (parsed.value.array.items) |entry| {
+            const name = objectString(entry, "name") orelse continue;
+            if (seen.get(name)) |winner| {
+                if (collision_count != 0) try collisions.writer.writeByte(',');
+                try writeCollisionDiagnostic(&collisions.writer, name, winner, entry);
+                collision_count += 1;
+                continue;
+            }
+            try seen.put(name, entry);
+            if (written != 0) try w.writeByte(',');
+            try std.json.Stringify.value(entry, .{}, w);
+            written += 1;
+        }
+    }
+    try w.writeAll("],\"diagnostics\":[");
+    try w.writeAll(collisions.written());
+    try w.writeAll("]}");
+}
+
+/// Emit one upstream-shaped `collision` diagnostic for a shadowed duplicate
+/// command. Matches resource-loader.ts dedupePrompts (prompts) and skills.ts
+/// (skills): the message is `name "/<name>" collision` for prompts and
+/// `name "<name>" collision` for skills, and the embedded collision object
+/// carries resourceType/name/winnerPath/loserPath. `path` is the loser's path,
+/// exactly as upstream sets `path: prompt.filePath` / `path: skill.filePath`.
+fn writeCollisionDiagnostic(
+    w: *std.Io.Writer,
+    command_name: []const u8,
+    winner: std.json.Value,
+    loser: std.json.Value,
+) !void {
+    const source = objectString(loser, "source") orelse "";
+    const is_skill = std.mem.eql(u8, source, "skill");
+    const resource_type: []const u8 = if (is_skill) "skill" else "prompt";
+    // Upstream prompt names carry no prefix; skill command names are stored as
+    // `skill:<name>` here but upstream's skill.name is the bare name.
+    const resource_name = if (is_skill and std.mem.startsWith(u8, command_name, "skill:"))
+        command_name["skill:".len..]
+    else
+        command_name;
+    const winner_path = sourceInfoPath(winner) orelse "";
+    const loser_path = sourceInfoPath(loser) orelse "";
+
+    try w.writeAll("{\"type\":\"collision\",\"message\":");
+    if (is_skill) {
+        try w.writeAll("\"name \\\"");
+        try writeJsonStringContents(w, resource_name);
+        try w.writeAll("\\\" collision\"");
+    } else {
+        try w.writeAll("\"name \\\"/");
+        try writeJsonStringContents(w, resource_name);
+        try w.writeAll("\\\" collision\"");
+    }
+    try w.writeAll(",\"path\":");
+    try writeJsonString(w, loser_path);
+    try w.writeAll(",\"collision\":{\"resourceType\":");
+    try writeJsonString(w, resource_type);
+    try w.writeAll(",\"name\":");
+    try writeJsonString(w, resource_name);
+    try w.writeAll(",\"winnerPath\":");
+    try writeJsonString(w, winner_path);
+    try w.writeAll(",\"loserPath\":");
+    try writeJsonString(w, loser_path);
+    try w.writeAll("}}");
+}
+
+fn sourceInfoPath(entry: std.json.Value) ?[]const u8 {
+    if (entry != .object) return null;
+    const source_info = entry.object.get("sourceInfo") orelse return null;
+    return objectString(source_info, "path");
+}
+
+/// Emit the comma-joined command objects (without the surrounding
+/// `{"commands":[ ]}`) in upstream precedence order.
+///
+/// Emission order mirrors upstream's resource precedence (package-manager.ts
+/// resourcePrecedenceRank): project settings (rank 0) -> project auto-discovered
+/// (rank 1) -> user settings (rank 2) -> user auto (rank 3) -> packages (rank 4).
+/// expandSlashResourceCommand resolves to the first matching name, so this order
+/// makes a project resource win over a same-named user resource exactly as
+/// upstream does. Temporary (--prompt/--skill) paths are emitted last, matching
+/// upstream's additionalSkillPaths/additionalPromptTemplatePaths being appended
+/// last.
+fn emitCommandsArrayBody(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    options: Options,
+) !void {
     var emitted: usize = 0;
 
     try writeExtensionCommands(io, allocator, w, &emitted, options.extension_paths);
 
     if (!options.no_prompt_templates) {
-        try writeDefaultPromptCommands(io, allocator, w, &emitted, options.home);
-        try writeSettingsPromptCommands(io, allocator, w, &emitted, options.home);
+        try writeProjectSettingsPromptCommands(io, allocator, w, &emitted, options.home);
+        try writeProjectAutoPromptCommands(io, allocator, w, &emitted);
+        try writeUserSettingsPromptCommands(io, allocator, w, &emitted, options.home);
+        try writeUserAutoPromptCommands(io, allocator, w, &emitted, options.home);
+        try writePackagePromptCommands(io, allocator, w, &emitted, options.home);
     }
     try writePromptCommandsForPaths(io, allocator, w, &emitted, options.additional_prompt_paths, "temporary");
 
     if (!options.no_skills) {
-        try writeDefaultSkillCommands(io, allocator, w, &emitted, options.home);
-        try writeSettingsSkillCommands(io, allocator, w, &emitted, options.home);
+        try writeProjectSettingsSkillCommands(io, allocator, w, &emitted, options.home);
+        try writeProjectAutoSkillCommands(io, allocator, w, &emitted, options.home);
+        try writeUserSettingsSkillCommands(io, allocator, w, &emitted, options.home);
+        try writeUserAutoSkillCommands(io, allocator, w, &emitted, options.home);
+        try writePackageSkillCommands(io, allocator, w, &emitted, options.home);
     }
     try writeSkillCommandsForPaths(io, allocator, w, &emitted, options.additional_skill_paths, "temporary", true);
+}
 
-    try w.writeAll("]}");
+/// On-demand reload entrypoint for prompts/skills (and, via the extension
+/// runner, extension commands). Re-discovers every resource directory from
+/// disk on each call and returns the freshly-built commands JSON (caller owns
+/// the returned slice).
+///
+/// This is the function the TUI/RPC `/reload` path calls to mirror upstream's
+/// `resourceLoader.reload()` ("Reload keybindings, extensions, skills, prompts,
+/// and themes"). Discovery here is stateless — there is no in-memory cache to
+/// invalidate — so re-invoking it picks up files added/removed since the last
+/// call. Themes/context-files are reloaded by their own discover() entrypoints
+/// (themes.zig / context_files.zig) on the same on-demand basis.
+///
+/// Divergence from upstream: upstream keeps a live `fs.watch` on theme files to
+/// hot-reload the active theme, and caches resources between `/reload`s. pi-zig
+/// has no long-lived resource cache and no fs-watch daemon; instead every list
+/// (`get_commands`, `themes`, `context-files`) re-reads disk, which is a strict
+/// superset of upstream's reload guarantee (always fresh, never stale).
+pub fn reloadCommandsJson(io: std.Io, allocator: std.mem.Allocator, options: Options) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try writeCommandsDataJsonWithOptions(io, allocator, &out.writer, options);
+    return out.toOwnedSlice();
 }
 
 pub fn expandSlashResourceCommand(
@@ -118,83 +273,154 @@ fn writeExtensionCommands(
     }
 }
 
-fn writeDefaultPromptCommands(
+// --- Prompt command scopes, in upstream precedence order (rank 0..4). ---
+
+/// rank 0: project settings-file prompt entries (source "local", non-package).
+fn writeProjectSettingsPromptCommands(
     io: std.Io,
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     emitted: *usize,
     home: ?[]const u8,
 ) !void {
-    if (home) |home_dir| {
-        const user_prompts = try std.fs.path.join(allocator, &.{ home_dir, ".pi", "agent", "prompts" });
-        defer allocator.free(user_prompts);
-        try writePromptCommandsFromPath(io, allocator, w, emitted, user_prompts, "user");
-    }
+    try writePromptCommandsFromSettings(io, allocator, w, emitted, project_settings_file, ".pi", "project", home);
+}
 
+/// rank 1: project auto-discovered prompt directories.
+fn writeProjectAutoPromptCommands(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    emitted: *usize,
+) !void {
     try writePromptCommandsFromPath(io, allocator, w, emitted, project_prompts_dir, "project");
     try writePromptCommandsFromPath(io, allocator, w, emitted, legacy_project_prompts_dir, "project");
 }
 
-fn writeDefaultSkillCommands(
+/// rank 2: user settings-file prompt entries.
+fn writeUserSettingsPromptCommands(
     io: std.Io,
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     emitted: *usize,
     home: ?[]const u8,
 ) !void {
-    if (home) |home_dir| {
-        const user_pi_skills = try std.fs.path.join(allocator, &.{ home_dir, ".pi", "agent", "skills" });
-        defer allocator.free(user_pi_skills);
-        try writeSkillCommandsFromPath(io, allocator, w, emitted, user_pi_skills, "user", true);
-
-        const user_agents_skills = try std.fs.path.join(allocator, &.{ home_dir, ".agents", "skills" });
-        defer allocator.free(user_agents_skills);
-        try writeSkillCommandsFromPath(io, allocator, w, emitted, user_agents_skills, "user", false);
-    }
-
-    try writeSkillCommandsFromPath(io, allocator, w, emitted, project_skills_dir, "project", true);
-    try writeSkillCommandsFromPath(io, allocator, w, emitted, legacy_project_skills_dir, "project", true);
-    try writeAncestorAgentsSkillCommands(io, allocator, w, emitted, home);
+    const home_dir = home orelse return;
+    const global_agent_dir = try std.fs.path.join(allocator, &.{ home_dir, ".pi", "agent" });
+    defer allocator.free(global_agent_dir);
+    const global_settings = try std.fs.path.join(allocator, &.{ global_agent_dir, "settings.json" });
+    defer allocator.free(global_settings);
+    try writePromptCommandsFromSettings(io, allocator, w, emitted, global_settings, global_agent_dir, "user", home);
 }
 
-fn writeSettingsPromptCommands(
+/// rank 3: user auto-discovered prompt directory.
+fn writeUserAutoPromptCommands(
     io: std.Io,
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     emitted: *usize,
     home: ?[]const u8,
 ) !void {
+    const home_dir = home orelse return;
+    const user_prompts = try std.fs.path.join(allocator, &.{ home_dir, ".pi", "agent", "prompts" });
+    defer allocator.free(user_prompts);
+    try writePromptCommandsFromPath(io, allocator, w, emitted, user_prompts, "user");
+}
+
+/// rank 4: package prompt sources (project package sources before user).
+fn writePackagePromptCommands(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    emitted: *usize,
+    home: ?[]const u8,
+) !void {
+    try writePackagePromptCommandsFromSettings(io, allocator, w, emitted, project_settings_file, ".pi", "project", home);
     if (home) |home_dir| {
         const global_agent_dir = try std.fs.path.join(allocator, &.{ home_dir, ".pi", "agent" });
         defer allocator.free(global_agent_dir);
         const global_settings = try std.fs.path.join(allocator, &.{ global_agent_dir, "settings.json" });
         defer allocator.free(global_settings);
         try writePackagePromptCommandsFromSettings(io, allocator, w, emitted, global_settings, global_agent_dir, "user", home);
-        try writePromptCommandsFromSettings(io, allocator, w, emitted, global_settings, global_agent_dir, "user", home);
     }
-
-    try writePackagePromptCommandsFromSettings(io, allocator, w, emitted, project_settings_file, ".pi", "project", home);
-    try writePromptCommandsFromSettings(io, allocator, w, emitted, project_settings_file, ".pi", "project", home);
 }
 
-fn writeSettingsSkillCommands(
+// --- Skill command scopes, in upstream precedence order (rank 0..4). ---
+
+/// rank 0: project settings-file skill entries.
+fn writeProjectSettingsSkillCommands(
     io: std.Io,
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     emitted: *usize,
     home: ?[]const u8,
 ) !void {
+    try writeSkillCommandsFromSettings(io, allocator, w, emitted, project_settings_file, ".pi", "project", home);
+}
+
+/// rank 1: project auto-discovered skill directories (incl. ancestor .agents/skills).
+fn writeProjectAutoSkillCommands(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    emitted: *usize,
+    home: ?[]const u8,
+) !void {
+    try writeSkillCommandsFromPath(io, allocator, w, emitted, project_skills_dir, "project", true);
+    try writeSkillCommandsFromPath(io, allocator, w, emitted, legacy_project_skills_dir, "project", true);
+    try writeAncestorAgentsSkillCommands(io, allocator, w, emitted, home);
+}
+
+/// rank 2: user settings-file skill entries.
+fn writeUserSettingsSkillCommands(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    emitted: *usize,
+    home: ?[]const u8,
+) !void {
+    const home_dir = home orelse return;
+    const global_agent_dir = try std.fs.path.join(allocator, &.{ home_dir, ".pi", "agent" });
+    defer allocator.free(global_agent_dir);
+    const global_settings = try std.fs.path.join(allocator, &.{ global_agent_dir, "settings.json" });
+    defer allocator.free(global_settings);
+    try writeSkillCommandsFromSettings(io, allocator, w, emitted, global_settings, global_agent_dir, "user", home);
+}
+
+/// rank 3: user auto-discovered skill directories (~/.pi/agent/skills, ~/.agents/skills).
+fn writeUserAutoSkillCommands(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    emitted: *usize,
+    home: ?[]const u8,
+) !void {
+    const home_dir = home orelse return;
+    const user_pi_skills = try std.fs.path.join(allocator, &.{ home_dir, ".pi", "agent", "skills" });
+    defer allocator.free(user_pi_skills);
+    try writeSkillCommandsFromPath(io, allocator, w, emitted, user_pi_skills, "user", true);
+
+    const user_agents_skills = try std.fs.path.join(allocator, &.{ home_dir, ".agents", "skills" });
+    defer allocator.free(user_agents_skills);
+    try writeSkillCommandsFromPath(io, allocator, w, emitted, user_agents_skills, "user", false);
+}
+
+/// rank 4: package skill sources (project package sources before user).
+fn writePackageSkillCommands(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    emitted: *usize,
+    home: ?[]const u8,
+) !void {
+    try writePackageSkillCommandsFromSettings(io, allocator, w, emitted, project_settings_file, ".pi", "project", home);
     if (home) |home_dir| {
         const global_agent_dir = try std.fs.path.join(allocator, &.{ home_dir, ".pi", "agent" });
         defer allocator.free(global_agent_dir);
         const global_settings = try std.fs.path.join(allocator, &.{ global_agent_dir, "settings.json" });
         defer allocator.free(global_settings);
         try writePackageSkillCommandsFromSettings(io, allocator, w, emitted, global_settings, global_agent_dir, "user", home);
-        try writeSkillCommandsFromSettings(io, allocator, w, emitted, global_settings, global_agent_dir, "user", home);
     }
-
-    try writePackageSkillCommandsFromSettings(io, allocator, w, emitted, project_settings_file, ".pi", "project", home);
-    try writeSkillCommandsFromSettings(io, allocator, w, emitted, project_settings_file, ".pi", "project", home);
 }
 
 fn writePackagePromptCommandsFromSettings(
@@ -1414,7 +1640,7 @@ fn expandPromptTemplateFile(
     const frontmatter = parseFrontmatter(content);
     const args = try parseTemplateArgs(allocator, args_text);
     defer freeStringList(allocator, args);
-    return substituteTemplateArgs(allocator, frontmatter.body, args_text, args);
+    return substituteTemplateArgs(allocator, frontmatter.body, args);
 }
 
 fn expandSkillFile(
@@ -1430,6 +1656,9 @@ fn expandSkillFile(
     const frontmatter = parseFrontmatter(content);
     const skill_name = if (std.mem.startsWith(u8, command_name, "skill:")) command_name["skill:".len..] else command_name;
     const body = std.mem.trim(u8, frontmatter.body, " \t\r\n");
+    // Upstream _expandSkillCommand trims the args (text.slice(spaceIndex+1).trim())
+    // before appending, so trailing whitespace after the skill name is dropped.
+    const args = std.mem.trim(u8, args_text, " \t\r\n");
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.print("<skill name=\"{s}\" location=\"{s}\">\nReferences are relative to {s}.\n\n{s}\n</skill>", .{
@@ -1438,10 +1667,16 @@ fn expandSkillFile(
         base_dir,
         body,
     });
-    if (args_text.len > 0) try out.writer.print("\n\n{s}", .{args_text});
+    if (args.len > 0) try out.writer.print("\n\n{s}", .{args});
     return out.toOwnedSlice();
 }
 
+/// Parse command arguments respecting quoted strings (bash-style).
+/// Mirrors upstream parseCommandArgs (prompt-templates.ts) exactly:
+/// - single/double quotes toggle quoting; the quote characters are stripped
+/// - whitespace (JS `\s` ASCII subset) splits args only when the current token
+///   is non-empty, so empty quotes (e.g. `''`) yield no argument
+/// - backslashes are NOT escape characters; they are literal token bytes
 fn parseTemplateArgs(allocator: std.mem.Allocator, args_text: []const u8) ![][]u8 {
     var args: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -1451,40 +1686,25 @@ fn parseTemplateArgs(allocator: std.mem.Allocator, args_text: []const u8) ![][]u
     var current: std.ArrayList(u8) = .empty;
     defer current.deinit(allocator);
     var quote: ?u8 = null;
-    var escaped = false;
-    var arg_started = false;
     for (args_text) |char| {
-        if (escaped) {
-            try current.append(allocator, char);
-            escaped = false;
-            arg_started = true;
-        } else if (char == '\\') {
-            escaped = true;
-            arg_started = true;
-        } else if (quote) |quote_char| {
+        if (quote) |quote_char| {
             if (char == quote_char) {
                 quote = null;
-                arg_started = true;
             } else {
                 try current.append(allocator, char);
-                arg_started = true;
             }
         } else if (char == '"' or char == '\'') {
             quote = char;
-            arg_started = true;
-        } else if (isAsciiWhitespace(char)) {
-            if (arg_started) {
+        } else if (std.ascii.isWhitespace(char)) {
+            if (current.items.len > 0) {
                 try appendTemplateArg(allocator, &args, current.items);
                 current.clearRetainingCapacity();
-                arg_started = false;
             }
         } else {
             try current.append(allocator, char);
-            arg_started = true;
         }
     }
-    if (escaped) try current.append(allocator, '\\');
-    if (arg_started) {
+    if (current.items.len > 0) {
         try appendTemplateArg(allocator, &args, current.items);
         current.clearRetainingCapacity();
     }
@@ -1502,10 +1722,19 @@ fn freeStringList(allocator: std.mem.Allocator, values: []const []u8) void {
     if (values.len > 0) allocator.free(values);
 }
 
+/// Substitute argument placeholders in template content.
+/// Mirrors upstream substituteArgs (prompt-templates.ts):
+/// - $1, $2, ... positional args (1-indexed; out-of-range yields "")
+/// - ${@:start} / ${@:start:length} bash-style slices (1-indexed; 0 treated as 1)
+/// - $ARGUMENTS and $@ expand to all parsed args joined by a single space
+///
+/// Upstream joins the PARSED args (`args.join(" ")`), so quote characters are
+/// dropped and internal whitespace runs collapse to single spaces — it never
+/// re-emits the raw invocation text. Substitution runs once over the template
+/// only; inserted argument values are not re-scanned for placeholders.
 fn substituteTemplateArgs(
     allocator: std.mem.Allocator,
     content: []const u8,
-    raw_args: []const u8,
     args: []const []u8,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -1518,12 +1747,12 @@ fn substituteTemplateArgs(
             continue;
         }
         if (index + "$ARGUMENTS".len <= content.len and std.mem.eql(u8, content[index .. index + "$ARGUMENTS".len], "$ARGUMENTS")) {
-            try out.writer.writeAll(raw_args);
+            try appendJoinedArgs(&out.writer, args, 0, std.math.maxInt(usize));
             index += "$ARGUMENTS".len;
             continue;
         }
         if (index + 2 <= content.len and content[index + 1] == '@') {
-            try out.writer.writeAll(raw_args);
+            try appendJoinedArgs(&out.writer, args, 0, std.math.maxInt(usize));
             index += 2;
             continue;
         }
@@ -1661,4 +1890,298 @@ test "frontmatter parser extracts command metadata" {
     );
     try std.testing.expectEqualStrings("brave-search", parsed.value("name").?);
     try std.testing.expectEqualStrings("Web search via Brave API", parsed.value("description").?);
+}
+
+// Mirrors expandPromptTemplateFile's arg pipeline: parse the raw invocation
+// args, then substitute placeholders in `content`. Lets tests pin behavior
+// against upstream parseCommandArgs/substituteArgs without touching the fs.
+fn substituteForTest(allocator: std.mem.Allocator, content: []const u8, args_text: []const u8) ![]u8 {
+    const args = try parseTemplateArgs(allocator, args_text);
+    defer freeStringList(allocator, args);
+    return substituteTemplateArgs(allocator, content, args);
+}
+
+test "parseTemplateArgs matches upstream parseCommandArgs (no escapes, quote stripping)" {
+    const allocator = std.testing.allocator;
+
+    // Backslash is a literal byte upstream (parseCommandArgs has no escape case).
+    {
+        const args = try parseTemplateArgs(allocator, "a\\ b");
+        defer freeStringList(allocator, args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("a\\", args[0]);
+        try std.testing.expectEqualStrings("b", args[1]);
+    }
+
+    // Quotes are stripped; whitespace inside quotes is preserved.
+    {
+        const args = try parseTemplateArgs(allocator, "\"a b\"  'c d'");
+        defer freeStringList(allocator, args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("a b", args[0]);
+        try std.testing.expectEqualStrings("c d", args[1]);
+    }
+
+    // Empty quotes produce no argument (upstream pushes only when current!="").
+    {
+        const args = try parseTemplateArgs(allocator, "x '' y");
+        defer freeStringList(allocator, args);
+        try std.testing.expectEqual(@as(usize, 2), args.len);
+        try std.testing.expectEqualStrings("x", args[0]);
+        try std.testing.expectEqualStrings("y", args[1]);
+    }
+}
+
+test "substituteTemplateArgs joins parsed args with single space for \\$@ and \\$ARGUMENTS" {
+    const allocator = std.testing.allocator;
+
+    // $@ / $ARGUMENTS collapse internal whitespace and drop quotes (args.join(" ")).
+    {
+        const out = try substituteForTest(allocator, "[$@]", "\"a  b\"   c");
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("[a  b c]", out);
+    }
+    {
+        const out = try substituteForTest(allocator, "<$ARGUMENTS>", "one   two");
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("<one two>", out);
+    }
+}
+
+test "substituteTemplateArgs positional and slice placeholders" {
+    const allocator = std.testing.allocator;
+
+    {
+        const out = try substituteForTest(allocator, "$1-$2-$3", "alpha beta");
+        defer allocator.free(out);
+        // $3 is out of range -> empty, matching args[index] ?? "".
+        try std.testing.expectEqualStrings("alpha-beta-", out);
+    }
+    {
+        // $0 is out of range upstream (parseInt("0")-1 = -1).
+        const out = try substituteForTest(allocator, "[$0]", "alpha");
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("[]", out);
+    }
+    {
+        // ${@:2} -> args from 2nd onward; ${@:2:1} -> one arg starting at 2nd.
+        const out = try substituteForTest(allocator, "${@:2}|${@:2:1}", "a b c d");
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("b c d|b", out);
+    }
+    {
+        // ${@:0} behaves like ${@:1} (bash convention: start clamps to first).
+        const out = try substituteForTest(allocator, "${@:0}", "a b");
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("a b", out);
+    }
+}
+
+test "substituteTemplateArgs does not re-substitute inserted argument values" {
+    const allocator = std.testing.allocator;
+    // Arg value contains "$2"; it must be emitted literally, not expanded.
+    const out = try substituteForTest(allocator, "$1 then $2", "$2 second");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("$2 then second", out);
+}
+
+test "reloadCommandsJson re-discovers prompts added after the first call" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    // Use a cwd-relative temp prompts dir (mirrors the repo's zig-out fixture
+    // convention) so reload picks up files exactly like the real CLI does.
+    const dir = "zig-out/pi-zig-reload-test-prompts";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+
+    // Reload with only this (empty) dir as an additional prompt path: the new
+    // command must be absent before the file exists.
+    const options = Options{
+        .additional_prompt_paths = &.{dir},
+        .no_skills = true,
+        .no_prompt_templates = true,
+    };
+
+    const before = try reloadCommandsJson(io, allocator, options);
+    defer allocator.free(before);
+    try std.testing.expect(std.mem.indexOf(u8, before, "\"name\":\"reload-probe\"") == null);
+
+    // Add a prompt template, then reload again on demand.
+    const prompt_path = dir ++ "/reload-probe.md";
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = prompt_path,
+        .data = "---\ndescription: freshly added\n---\nBody for $1\n",
+    });
+
+    const after = try reloadCommandsJson(io, allocator, options);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"name\":\"reload-probe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"source\":\"prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"description\":\"freshly added\"") != null);
+
+    // Round-trip the other direction: removing the file and reloading drops it,
+    // proving there is no stale in-memory cache.
+    try std.Io.Dir.cwd().deleteFile(io, prompt_path);
+    const after_remove = try reloadCommandsJson(io, allocator, options);
+    defer allocator.free(after_remove);
+    try std.testing.expect(std.mem.indexOf(u8, after_remove, "\"name\":\"reload-probe\"") == null);
+}
+
+test "writeCommandsDataJson dedups colliding prompt names keeping the first (highest precedence)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const dir_a = "zig-out/pi-zig-dedup-test-a";
+    const dir_b = "zig-out/pi-zig-dedup-test-b";
+    for ([_][]const u8{ dir_a, dir_b }) |dir| {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+    }
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir_a) catch {};
+        std.Io.Dir.cwd().deleteTree(io, dir_b) catch {};
+    }
+
+    // Same prompt name "dup" in two paths with distinct descriptions.
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dir_a ++ "/dup.md",
+        .data = "---\ndescription: winner from a\n---\nBody A\n",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dir_b ++ "/dup.md",
+        .data = "---\ndescription: loser from b\n---\nBody B\n",
+    });
+
+    // dir_a is listed first, so its "dup" must win and the duplicate is dropped.
+    const paths = [_][]const u8{ dir_a, dir_b };
+    const json = try reloadCommandsJson(io, allocator, .{
+        .additional_prompt_paths = &paths,
+        .no_skills = true,
+        .no_prompt_templates = true,
+    });
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const list = parsed.value.object.get("commands").?.array.items;
+
+    var dup_count: usize = 0;
+    var winning_description: []const u8 = "";
+    for (list) |entry| {
+        const name = objectString(entry, "name") orelse continue;
+        if (!std.mem.eql(u8, name, "dup")) continue;
+        dup_count += 1;
+        winning_description = objectString(entry, "description") orelse "";
+    }
+    try std.testing.expectEqual(@as(usize, 1), dup_count);
+    try std.testing.expectEqualStrings("winner from a", winning_description);
+}
+
+test "writeCommandsDataJson emits an upstream-shaped collision diagnostic for a shadowed duplicate" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const dir_a = "zig-out/pi-zig-collision-test-a";
+    const dir_b = "zig-out/pi-zig-collision-test-b";
+    for ([_][]const u8{ dir_a, dir_b }) |dir| {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+    }
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir_a) catch {};
+        std.Io.Dir.cwd().deleteTree(io, dir_b) catch {};
+    }
+
+    // Same prompt name "dup" in two paths; dir_a is listed first so it wins.
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dir_a ++ "/dup.md",
+        .data = "---\ndescription: winner from a\n---\nBody A\n",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dir_b ++ "/dup.md",
+        .data = "---\ndescription: loser from b\n---\nBody B\n",
+    });
+
+    const paths = [_][]const u8{ dir_a, dir_b };
+    const json = try reloadCommandsJson(io, allocator, .{
+        .additional_prompt_paths = &paths,
+        .no_skills = true,
+        .no_prompt_templates = true,
+    });
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    // Winner is unchanged: exactly one "dup" command, from dir_a.
+    const list = parsed.value.object.get("commands").?.array.items;
+    var dup_count: usize = 0;
+    for (list) |entry| {
+        if (std.mem.eql(u8, objectString(entry, "name") orelse "", "dup")) dup_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), dup_count);
+
+    // Exactly one collision diagnostic, matching upstream dedupePrompts shape.
+    const diagnostics = parsed.value.object.get("diagnostics").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    const diag = diagnostics[0];
+    try std.testing.expectEqualStrings("collision", objectString(diag, "type").?);
+    try std.testing.expectEqualStrings("name \"/dup\" collision", objectString(diag, "message").?);
+    // path is the loser path (dir_b), exactly as upstream `path: prompt.filePath`.
+    try std.testing.expect(std.mem.indexOf(u8, objectString(diag, "path").?, dir_b) != null);
+
+    const collision = diag.object.get("collision").?;
+    try std.testing.expectEqualStrings("prompt", objectString(collision, "resourceType").?);
+    try std.testing.expectEqualStrings("dup", objectString(collision, "name").?);
+    try std.testing.expect(std.mem.indexOf(u8, objectString(collision, "winnerPath").?, dir_a) != null);
+    try std.testing.expect(std.mem.indexOf(u8, objectString(collision, "loserPath").?, dir_b) != null);
+}
+
+test "writeCommandsDataJson emits a skill collision diagnostic with the bare skill name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const dir_a = "zig-out/pi-zig-collision-skill-a";
+    const dir_b = "zig-out/pi-zig-collision-skill-b";
+    for ([_][]const u8{ dir_a, dir_b }) |dir| {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+    }
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir_a) catch {};
+        std.Io.Dir.cwd().deleteTree(io, dir_b) catch {};
+    }
+
+    // Two SKILL.md files declaring the same skill name "dupskill".
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dir_a ++ "/SKILL.md",
+        .data = "---\nname: dupskill\ndescription: winner skill\n---\nBody A\n",
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = dir_b ++ "/SKILL.md",
+        .data = "---\nname: dupskill\ndescription: loser skill\n---\nBody B\n",
+    });
+
+    const paths = [_][]const u8{ dir_a, dir_b };
+    const json = try reloadCommandsJson(io, allocator, .{
+        .additional_skill_paths = &paths,
+        .no_skills = true,
+        .no_prompt_templates = true,
+    });
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const diagnostics = parsed.value.object.get("diagnostics").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    const diag = diagnostics[0];
+    try std.testing.expectEqualStrings("collision", objectString(diag, "type").?);
+    // Skill messages use the bare name with no leading slash (upstream skills.ts).
+    try std.testing.expectEqualStrings("name \"dupskill\" collision", objectString(diag, "message").?);
+    const collision = diag.object.get("collision").?;
+    try std.testing.expectEqualStrings("skill", objectString(collision, "resourceType").?);
+    try std.testing.expectEqualStrings("dupskill", objectString(collision, "name").?);
 }

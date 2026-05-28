@@ -620,6 +620,17 @@ pub const PersistentStore = struct {
         try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
     }
 
+    /// Optional provenance metadata for an LLM-generated compaction summary.
+    /// When present, the compaction is recorded with `local:false` plus the
+    /// provider/model that produced the summary. When absent the legacy
+    /// `local:true` static-summary shape is written, keeping existing readers
+    /// (loadCompactionEntry only consumes summary/firstKeptEntryId/tokensBefore)
+    /// fully backward-compatible.
+    pub const CompactionProvider = struct {
+        provider: []const u8,
+        model: []const u8,
+    };
+
     pub fn appendCompaction(
         self: *PersistentStore,
         io: std.Io,
@@ -629,6 +640,7 @@ pub const PersistentStore = struct {
         tokens_before: usize,
         custom_instructions: ?[]const u8,
         message_count: usize,
+        provider_meta: ?CompactionProvider,
     ) ![]const u8 {
         var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
         const id = try self.nextEntryId(&entry_id_buf);
@@ -647,13 +659,59 @@ pub const PersistentStore = struct {
         try writeJsonString(w, first_kept_entry_id);
         try w.writeAll(",\"tokensBefore\":");
         try w.print("{d}", .{tokens_before});
-        try w.writeAll(",\"details\":{\"local\":true,\"messageCount\":");
+        if (provider_meta) |meta| {
+            try w.writeAll(",\"details\":{\"local\":false,\"provider\":");
+            try writeJsonString(w, meta.provider);
+            try w.writeAll(",\"model\":");
+            try writeJsonString(w, meta.model);
+            try w.writeAll(",\"messageCount\":");
+        } else {
+            try w.writeAll(",\"details\":{\"local\":true,\"messageCount\":");
+        }
         try w.print("{d}", .{message_count});
         if (custom_instructions) |instructions| {
             try w.writeAll(",\"customInstructions\":");
             try writeJsonString(w, instructions);
         }
         try w.writeAll("}}\n");
+        try appendBytes(io, self.path(), out.written());
+        try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
+        return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+
+    // [FLOW_G_SESSION_TREE] Append a branch_summary entry (upstream session-manager.ts
+    // branchWithSummary / BranchSummaryEntry): when navigateTree abandons a branch with
+    // summarization on, a branch_summary captures the abandoned path's context at the
+    // navigation-target position. Shape mirrors upstream
+    // {type,id,parentId,timestamp,fromId,summary,fromHook}; `from_id` is the target the
+    // leaf moved to ("root" when null), and `from_hook` is false for pi-generated
+    // summaries (the html exporter + tree preview already recognize branch_summary).
+    pub fn appendBranchSummary(
+        self: *PersistentStore,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        summary: []const u8,
+        from_id: []const u8,
+        from_hook: bool,
+    ) ![]const u8 {
+        var entry_id_buf: [max_entry_id_bytes]u8 = undefined;
+        const id = try self.nextEntryId(&entry_id_buf);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"type\":\"branch_summary\",\"id\":");
+        try writeJsonString(w, id);
+        try w.writeAll(",\"parentId\":");
+        try self.writeLeafParent(w);
+        try w.writeAll(",\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll(",\"fromId\":");
+        try writeJsonString(w, from_id);
+        try w.writeAll(",\"summary\":");
+        try writeJsonString(w, summary);
+        try w.writeAll(",\"fromHook\":");
+        try w.writeAll(if (from_hook) "true" else "false");
+        try w.writeAll("}\n");
         try appendBytes(io, self.path(), out.written());
         try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, id);
         return self.leaf_id_buf[0..self.leaf_id_len];
@@ -703,6 +761,211 @@ pub const PersistentStore = struct {
         self.bash_executions += 1;
         return self.leaf_id_buf[0..self.leaf_id_len];
     }
+
+    // ===== [FLOW_G_SESSION_TREE] begin same-file tree navigation =====
+    // Mirrors upstream/pi/packages/coding-agent/src/core/session-manager.ts
+    // getTree()/branch()/resetLeaf()/getLeafId() and agent-session.ts navigateTree():
+    // the session JSONL is an append-only id/parentId tree; the "leaf" pointer marks
+    // the active branch tip. Branch switching moves the leaf to an earlier entry by
+    // appending a `{"type":"leaf","targetId":...}` record (already honored by
+    // loadExisting above) WITHOUT creating a new file (that is fork/clone's job).
+    pub const tree_max_nodes = 512;
+    const tree_max_preview_bytes = 80;
+
+    pub const TreeNode = struct {
+        id_buf: [max_entry_id_bytes]u8 = undefined,
+        id_len: usize = 0,
+        parent_buf: [max_entry_id_bytes]u8 = undefined,
+        parent_len: usize = 0,
+        has_parent: bool = false,
+        kind_buf: [32]u8 = undefined,
+        kind_len: usize = 0,
+        role_buf: [24]u8 = undefined,
+        role_len: usize = 0,
+        preview_buf: [tree_max_preview_bytes]u8 = undefined,
+        preview_len: usize = 0,
+
+        pub fn id(self: *const TreeNode) []const u8 {
+            return self.id_buf[0..self.id_len];
+        }
+
+        pub fn parentId(self: *const TreeNode) ?[]const u8 {
+            if (!self.has_parent) return null;
+            return self.parent_buf[0..self.parent_len];
+        }
+
+        pub fn kind(self: *const TreeNode) []const u8 {
+            return self.kind_buf[0..self.kind_len];
+        }
+
+        pub fn role(self: *const TreeNode) ?[]const u8 {
+            if (self.role_len == 0) return null;
+            return self.role_buf[0..self.role_len];
+        }
+
+        pub fn preview(self: *const TreeNode) []const u8 {
+            return self.preview_buf[0..self.preview_len];
+        }
+    };
+
+    pub const SessionTree = struct {
+        nodes: [tree_max_nodes]TreeNode = undefined,
+        count: usize = 0,
+
+        pub fn slice(self: *const SessionTree) []const TreeNode {
+            return self.nodes[0..self.count];
+        }
+
+        pub fn contains(self: *const SessionTree, target_id: []const u8) bool {
+            for (self.nodes[0..self.count]) |*node| {
+                if (std.mem.eql(u8, node.id(), target_id)) return true;
+            }
+            return false;
+        }
+    };
+
+    /// Parse the durable JSONL into a flat node list carrying id/parentId/type so
+    /// callers can reconstruct the tree (upstream getTree()). The session header is
+    /// excluded; `leaf` entries are pointer updates, not nodes. Non-fatal: malformed
+    /// individual entries are skipped so a partially written tail never breaks reads.
+    /// Heap-friendly variant of readTree: fills the caller-provided `out` pointer
+    /// in place, with NO return-by-value of the 128 KB SessionTree. Use this on
+    /// any code path where stack pressure matters (worker threads, the test
+    /// runner, or callers that compose multiple frames before this call).
+    pub fn readTreeInto(self: *const PersistentStore, io: std.Io, allocator: std.mem.Allocator, out: *SessionTree) !void {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, self.path(), allocator, .limited(16 * 1024 * 1024));
+        defer allocator.free(bytes);
+
+        out.* = .{};
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        var saw_header = false;
+        while (lines.next()) |raw_line| {
+            const line = stripTrailingCarriageReturn(raw_line);
+            if (std.mem.trim(u8, line, " \t").len == 0) continue;
+
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const object = parsed.value.object;
+            const entry_type = getStringFieldObject(object, "type") orelse continue;
+            if (!saw_header) {
+                saw_header = true;
+                if (std.mem.eql(u8, entry_type, "session")) continue;
+            }
+            if (std.mem.eql(u8, entry_type, "session")) continue;
+            if (std.mem.eql(u8, entry_type, "leaf")) continue;
+            const id = getStringFieldObject(object, "id") orelse continue;
+            if (id.len > max_entry_id_bytes) continue;
+            if (out.count >= tree_max_nodes) break;
+
+            var node = &out.nodes[out.count];
+            node.* = .{};
+            @memcpy(node.id_buf[0..id.len], id);
+            node.id_len = id.len;
+            switch (object.get("parentId") orelse std.json.Value.null) {
+                .string => |parent| {
+                    if (parent.len <= max_entry_id_bytes) {
+                        @memcpy(node.parent_buf[0..parent.len], parent);
+                        node.parent_len = parent.len;
+                        node.has_parent = true;
+                    }
+                },
+                else => node.has_parent = false,
+            }
+            copyTreeField(&node.kind_buf, &node.kind_len, entry_type);
+            fillTreePreview(node, object, entry_type);
+            out.count += 1;
+        }
+    }
+
+    pub fn readTree(self: *const PersistentStore, io: std.Io, allocator: std.mem.Allocator) !SessionTree {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, self.path(), allocator, .limited(16 * 1024 * 1024));
+        defer allocator.free(bytes);
+
+        // Heap-allocate the working tree: SessionTree is ~128 KB (tree_max_nodes
+        // fixed-size TreeNodes), which overflows worker/test thread stacks if held
+        // as a value-type local. Return-by-value still works via RVO into the
+        // caller's slot, so the public signature is preserved.
+        const tree_ptr = try allocator.create(SessionTree);
+        defer allocator.destroy(tree_ptr);
+        tree_ptr.* = .{};
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        var saw_header = false;
+        while (lines.next()) |raw_line| {
+            const line = stripTrailingCarriageReturn(raw_line);
+            if (std.mem.trim(u8, line, " \t").len == 0) continue;
+
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const object = parsed.value.object;
+            const entry_type = getStringFieldObject(object, "type") orelse continue;
+            if (!saw_header) {
+                saw_header = true;
+                if (std.mem.eql(u8, entry_type, "session")) continue;
+            }
+            if (std.mem.eql(u8, entry_type, "session")) continue;
+            if (std.mem.eql(u8, entry_type, "leaf")) continue;
+            const id = getStringFieldObject(object, "id") orelse continue;
+            if (id.len > max_entry_id_bytes) continue;
+            if (tree_ptr.count >= tree_max_nodes) break;
+
+            var node = &tree_ptr.nodes[tree_ptr.count];
+            node.* = .{};
+            @memcpy(node.id_buf[0..id.len], id);
+            node.id_len = id.len;
+            switch (object.get("parentId") orelse std.json.Value.null) {
+                .string => |parent| {
+                    if (parent.len <= max_entry_id_bytes) {
+                        @memcpy(node.parent_buf[0..parent.len], parent);
+                        node.parent_len = parent.len;
+                        node.has_parent = true;
+                    }
+                },
+                else => node.has_parent = false,
+            }
+            copyTreeField(&node.kind_buf, &node.kind_len, entry_type);
+            fillTreePreview(node, object, entry_type);
+            tree_ptr.count += 1;
+        }
+        return tree_ptr.*;
+    }
+
+    /// Move the active leaf pointer to `target_id` (upstream branch()/navigateTree()).
+    /// Appends a durable `leaf` record so a later reload restores the same branch tip,
+    /// staying in the SAME file. The target must already exist in the tree.
+    pub fn setLeaf(self: *PersistentStore, io: std.Io, allocator: std.mem.Allocator, target_id: []const u8) !void {
+        if (target_id.len > max_entry_id_bytes) return error.ValueTooLong;
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"type\":\"leaf\",\"targetId\":");
+        try writeJsonString(w, target_id);
+        try w.writeAll(",\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll("}\n");
+        try appendBytes(io, self.path(), out.written());
+        try copyBounded(&self.leaf_id_buf, &self.leaf_id_len, target_id);
+    }
+
+    /// Reset the leaf pointer to before any entries (upstream resetLeaf()). Used when
+    /// navigating to the root so the next append starts a fresh branch at parentId=null.
+    pub fn resetLeaf(self: *PersistentStore, io: std.Io, allocator: std.mem.Allocator) !void {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"type\":\"leaf\",\"targetId\":null,\"timestamp\":");
+        try writeJsonString(w, timestampString(io));
+        try w.writeAll("}\n");
+        try appendBytes(io, self.path(), out.written());
+        self.leaf_id_len = 0;
+    }
+
+    pub fn leafId(self: *const PersistentStore) ?[]const u8 {
+        if (self.leaf_id_len == 0) return null;
+        return self.leaf_id_buf[0..self.leaf_id_len];
+    }
+    // ===== [FLOW_G_SESSION_TREE] end same-file tree navigation =====
 
     fn refreshSessionId(self: *PersistentStore, io: std.Io) !void {
         const now = std.Io.Clock.real.now(io).nanoseconds;
@@ -998,6 +1261,66 @@ fn copyBounded(buffer: []u8, len: *usize, value: []const u8) !void {
     len.* = value.len;
 }
 
+// [FLOW_G_SESSION_TREE] Copy at most buffer.len bytes (truncating, never failing)
+// into a bounded tree-node field. Tree previews/kinds are advisory display data, so
+// over-long values are clipped rather than rejecting the whole entry.
+fn copyTreeField(buffer: []u8, len: *usize, value: []const u8) void {
+    const n = @min(value.len, buffer.len);
+    @memcpy(buffer[0..n], value[0..n]);
+    len.* = n;
+}
+
+// [FLOW_G_SESSION_TREE] Fill a node's role + short preview for tree display. Mirrors
+// the kind of summary upstream surfaces per tree node (message role/text, compaction
+// summary, bash command). Pure best-effort: missing fields just yield an empty preview.
+fn fillTreePreview(node: *PersistentStore.TreeNode, object: std.json.ObjectMap, entry_type: []const u8) void {
+    if (std.mem.eql(u8, entry_type, "message")) {
+        const message = object.get("message") orelse return;
+        if (message != .object) return;
+        if (getStringFieldObject(message.object, "role")) |role| {
+            copyTreeField(&node.role_buf, &node.role_len, role);
+        }
+        if (std.mem.eql(u8, node.role_buf[0..node.role_len], "bashExecution")) {
+            if (getStringFieldObject(message.object, "command")) |command| {
+                copyTreePreview(node, command);
+            }
+            return;
+        }
+        copyTreePreviewFromContent(node, message.object.get("content") orelse .null);
+    } else if (std.mem.eql(u8, entry_type, "compaction")) {
+        if (getStringFieldObject(object, "summary")) |summary| copyTreePreview(node, summary);
+    } else if (std.mem.eql(u8, entry_type, "branch_summary")) {
+        if (getStringFieldObject(object, "summary")) |summary| copyTreePreview(node, summary);
+    } else if (std.mem.eql(u8, entry_type, "custom_message")) {
+        copyTreePreviewFromContent(node, object.get("content") orelse .null);
+    } else if (std.mem.eql(u8, entry_type, "session_info")) {
+        if (getStringFieldObject(object, "name")) |name| copyTreePreview(node, name);
+    }
+}
+
+fn copyTreePreviewFromContent(node: *PersistentStore.TreeNode, content: std.json.Value) void {
+    switch (content) {
+        .string => |text| copyTreePreview(node, text),
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .object) continue;
+                const block_type = getStringFieldObject(item.object, "type") orelse continue;
+                if (!std.mem.eql(u8, block_type, "text")) continue;
+                if (getStringFieldObject(item.object, "text")) |text| {
+                    copyTreePreview(node, text);
+                    return;
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn copyTreePreview(node: *PersistentStore.TreeNode, text: []const u8) void {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    copyTreeField(&node.preview_buf, &node.preview_len, trimmed);
+}
+
 fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
     const hex = "0123456789abcdef";
     try w.writeByte('"');
@@ -1091,6 +1414,94 @@ test "persistent session store rejects invalid raw custom entry JSON" {
     try std.testing.expectEqual(@as(usize, 0), store.entry_counter);
 }
 
+test "persistent session store records llm compaction provenance and stays reloadable" {
+    const path = "zig-out/pi-zig-session-llm-compaction-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try PersistentStore.init(std.testing.io, std.testing.allocator, path);
+    const user_id = try store.appendMessage(std.testing.io, std.testing.allocator, .user, "first turn");
+    const first_kept = try std.testing.allocator.dupe(u8, user_id);
+    defer std.testing.allocator.free(first_kept);
+
+    _ = try store.appendCompaction(
+        std.testing.io,
+        std.testing.allocator,
+        "LLM COMPACTION SUMMARY: alpha",
+        first_kept,
+        128,
+        null,
+        1,
+        .{ .provider = "openai", .model = "gpt-4o" },
+    );
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    // LLM-generated compaction marks local:false and records provenance.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"local\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"provider\":\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"model\":\"gpt-4o\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "LLM COMPACTION SUMMARY: alpha") != null);
+
+    // The compaction entry must survive reopen (existing readers only need the
+    // header to parse; the additive details fields are ignored gracefully).
+    const reloaded = try PersistentStore.open(std.testing.io, std.testing.allocator, path);
+    try std.testing.expect(reloaded.sessionId().len > 0);
+}
+
+test "[FLOW_G_SESSION_TREE] persistent session store appends an upstream-shaped branch_summary" {
+    const path = "zig-out/pi-zig-session-branch-summary-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try PersistentStore.init(std.testing.io, std.testing.allocator, path);
+    const first = try store.appendMessage(std.testing.io, std.testing.allocator, .user, "root question");
+    const first_id = try std.testing.allocator.dupe(u8, first);
+    defer std.testing.allocator.free(first_id);
+
+    const summary_id = try store.appendBranchSummary(
+        std.testing.io,
+        std.testing.allocator,
+        "## Goal\nabandoned branch work",
+        first_id,
+        false,
+    );
+    try std.testing.expectEqualStrings("m-2", summary_id);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    // Upstream BranchSummaryEntry shape: type/id/parentId/fromId/summary/fromHook.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"type\":\"branch_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"fromId\":\"m-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"parentId\":\"m-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"fromHook\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "abandoned branch work") != null);
+
+    // The branch_summary surfaces as a tree node with a preview (readTree + fillTreePreview
+    // already recognize it) and the entry survives reopen.
+    var tree = try store.readTree(std.testing.io, std.testing.allocator);
+    var found = false;
+    for (tree.slice()) |*node| {
+        if (std.mem.eql(u8, node.id(), "m-2")) {
+            try std.testing.expectEqualStrings("branch_summary", node.kind());
+            try std.testing.expect(node.preview().len > 0);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+
+    const reloaded = try PersistentStore.open(std.testing.io, std.testing.allocator, path);
+    try std.testing.expectEqualStrings("m-2", reloaded.leafId().?);
+}
+
+test "persistent session store keeps legacy local compaction shape without provenance" {
+    const path = "zig-out/pi-zig-session-local-compaction-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try PersistentStore.init(std.testing.io, std.testing.allocator, path);
+    _ = try store.appendCompaction(std.testing.io, std.testing.allocator, "Local summary of 0 message(s).", "", 1, null, 0, null);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"local\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"provider\"") == null);
+}
+
 test "persistent session store opens existing jsonl without truncating" {
     const path = "zig-out/pi-zig-session-open-test.jsonl";
     std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
@@ -1102,4 +1513,64 @@ test "persistent session store opens existing jsonl without truncating" {
     try std.testing.expectEqual(@as(usize, 1), loaded.user_messages);
     try std.testing.expectEqual(@as(usize, 1), loaded.totalMessages());
     try std.testing.expect(loaded.sessionId().len > 0);
+}
+
+test "session tree exposes id/parentId structure with previews" {
+    const path = "zig-out/pi-zig-session-tree-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try PersistentStore.init(std.testing.io, std.testing.allocator, path);
+    _ = try store.appendMessage(std.testing.io, std.testing.allocator, .user, "root question");
+    _ = try store.appendMessage(std.testing.io, std.testing.allocator, .assistant, "first answer");
+
+    var tree = try store.readTree(std.testing.io, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), tree.count);
+    const nodes = tree.slice();
+    try std.testing.expectEqualStrings("m-1", nodes[0].id());
+    try std.testing.expectEqual(@as(?[]const u8, null), nodes[0].parentId());
+    try std.testing.expectEqualStrings("message", nodes[0].kind());
+    try std.testing.expectEqualStrings("user", nodes[0].role().?);
+    try std.testing.expectEqualStrings("root question", nodes[0].preview());
+    // The second message is a child of the first (parentId chains the tree).
+    try std.testing.expectEqualStrings("m-2", nodes[1].id());
+    try std.testing.expectEqualStrings("m-1", nodes[1].parentId().?);
+    try std.testing.expect(tree.contains("m-1"));
+    try std.testing.expect(!tree.contains("m-99"));
+}
+
+test "session tree leaf move branches in the same file and survives reload" {
+    const path = "zig-out/pi-zig-session-tree-branch-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try PersistentStore.init(std.testing.io, std.testing.allocator, path);
+    const first = try store.appendMessage(std.testing.io, std.testing.allocator, .user, "alpha");
+    const first_id = try std.testing.allocator.dupe(u8, first);
+    defer std.testing.allocator.free(first_id);
+    _ = try store.appendMessage(std.testing.io, std.testing.allocator, .assistant, "alpha reply");
+    try std.testing.expectEqualStrings("m-2", store.leafId().?);
+
+    // Branch back onto the first user message: the leaf moves WITHOUT a new file.
+    try store.setLeaf(std.testing.io, std.testing.allocator, first_id);
+    try std.testing.expectEqualStrings("m-1", store.leafId().?);
+
+    // The next append becomes a sibling branch (parentId == first_id).
+    _ = try store.appendMessage(std.testing.io, std.testing.allocator, .assistant, "alpha reply v2");
+    var tree = try store.readTree(std.testing.io, std.testing.allocator);
+    var children_of_first: usize = 0;
+    for (tree.slice()) |*node| {
+        if (node.parentId()) |parent| {
+            if (std.mem.eql(u8, parent, first_id)) children_of_first += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), children_of_first);
+
+    // Reload restores the branch tip from the durable leaf record.
+    const reloaded = try PersistentStore.open(std.testing.io, std.testing.allocator, path);
+    try std.testing.expectEqualStrings("m-3", reloaded.leafId().?);
+}
+
+test "session tree setLeaf rejects oversized target ids" {
+    const path = "zig-out/pi-zig-session-tree-reject-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var store = try PersistentStore.init(std.testing.io, std.testing.allocator, path);
+    const oversized = "x" ** (max_entry_id_bytes + 1);
+    try std.testing.expectError(error.ValueTooLong, store.setLeaf(std.testing.io, std.testing.allocator, oversized));
 }

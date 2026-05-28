@@ -439,6 +439,18 @@ fn resolveApiKeyMutable(
     if (findEnvKey(env, provider)) |key| {
         if (env.get(key)) |value| return try allocator.dupe(u8, value);
     }
+    if (std.mem.eql(u8, provider, "google-vertex")) {
+        // Only the disk-backed callers (which pass refreshed_out) may mint a Vertex
+        // access token over the network, mirroring how resolveExpiredOAuth gates its
+        // refresh. When GOOGLE_CLOUD_ACCESS_TOKEN is present, ai_client resolves the
+        // bearer from env via the <authenticated> placeholder, so ADC minting is only
+        // attempted when Application Default Credentials are the credential source.
+        if (refreshed_out != null and !hasAnyEnv(env, &.{"GOOGLE_CLOUD_ACCESS_TOKEN"})) {
+            if (try mintVertexAdcToken(io, allocator, env)) |access_token| {
+                return access_token;
+            }
+        }
+    }
     if (hasAmbientProviderAuth(env, provider) != null) return try allocator.dupe(u8, "<authenticated>");
     return null;
 }
@@ -761,6 +773,697 @@ fn chatGptAccountIdFromAccessToken(allocator: std.mem.Allocator, access_token: [
     return try allocator.dupe(u8, account_id.string);
 }
 
+// --- Google Vertex Application Default Credentials (ADC) ---------------------
+//
+// gcloud writes Application Default Credentials to a JSON file containing one of
+// two grant types:
+//
+//   * authorized_user: { client_id, client_secret, refresh_token, type }. We
+//     exchange the refresh_token at Google's OAuth2 token endpoint for a
+//     short-lived ya29.* access token (the same request @google/genai's GoogleAuth
+//     issues).
+//   * service_account: { client_email, private_key, token_uri, type, ... }. We
+//     build and RS256-sign a JWT assertion with the service-account private key
+//     (RFC 7523 jwt-bearer grant) and exchange it for an access token. RS256
+//     signing is implemented over std.crypto primitives (SHA-256 + RSA modular
+//     exponentiation via std.crypto.ff); no external SDK is used.
+//
+// Upstream's Vertex provider delegates to @google/genai; both flows mirror what
+// GoogleAuth performs for the corresponding credential file.
+
+const google_oauth_token_url = "https://oauth2.googleapis.com/token";
+const google_token_scope = "https://www.googleapis.com/auth/cloud-platform";
+const jwt_bearer_grant_type = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// Resolution order for the ADC file path:
+///   1. GOOGLE_APPLICATION_CREDENTIALS (explicit override, gcloud-standard env var)
+///   2. $CLOUDSDK_CONFIG/application_default_credentials.json
+///   3. $HOME/.config/gcloud/application_default_credentials.json (gcloud default)
+/// Returns null when no candidate path exists on disk.
+fn vertexAdcPath(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
+    if (env.get("GOOGLE_APPLICATION_CREDENTIALS")) |explicit| {
+        const trimmed = std.mem.trim(u8, explicit, " \t\r\n");
+        if (trimmed.len > 0) return try expandMaybeTilde(allocator, env, trimmed);
+    }
+    if (env.get("CLOUDSDK_CONFIG")) |config_dir| {
+        const trimmed = std.mem.trim(u8, config_dir, " \t\r\n");
+        if (trimmed.len > 0) {
+            const expanded = try expandMaybeTilde(allocator, env, trimmed);
+            defer allocator.free(expanded);
+            const path = try std.fs.path.join(allocator, &.{ expanded, "application_default_credentials.json" });
+            if (try fileExists(io, path)) return path;
+            allocator.free(path);
+        }
+    }
+    if (env.get("HOME")) |home| {
+        const path = try std.fs.path.join(allocator, &.{ home, ".config", "gcloud", "application_default_credentials.json" });
+        if (try fileExists(io, path)) return path;
+        allocator.free(path);
+    }
+    return null;
+}
+
+fn fileExists(io: std.Io, path: []const u8) !bool {
+    if (std.Io.Dir.cwd().statFile(io, path, .{})) |_| {
+        return true;
+    } else |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return false,
+    }
+}
+
+/// Authorized-user fields parsed from an ADC file. Slices borrow from `parsed`.
+const VertexAuthorizedUser = struct {
+    client_id: []const u8,
+    client_secret: []const u8,
+    refresh_token: []const u8,
+};
+
+/// Service-account fields parsed from an ADC file. Slices borrow from `parsed`.
+const VertexServiceAccount = struct {
+    client_email: []const u8,
+    private_key: []const u8,
+    token_uri: []const u8,
+};
+
+/// A parsed Vertex ADC credential, tagged by grant type.
+const VertexAdc = union(enum) {
+    authorized_user: VertexAuthorizedUser,
+    service_account: VertexServiceAccount,
+};
+
+const VertexAdcError = error{
+    AdcMalformed,
+};
+
+/// Parse an ADC JSON document into its grant-type-specific fields. Both the
+/// authorized_user and service_account grants are supported. Returns AdcMalformed
+/// when the required fields for the detected type are missing.
+fn parseVertexAdc(root: std.json.Value) VertexAdcError!VertexAdc {
+    if (root != .object) return error.AdcMalformed;
+    const obj = root.object;
+
+    const is_service_account = blk: {
+        const kind = obj.get("type") orelse break :blk false;
+        break :blk kind == .string and std.mem.eql(u8, kind.string, "service_account");
+    };
+
+    if (is_service_account) {
+        const client_email = obj.get("client_email") orelse return error.AdcMalformed;
+        const private_key = obj.get("private_key") orelse return error.AdcMalformed;
+        if (client_email != .string or private_key != .string) return error.AdcMalformed;
+        if (client_email.string.len == 0 or private_key.string.len == 0) return error.AdcMalformed;
+        // token_uri is optional in the file; default to Google's standard endpoint.
+        const token_uri = blk: {
+            const value = obj.get("token_uri") orelse break :blk google_oauth_token_url;
+            break :blk if (value == .string and value.string.len > 0) value.string else google_oauth_token_url;
+        };
+        return .{ .service_account = .{
+            .client_email = client_email.string,
+            .private_key = private_key.string,
+            .token_uri = token_uri,
+        } };
+    }
+
+    const client_id = obj.get("client_id") orelse return error.AdcMalformed;
+    const client_secret = obj.get("client_secret") orelse return error.AdcMalformed;
+    const refresh_token = obj.get("refresh_token") orelse return error.AdcMalformed;
+    if (client_id != .string or client_secret != .string or refresh_token != .string) return error.AdcMalformed;
+    if (client_id.string.len == 0 or refresh_token.string.len == 0) return error.AdcMalformed;
+
+    return .{ .authorized_user = .{
+        .client_id = client_id.string,
+        .client_secret = client_secret.string,
+        .refresh_token = refresh_token.string,
+    } };
+}
+
+/// Read, parse, and exchange the ADC refresh_token for a Vertex access token.
+/// Returns a freshly allocated ya29.* bearer on success, or null when:
+///   - no ADC file is present,
+///   - the file is a service_account key (unsupported), or
+///   - the file/token exchange is malformed or fails.
+/// Never throws on the absent-credentials path so callers degrade cleanly.
+fn mintVertexAdcToken(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
+    const path = (try vertexAdcPath(io, allocator, env)) orelse return null;
+    defer allocator.free(path);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_auth_bytes)) catch {
+        // [VERTEX_ADC_DEBUG] ADC path resolved but file unreadable; degrade to placeholder routing.
+        return null;
+    };
+    defer allocator.free(bytes);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch {
+        // [VERTEX_ADC_DEBUG] ADC file is not valid JSON.
+        return null;
+    };
+    defer parsed.deinit();
+
+    const adc = parseVertexAdc(parsed.value) catch |err| switch (err) {
+        error.AdcMalformed => {
+            // [VERTEX_ADC_DEBUG] ADC file missing required fields for its grant type.
+            return null;
+        },
+    };
+
+    switch (adc) {
+        .authorized_user => |authorized_user| {
+            const minted = exchangeVertexAdc(io, allocator, env, authorized_user) catch {
+                // Never log the refresh_token/client_secret; report the failure shape only.
+                try writeStderr(io, "Vertex ADC token exchange failed; falling back to ambient credential routing.\n");
+                return null;
+            };
+            return minted;
+        },
+        .service_account => |service_account| {
+            const minted = mintServiceAccountToken(io, allocator, env, service_account) catch {
+                // Never log the private_key or signed assertion; report the shape only.
+                try writeStderr(io, "Vertex ADC service_account token mint failed; falling back to ambient credential routing.\n");
+                return null;
+            };
+            return minted;
+        },
+    }
+}
+
+/// Exchange the ADC refresh_token at Google's OAuth2 token endpoint using the
+/// form-encoded grant_type=refresh_token flow (the same request @google/genai's
+/// GoogleAuth issues). Returns a freshly allocated access token.
+fn exchangeVertexAdc(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    adc: VertexAuthorizedUser,
+) ![]u8 {
+    // Test/integration override mirrors the PI_ZIG_OAUTH_TOKEN_URL hook used by
+    // refreshOAuthCredential so a fake token server can stand in for Google.
+    const token_url = env.get("PI_ZIG_OAUTH_TOKEN_URL") orelse google_oauth_token_url;
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "grant_type=refresh_token&client_id={s}&client_secret={s}&refresh_token={s}",
+        .{ adc.client_id, adc.client_secret, adc.refresh_token },
+    );
+    defer allocator.free(payload);
+
+    const result = try client.fetch(.{
+        .location = .{ .url = token_url },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .content_type = .{ .override = "application/x-www-form-urlencoded" },
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
+    });
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        return error.VertexAdcExchangeFailed;
+    }
+
+    return parseVertexAdcToken(allocator, response_body.written());
+}
+
+/// Extract `access_token` from a Google OAuth2 token response.
+/// Google returns { access_token, expires_in, scope, token_type } for the
+/// authorized_user refresh flow (no rotated refresh_token).
+fn parseVertexAdcToken(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.VertexAdcExchangeFailed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.VertexAdcExchangeFailed;
+    const access = parsed.value.object.get("access_token") orelse return error.VertexAdcExchangeFailed;
+    if (access != .string or access.string.len == 0) return error.VertexAdcExchangeFailed;
+    return try allocator.dupe(u8, access.string);
+}
+
+// --- Service-account JWT-bearer mint (RFC 7523) ------------------------------
+//
+// The service_account ADC flow signs a JWT assertion with the account's RSA
+// private key and exchanges it for an access token. The JWT is:
+//   header  = base64url({"alg":"RS256","typ":"JWT"})
+//   claims  = base64url({"iss":<client_email>,"scope":<scope>,
+//                        "aud":<token_uri>,"iat":<now>,"exp":<now+3600>})
+//   jwt     = header "." claims "." base64url(RS256(header "." claims))
+// where RS256 = RSASSA-PKCS1-v1_5 over SHA-256. We sign using std.crypto: the
+// SHA-256 digest is DigestInfo-wrapped + PKCS#1 v1.5 padded to the modulus size,
+// then raised to the private exponent modulo the modulus via std.crypto.ff. The
+// private key (n, d) is extracted from the PKCS#8 PEM in the ADC file.
+
+const max_rsa_modulus_bits = 4096;
+const RsaModulus = std.crypto.ff.Modulus(max_rsa_modulus_bits);
+const RsaFe = RsaModulus.Fe;
+
+const ServiceAccountError = error{
+    ServiceAccountKeyMalformed,
+    ServiceAccountSignFailed,
+    VertexAdcExchangeFailed,
+};
+
+/// RSA private key material extracted from a PKCS#8 document: the modulus `n` and
+/// the private exponent `d`, as big-endian byte slices (allocator-owned).
+const RsaPrivateKey = struct {
+    modulus: []u8,
+    private_exponent: []u8,
+
+    fn deinit(self: *RsaPrivateKey, allocator: std.mem.Allocator) void {
+        // Zero the private exponent before freeing — it is secret material.
+        @memset(self.private_exponent, 0);
+        allocator.free(self.private_exponent);
+        allocator.free(self.modulus);
+    }
+};
+
+/// Build, sign, and exchange a service-account JWT assertion for an access token.
+/// Returns the freshly allocated access token. The token endpoint is overridable
+/// via PI_ZIG_OAUTH_TOKEN_URL (same hook the other flows use) so a fake server can
+/// stand in for Google with no live call and no real key.
+fn mintServiceAccountToken(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    account: VertexServiceAccount,
+) ![]u8 {
+    const token_url = env.get("PI_ZIG_OAUTH_TOKEN_URL") orelse account.token_uri;
+
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const now_s = @divTrunc(now_ms, 1000);
+
+    const assertion = try buildSignedServiceAccountJwt(allocator, account, account.token_uri, now_s);
+    defer allocator.free(assertion);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "grant_type={s}&assertion={s}",
+        .{ jwt_bearer_grant_type, assertion },
+    );
+    defer allocator.free(payload);
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const result = try client.fetch(.{
+        .location = .{ .url = token_url },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .content_type = .{ .override = "application/x-www-form-urlencoded" },
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
+    });
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        return error.VertexAdcExchangeFailed;
+    }
+    return parseVertexAdcToken(allocator, response_body.written());
+}
+
+/// Assemble and RS256-sign a service-account JWT, returning the compact
+/// `header.claims.signature` string (allocator-owned). `aud` is the token URI the
+/// assertion is bound to (the real Google endpoint, even when the request is
+/// redirected to a fake server for testing — the audience claim must match the SA
+/// file's token_uri, not the override).
+fn buildSignedServiceAccountJwt(
+    allocator: std.mem.Allocator,
+    account: VertexServiceAccount,
+    aud: []const u8,
+    iat_seconds: i64,
+) ![]u8 {
+    const url_encoder = std.base64.url_safe_no_pad.Encoder;
+
+    // Header: {"alg":"RS256","typ":"JWT"} — stable, so encode the literal once.
+    const header_json = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
+    const header_b64 = try base64UrlAlloc(allocator, url_encoder, header_json);
+    defer allocator.free(header_b64);
+
+    const exp_seconds = iat_seconds + 3600;
+    const claims_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"iss\":\"{s}\",\"scope\":\"{s}\",\"aud\":\"{s}\",\"iat\":{d},\"exp\":{d}}}",
+        .{ account.client_email, google_token_scope, aud, iat_seconds, exp_seconds },
+    );
+    defer allocator.free(claims_json);
+    const claims_b64 = try base64UrlAlloc(allocator, url_encoder, claims_json);
+    defer allocator.free(claims_b64);
+
+    // Signing input is "<header_b64>.<claims_b64>".
+    const signing_input = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header_b64, claims_b64 });
+    defer allocator.free(signing_input);
+
+    var key = try parseRsaPrivateKeyFromPem(allocator, account.private_key);
+    defer key.deinit(allocator);
+
+    const signature = try rs256Sign(allocator, key, signing_input);
+    defer allocator.free(signature);
+
+    const signature_b64 = try base64UrlAlloc(allocator, url_encoder, signature);
+    defer allocator.free(signature_b64);
+
+    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ signing_input, signature_b64 });
+}
+
+fn base64UrlAlloc(allocator: std.mem.Allocator, encoder: std.base64.Base64Encoder, data: []const u8) ![]u8 {
+    const buf = try allocator.alloc(u8, encoder.calcSize(data.len));
+    errdefer allocator.free(buf);
+    _ = encoder.encode(buf, data);
+    return buf;
+}
+
+/// RSASSA-PKCS1-v1_5 sign `message` with SHA-256, returning the raw signature
+/// (modulus-length, big-endian, allocator-owned). Mirrors RS256: digest the
+/// message, wrap in the SHA-256 DigestInfo, PKCS#1 v1.5 pad to the modulus size,
+/// then s = m^d mod n via constant-time modular exponentiation (std.crypto.ff).
+fn rs256Sign(allocator: std.mem.Allocator, key: RsaPrivateKey, message: []const u8) ![]u8 {
+    const modulus_len = key.modulus.len;
+    if (modulus_len == 0 or modulus_len > max_rsa_modulus_bits / 8) return error.ServiceAccountSignFailed;
+
+    // SHA-256 digest of the signing input.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(message, &digest, .{});
+
+    // DigestInfo prefix for SHA-256 (RFC 8017 / PKCS#1 v1.5 EMSA).
+    const sha256_digest_info = [_]u8{
+        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+        0x00, 0x04, 0x20,
+    };
+    const t_len = sha256_digest_info.len + digest.len;
+    // EM = 0x00 || 0x01 || PS (0xFF...) || 0x00 || T, where len(EM) == modulus_len.
+    // Minimum padding is 8 bytes of 0xFF (RFC 8017 §9.2 step 3).
+    if (modulus_len < t_len + 11) return error.ServiceAccountSignFailed;
+
+    const em = try allocator.alloc(u8, modulus_len);
+    defer allocator.free(em);
+    em[0] = 0x00;
+    em[1] = 0x01;
+    const ps_len = modulus_len - t_len - 3;
+    @memset(em[2 .. 2 + ps_len], 0xFF);
+    em[2 + ps_len] = 0x00;
+    @memcpy(em[3 + ps_len ..][0..sha256_digest_info.len], &sha256_digest_info);
+    @memcpy(em[3 + ps_len + sha256_digest_info.len ..][0..digest.len], &digest);
+
+    // s = EM^d mod n, big-endian, constant-time (secret exponent).
+    const modulus = RsaModulus.fromBytes(key.modulus, .big) catch return error.ServiceAccountSignFailed;
+    const base = RsaFe.fromBytes(modulus, em, .big) catch return error.ServiceAccountSignFailed;
+    const exponent = RsaFe.fromBytes(modulus, key.private_exponent, .big) catch return error.ServiceAccountSignFailed;
+    const signed = modulus.pow(base, exponent) catch return error.ServiceAccountSignFailed;
+
+    const out = try allocator.alloc(u8, modulus_len);
+    errdefer allocator.free(out);
+    signed.toBytes(out, .big) catch {
+        allocator.free(out);
+        return error.ServiceAccountSignFailed;
+    };
+    return out;
+}
+
+/// Parse a PEM-wrapped PKCS#8 (`-----BEGIN PRIVATE KEY-----`) or PKCS#1
+/// (`-----BEGIN RSA PRIVATE KEY-----`) RSA private key, returning the modulus and
+/// private exponent. Walks the DER with std.crypto.Certificate.der.Element.
+fn parseRsaPrivateKeyFromPem(allocator: std.mem.Allocator, pem: []const u8) !RsaPrivateKey {
+    const der = try pemToDer(allocator, pem);
+    defer allocator.free(der);
+    return parseRsaPrivateKeyDer(allocator, der);
+}
+
+/// Decode the base64 body between the first PEM `-----BEGIN ...-----` and
+/// `-----END ...-----` markers into raw DER bytes (allocator-owned).
+fn pemToDer(allocator: std.mem.Allocator, pem: []const u8) ![]u8 {
+    const begin = std.mem.indexOf(u8, pem, "-----BEGIN") orelse return error.ServiceAccountKeyMalformed;
+    const body_start_nl = std.mem.indexOfScalarPos(u8, pem, begin, '\n') orelse return error.ServiceAccountKeyMalformed;
+    const end = std.mem.indexOfPos(u8, pem, body_start_nl, "-----END") orelse return error.ServiceAccountKeyMalformed;
+    const body = pem[body_start_nl + 1 .. end];
+
+    // Strip all whitespace (the SA file stores the key with literal "\n" already
+    // un-escaped by JSON parsing, so body contains real newlines).
+    var cleaned: std.ArrayList(u8) = .empty;
+    defer cleaned.deinit(allocator);
+    for (body) |c| {
+        if (c == '\n' or c == '\r' or c == ' ' or c == '\t') continue;
+        try cleaned.append(allocator, c);
+    }
+
+    const decoder = std.base64.standard.Decoder;
+    const der_len = decoder.calcSizeForSlice(cleaned.items) catch return error.ServiceAccountKeyMalformed;
+    const der = try allocator.alloc(u8, der_len);
+    errdefer allocator.free(der);
+    decoder.decode(der, cleaned.items) catch return error.ServiceAccountKeyMalformed;
+    return der;
+}
+
+const der_mod = std.crypto.Certificate.der;
+
+/// Extract (modulus, privateExponent) from a PKCS#8 PrivateKeyInfo or a bare
+/// PKCS#1 RSAPrivateKey DER. PKCS#8 wraps the RSAPrivateKey in an OCTET STRING
+/// after a version INTEGER and an AlgorithmIdentifier SEQUENCE.
+fn parseRsaPrivateKeyDer(allocator: std.mem.Allocator, der: []const u8) !RsaPrivateKey {
+    const outer = der_mod.Element.parse(der, 0) catch return error.ServiceAccountKeyMalformed;
+    if (outer.identifier.tag != .sequence) return error.ServiceAccountKeyMalformed;
+
+    const first = der_mod.Element.parse(der, outer.slice.start) catch return error.ServiceAccountKeyMalformed;
+    if (first.identifier.tag != .integer) return error.ServiceAccountKeyMalformed;
+
+    // Detect PKCS#8: version INTEGER (0) followed by an AlgorithmIdentifier SEQUENCE
+    // and a privateKey OCTET STRING that itself holds the RSAPrivateKey.
+    const after_version = der_mod.Element.parse(der, first.slice.end) catch return error.ServiceAccountKeyMalformed;
+    if (after_version.identifier.tag == .sequence) {
+        const private_key_octets = der_mod.Element.parse(der, after_version.slice.end) catch return error.ServiceAccountKeyMalformed;
+        if (private_key_octets.identifier.tag != .octetstring) return error.ServiceAccountKeyMalformed;
+        return parsePkcs1RsaPrivateKey(allocator, der, private_key_octets.slice.start);
+    }
+
+    // Otherwise treat the outer SEQUENCE as a bare PKCS#1 RSAPrivateKey.
+    return parsePkcs1RsaPrivateKey(allocator, der, outer.slice.start);
+}
+
+/// Parse a PKCS#1 RSAPrivateKey SEQUENCE whose contents begin at `seq_start`:
+///   version, modulus(n), publicExponent(e), privateExponent(d), ...
+/// Returns owned big-endian copies of n and d (leading 0x00 sign bytes stripped).
+fn parsePkcs1RsaPrivateKey(allocator: std.mem.Allocator, der: []const u8, seq_start: u32) !RsaPrivateKey {
+    const seq = der_mod.Element.parse(der, seq_start) catch return error.ServiceAccountKeyMalformed;
+    if (seq.identifier.tag != .sequence) return error.ServiceAccountKeyMalformed;
+
+    const version = der_mod.Element.parse(der, seq.slice.start) catch return error.ServiceAccountKeyMalformed;
+    if (version.identifier.tag != .integer) return error.ServiceAccountKeyMalformed;
+    const modulus_elem = der_mod.Element.parse(der, version.slice.end) catch return error.ServiceAccountKeyMalformed;
+    if (modulus_elem.identifier.tag != .integer) return error.ServiceAccountKeyMalformed;
+    const public_exp = der_mod.Element.parse(der, modulus_elem.slice.end) catch return error.ServiceAccountKeyMalformed;
+    if (public_exp.identifier.tag != .integer) return error.ServiceAccountKeyMalformed;
+    const private_exp = der_mod.Element.parse(der, public_exp.slice.end) catch return error.ServiceAccountKeyMalformed;
+    if (private_exp.identifier.tag != .integer) return error.ServiceAccountKeyMalformed;
+
+    const modulus = try dupeDerInteger(allocator, der[modulus_elem.slice.start..modulus_elem.slice.end]);
+    errdefer allocator.free(modulus);
+    const private_exponent = try dupeDerInteger(allocator, der[private_exp.slice.start..private_exp.slice.end]);
+    errdefer allocator.free(private_exponent);
+
+    return .{ .modulus = modulus, .private_exponent = private_exponent };
+}
+
+/// Copy a DER INTEGER's big-endian magnitude, stripping a single leading 0x00 byte
+/// that DER inserts to keep the high bit from signaling a negative value.
+fn dupeDerInteger(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var bytes = raw;
+    if (bytes.len > 1 and bytes[0] == 0x00) bytes = bytes[1..];
+    return allocator.dupe(u8, bytes);
+}
+
+// --- AWS ~/.aws/credentials profile resolution (Amazon Bedrock) --------------
+//
+// The Bedrock SigV4 signer in ai_client consumes IAM credentials from the
+// environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN).
+// When the user instead configures AWS_PROFILE (the common local case), the SDK
+// would resolve those keys from the shared credentials file. We mirror just that
+// step: parse the requested profile out of ~/.aws/credentials (or
+// AWS_SHARED_CREDENTIALS_FILE) and surface its access key / secret / session token
+// in the same env-equivalent shape the signer already understands. This is gated
+// on AWS_PROFILE being set; container/IMDS credential providers remain out of
+// scope (documented SDK-only behavior).
+
+/// IAM credentials resolved from an AWS shared-credentials profile. All slices are
+/// allocator-owned; `deinit` zeroes the secret material before freeing.
+pub const AwsProfileCredentials = struct {
+    access_key_id: []u8,
+    secret_access_key: []u8,
+    session_token: ?[]u8 = null,
+    region: ?[]u8 = null,
+
+    pub fn deinit(self: *AwsProfileCredentials, allocator: std.mem.Allocator) void {
+        @memset(self.secret_access_key, 0);
+        allocator.free(self.secret_access_key);
+        allocator.free(self.access_key_id);
+        if (self.session_token) |token| {
+            @memset(token, 0);
+            allocator.free(token);
+        }
+        if (self.region) |region| allocator.free(region);
+    }
+};
+
+/// Resolve IAM credentials for the active AWS profile, mirroring the SDK's shared
+/// credentials file lookup. Returns null when AWS_PROFILE is unset, the file is
+/// absent/unreadable, or the profile/keys are missing — callers then degrade to
+/// the existing env-based signer path. Never prints secrets.
+pub fn resolveAwsProfileCredentials(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+) !?AwsProfileCredentials {
+    const profile = env.get("AWS_PROFILE") orelse return null;
+    const profile_name = std.mem.trim(u8, profile, " \t\r\n");
+    if (profile_name.len == 0) return null;
+
+    const path = (try awsCredentialsPath(allocator, env)) orelse return null;
+    defer allocator.free(path);
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_auth_bytes)) catch return null;
+    defer allocator.free(bytes);
+
+    return parseAwsProfile(allocator, bytes, profile_name);
+}
+
+/// Resolution order for the AWS shared credentials file:
+///   1. AWS_SHARED_CREDENTIALS_FILE (explicit override, SDK-standard env var)
+///   2. $HOME/.aws/credentials (SDK default)
+fn awsCredentialsPath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
+    if (env.get("AWS_SHARED_CREDENTIALS_FILE")) |explicit| {
+        const trimmed = std.mem.trim(u8, explicit, " \t\r\n");
+        if (trimmed.len > 0) return try expandMaybeTilde(allocator, env, trimmed);
+    }
+    const home = env.get("HOME") orelse return null;
+    return try std.fs.path.join(allocator, &.{ home, ".aws", "credentials" });
+}
+
+/// Parse a single `[profile]` section out of an AWS credentials ini file. Supports
+/// the bare profile name and the `[profile <name>]` form (used in ~/.aws/config).
+/// Returns null when the profile or the required keys are missing.
+fn parseAwsProfile(allocator: std.mem.Allocator, contents: []const u8, profile: []const u8) !?AwsProfileCredentials {
+    var in_section = false;
+    var access_key_id: ?[]const u8 = null;
+    var secret_access_key: ?[]const u8 = null;
+    var session_token: ?[]const u8 = null;
+    var region: ?[]const u8 = null;
+
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+
+        if (line[0] == '[') {
+            // Section header. We were collecting the target profile → stop on the
+            // next header (ini sections do not nest).
+            if (in_section) break;
+            const close = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+            var name = std.mem.trim(u8, line[1..close], " \t");
+            // ~/.aws/config uses "[profile foo]"; accept that spelling too.
+            if (std.mem.startsWith(u8, name, "profile ")) {
+                name = std.mem.trim(u8, name["profile ".len..], " \t");
+            }
+            in_section = std.mem.eql(u8, name, profile);
+            continue;
+        }
+
+        if (!in_section) continue;
+
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "aws_access_key_id")) {
+            access_key_id = value;
+        } else if (std.ascii.eqlIgnoreCase(key, "aws_secret_access_key")) {
+            secret_access_key = value;
+        } else if (std.ascii.eqlIgnoreCase(key, "aws_session_token")) {
+            session_token = value;
+        } else if (std.ascii.eqlIgnoreCase(key, "region")) {
+            region = value;
+        }
+    }
+
+    const id = access_key_id orelse return null;
+    const secret = secret_access_key orelse return null;
+    if (id.len == 0 or secret.len == 0) return null;
+
+    var creds = AwsProfileCredentials{
+        .access_key_id = try allocator.dupe(u8, id),
+        .secret_access_key = try allocator.dupe(u8, secret),
+    };
+    errdefer creds.deinit(allocator);
+    if (session_token) |token| {
+        if (token.len > 0) creds.session_token = try allocator.dupe(u8, token);
+    }
+    if (region) |value| {
+        if (value.len > 0) creds.region = try allocator.dupe(u8, value);
+    }
+    return creds;
+}
+
+// --- Interactive OAuth login scaffold ----------------------------------------
+//
+// Upstream supports an interactive browser/device-code login that exchanges a
+// user authorization for stored OAuth credentials. A full PKCE/device-code loop
+// (open browser, run a loopback callback server, poll the device endpoint) is a
+// large, network- and TTY-bound surface. This scaffold establishes the opt-in
+// entry point and the per-provider parameters; it must SKIP CLEANLY (no crash, no
+// secret output) when invoked without the interactive prerequisites, so it is safe
+// to wire into the CLI today and fill in the live loop later.
+
+const InteractiveLoginError = error{
+    InteractiveLoginUnavailable,
+    InteractiveLoginUnsupportedProvider,
+};
+
+/// Begin an interactive OAuth login for `provider`. Opt-in only: callers must pass
+/// `enabled = true` (e.g. behind an explicit `auth login` subcommand). Returns
+/// InteractiveLoginUnavailable when login is not enabled or there is no TTY, and
+/// InteractiveLoginUnsupportedProvider for providers without an OAuth spec. The
+/// live authorization loop is not yet implemented; this never prints secrets and
+/// never blocks, so absent prerequisites degrade cleanly.
+pub fn beginInteractiveLogin(
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    provider: []const u8,
+    enabled: bool,
+) InteractiveLoginError!void {
+    if (!enabled) return error.InteractiveLoginUnavailable;
+    if (oauthProviderSpec(provider) == null) return error.InteractiveLoginUnsupportedProvider;
+    if (!interactiveLoginAvailable(io, env)) {
+        writeStderr(io, "Interactive login requires a terminal; set the credential with `auth set-oauth` instead.\n") catch {};
+        return error.InteractiveLoginUnavailable;
+    }
+    // Live PKCE/device-code authorization loop is not yet implemented. Report the
+    // documented limitation rather than faking a credential.
+    writeStderr(io, "Interactive OAuth login is not yet implemented for this build; use `auth set-oauth`.\n") catch {};
+    return error.InteractiveLoginUnavailable;
+}
+
+/// Interactive login needs an attached terminal (a browser/device-code prompt is
+/// meaningless in a pipe/CI). PI_OFFLINE disables all startup network operations,
+/// so it also disables interactive login.
+fn interactiveLoginAvailable(io: std.Io, env: *const std.process.Environ.Map) bool {
+    if (envFlagEnabled(env, "PI_OFFLINE")) return false;
+    const stdin_tty = std.Io.File.stdin().isTty(io) catch false;
+    const stdout_tty = std.Io.File.stdout().isTty(io) catch false;
+    return stdin_tty and stdout_tty;
+}
+
+fn envFlagEnabled(env: *const std.process.Environ.Map, key: []const u8) bool {
+    const value = env.get(key) orelse return false;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return std.mem.eql(u8, trimmed, "1") or
+        std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "yes");
+}
+
 fn credentialType(value: std.json.Value) ?[]const u8 {
     if (value != .object) return null;
     const kind = value.object.get("type") orelse return null;
@@ -1072,4 +1775,377 @@ test "refresh response rejects malformed token bodies" {
         "old",
         "{\"access_token\":\"only-access\"}",
     ));
+}
+
+test "Vertex ADC authorized_user document parses client_id/secret/refresh_token" {
+    const sample =
+        \\{
+        \\  "client_id": "764086051850-adc.apps.googleusercontent.com",
+        \\  "client_secret": "d-secret-value",
+        \\  "refresh_token": "1//adc-refresh-token",
+        \\  "type": "authorized_user"
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sample, .{});
+    defer parsed.deinit();
+    const adc = try parseVertexAdc(parsed.value);
+    try std.testing.expect(adc == .authorized_user);
+    try std.testing.expectEqualStrings("764086051850-adc.apps.googleusercontent.com", adc.authorized_user.client_id);
+    try std.testing.expectEqualStrings("d-secret-value", adc.authorized_user.client_secret);
+    try std.testing.expectEqualStrings("1//adc-refresh-token", adc.authorized_user.refresh_token);
+}
+
+test "Vertex ADC service_account document parses client_email/private_key/token_uri" {
+    const sample =
+        \\{"type":"service_account","client_email":"svc@project.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n","token_uri":"https://oauth2.googleapis.com/token"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sample, .{});
+    defer parsed.deinit();
+    const adc = try parseVertexAdc(parsed.value);
+    try std.testing.expect(adc == .service_account);
+    try std.testing.expectEqualStrings("svc@project.iam.gserviceaccount.com", adc.service_account.client_email);
+    try std.testing.expect(std.mem.indexOf(u8, adc.service_account.private_key, "BEGIN PRIVATE KEY") != null);
+    try std.testing.expectEqualStrings("https://oauth2.googleapis.com/token", adc.service_account.token_uri);
+}
+
+test "Vertex ADC service_account token_uri defaults to Google when absent" {
+    const sample =
+        \\{"type":"service_account","client_email":"svc@project.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sample, .{});
+    defer parsed.deinit();
+    const adc = try parseVertexAdc(parsed.value);
+    try std.testing.expect(adc == .service_account);
+    try std.testing.expectEqualStrings(google_oauth_token_url, adc.service_account.token_uri);
+}
+
+test "Vertex ADC parsing rejects documents missing required fields" {
+    const cases = [_][]const u8{
+        "{}",
+        "{\"client_id\":\"only-id\"}",
+        "{\"client_id\":\"id\",\"client_secret\":\"secret\"}",
+        "{\"client_id\":\"\",\"client_secret\":\"s\",\"refresh_token\":\"r\"}",
+        "{\"client_id\":\"id\",\"client_secret\":\"s\",\"refresh_token\":\"\"}",
+        // service_account missing private_key / client_email.
+        "{\"type\":\"service_account\",\"client_email\":\"svc@x.iam.gserviceaccount.com\"}",
+        "{\"type\":\"service_account\",\"private_key\":\"-----BEGIN PRIVATE KEY-----\\nx\\n-----END PRIVATE KEY-----\"}",
+        "{\"type\":\"service_account\",\"client_email\":\"\",\"private_key\":\"k\"}",
+    };
+    for (cases) |body| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.AdcMalformed, parseVertexAdc(parsed.value));
+    }
+}
+
+test "Vertex ADC token exchange request payload shape matches Google refresh_token grant" {
+    // Assert the exact form-encoded body and field ordering the OAuth2 token
+    // endpoint receives, without performing any network I/O or printing secrets.
+    const adc = VertexAuthorizedUser{
+        .client_id = "764086051850-adc.apps.googleusercontent.com",
+        .client_secret = "d-secret-value",
+        .refresh_token = "1//adc-refresh-token",
+    };
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "grant_type=refresh_token&client_id={s}&client_secret={s}&refresh_token={s}",
+        .{ adc.client_id, adc.client_secret, adc.refresh_token },
+    );
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectEqualStrings(
+        "grant_type=refresh_token&client_id=764086051850-adc.apps.googleusercontent.com&client_secret=d-secret-value&refresh_token=1//adc-refresh-token",
+        payload,
+    );
+}
+
+test "Vertex ADC token endpoint defaults to Google, env override redirects to fake server" {
+    // Mirrors the PI_ZIG_OAUTH_TOKEN_URL hook reused from refreshOAuthCredential so
+    // the Node smoke can point token minting at a local fake endpoint.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectEqualStrings(
+        google_oauth_token_url,
+        env.get("PI_ZIG_OAUTH_TOKEN_URL") orelse google_oauth_token_url,
+    );
+    try env.put("PI_ZIG_OAUTH_TOKEN_URL", "http://127.0.0.1:45999/token");
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:45999/token",
+        env.get("PI_ZIG_OAUTH_TOKEN_URL") orelse google_oauth_token_url,
+    );
+}
+
+test "Vertex ADC token response parsing extracts ya29 access token" {
+    const minted = try parseVertexAdcToken(
+        std.testing.allocator,
+        "{\"access_token\":\"ya29.minted-vertex-token\",\"expires_in\":3599,\"scope\":\"https://www.googleapis.com/auth/cloud-platform\",\"token_type\":\"Bearer\"}",
+    );
+    defer std.testing.allocator.free(minted);
+    try std.testing.expectEqualStrings("ya29.minted-vertex-token", minted);
+}
+
+test "Vertex ADC token response parsing rejects malformed bodies" {
+    try std.testing.expectError(error.VertexAdcExchangeFailed, parseVertexAdcToken(std.testing.allocator, "not json"));
+    try std.testing.expectError(error.VertexAdcExchangeFailed, parseVertexAdcToken(std.testing.allocator, "{\"expires_in\":3600}"));
+    try std.testing.expectError(error.VertexAdcExchangeFailed, parseVertexAdcToken(std.testing.allocator, "{\"access_token\":\"\"}"));
+}
+
+// A throwaway 2048-bit RSA private key (PKCS#8 PEM) used ONLY to unit-test the
+// RS256 signer/JWT assembly. It is a freshly generated test key, not a real
+// service-account credential, and signs nothing that reaches a live endpoint.
+const test_rsa_pkcs8_pem =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCzFGyixKiix3La
+    \\uAXYF3SUVFiZ+ndGtt20RIL7xXhJ2Jimusk6CWufnOC6kreLMUQbxncUWItmHIUE
+    \\MJToKwkgkZlF1YlgP7+SfJ9l0X04ygLUsPfvz1P++bx9MOtu0TE4PAmfDIc585gQ
+    \\e5giv/CEWfc4pbJ835IPKAwTT/33RbQDRtrVTTePURnmPPjTvuoLiTTFzTJJgEYi
+    \\dYn5sgVg5OcDdeyRkd8eoHBczhqFxA2/NL9W4YowJm5VmCYN2TTLkZixC4dtrmHc
+    \\AkuQrlTDgsvj10VfRjGv38nutUX2DqZtkCQbx11I+UpfPohqYCPlehqs4gARBsWQ
+    \\RUSH4u9ZAgMBAAECggEAANI/db7qimr8dFWYFQ91lMh2sWNCi8K+ktfxWiaJX2wn
+    \\pIQKJSCN4Zq2bwemRuTtqaoncOCBvDDdntsQ1mGSAe4Z1vaSi0+AXJSUgqqbvnzV
+    \\yikunIg+DEv0wSTQZy90DsGPYxSqYNKvu3V7TcgvK7Tob6FN3+GUXREsJi1jEx8R
+    \\OWliU1kVsbtsSoHWhxNPRevt7lWUw6rMW3UbP5XXzR6ftfThvgQ3l8NvSG9IhDIp
+    \\eJjuTf2Xdv0T3Mx8Q5/rvfa0FMe8YAFNByFpUNKF0CVVVZyzJUCTd+YxCVYIHHiu
+    \\6D23vG/Qnfr77YPUhMsEqJzPhyIoEjATaAlK2xwgxQKBgQDbVNIFTnsavvL4hVVc
+    \\hi7LBW+atUOeS2nXGImmMgtXGeMCysdoTSGo8ODu7NGldBDIfZkOGNX/A6vGWGh2
+    \\ShrKobSkROF96c8IgmrV5ojA+NPnQn01jejZwpgvJ9I93Gm8obe+0/JiSpNhBN1F
+    \\AXSLwZnnHz7pqCwHLZbYsoALfQKBgQDRBN/sFW6MKpbW8n6CGPeJ47BcZ4W2cCr1
+    \\IcWTsxojF+jbr9bmihDt0bUCn9ccQ2l3nHnFrXoJVumkSJPaK3vuRkvKOUn4WTdd
+    \\vZOGlqhZ7Y2nvY4T4ecBc7nlS6gUJZFD2grUVKy/mtdym/UT+Xb7w29MocDA9O3b
+    \\Z0cBGpbiDQKBgQDYRcA+iU+sZOOTGW69qHaVrMuK4vhFK5m3BrQclDZIcfc+NpQA
+    \\jiYFv1gdYJmtK1CtUePNWcISDx2fnGeNVK8sZd2JKX6sORP0ER2lxAfPOM1CuXZb
+    \\i44yw8ZqoTqX0zLUVSapXbchIuZGgZRqSfARKxtGIrJXloOrpFGdZg4KxQKBgFoR
+    \\4LBqN938yE1N58gGHD12OVxIW+1W/pvtdqeECWJP/k8UweVMX6krsfW0jUynm/4o
+    \\Fq1haPI3Wq0pfVUJYfk2n5hAAakcQOiLNdRMfbVq0Z0T6PKWaSZOCTBO3tn3qlZz
+    \\0jDXYC2c+vRvUjfOS0CIYiDCnz5HDWx7X7SREa3NAoGBAKNyOioRkFHQ1h5c3EUk
+    \\F5mWUMF7w+IPDPTc/O51ZfQY/5Ra0w7/D+bgpoiSR+Sjeys/puoX4HY84pwE4LTy
+    \\alNlrA2CRM9ebkMMTPuplqqJNxwmcG1SDmgMDAacvB30ASUAEZekBaBE1SJ0RHBK
+    \\cQbYF5c5gAgE83x+tEs13nBc
+    \\-----END PRIVATE KEY-----
+;
+
+test "service_account PKCS#8 PEM parses into RSA modulus and private exponent" {
+    var key = try parseRsaPrivateKeyFromPem(std.testing.allocator, test_rsa_pkcs8_pem);
+    defer key.deinit(std.testing.allocator);
+    // 2048-bit key -> 256-byte modulus.
+    try std.testing.expectEqual(@as(usize, 256), key.modulus.len);
+    // The private exponent for a 2048-bit key is ~256 bytes (no leading zero here).
+    try std.testing.expect(key.private_exponent.len >= 255 and key.private_exponent.len <= 256);
+}
+
+test "RS256 signer produces a signature that verifies against the public key" {
+    var key = try parseRsaPrivateKeyFromPem(std.testing.allocator, test_rsa_pkcs8_pem);
+    defer key.deinit(std.testing.allocator);
+
+    const message = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJzdmMifQ";
+    const signature = try rs256Sign(std.testing.allocator, key, message);
+    defer std.testing.allocator.free(signature);
+    try std.testing.expectEqual(@as(usize, 256), signature.len);
+
+    // Independently verify with std.crypto's RSA PKCS1v1.5 + SHA-256. The public
+    // exponent is the standard 65537 (0x010001).
+    const Rsa = std.crypto.Certificate.rsa;
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const public_exponent = [_]u8{ 0x01, 0x00, 0x01 };
+    const public_key = try Rsa.PublicKey.fromBytes(&public_exponent, key.modulus);
+    var sig_array: [256]u8 = undefined;
+    @memcpy(&sig_array, signature);
+    try Rsa.PKCS1v1_5Signature.verify(256, sig_array, message, public_key, Sha256);
+
+    // A tampered message must NOT verify against the same signature.
+    try std.testing.expectError(
+        error.InvalidSignature,
+        Rsa.PKCS1v1_5Signature.verify(256, sig_array, "tampered", public_key, Sha256),
+    );
+}
+
+test "service_account JWT has three base64url segments and a verifiable signature" {
+    const account = VertexServiceAccount{
+        .client_email = "svc@flow.iam.gserviceaccount.com",
+        .private_key = test_rsa_pkcs8_pem,
+        .token_uri = google_oauth_token_url,
+    };
+    const jwt = try buildSignedServiceAccountJwt(std.testing.allocator, account, account.token_uri, 1_700_000_000);
+    defer std.testing.allocator.free(jwt);
+
+    // Exactly two dots -> three segments.
+    var dots: usize = 0;
+    for (jwt) |c| {
+        if (c == '.') dots += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), dots);
+
+    var it = std.mem.splitScalar(u8, jwt, '.');
+    const header_b64 = it.next().?;
+    const claims_b64 = it.next().?;
+    const sig_b64 = it.next().?;
+
+    // Decode and check the header + claims content.
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    var header_buf: [128]u8 = undefined;
+    const header_len = try decoder.calcSizeForSlice(header_b64);
+    try decoder.decode(header_buf[0..header_len], header_b64);
+    try std.testing.expectEqualStrings("{\"alg\":\"RS256\",\"typ\":\"JWT\"}", header_buf[0..header_len]);
+
+    var claims_buf: [512]u8 = undefined;
+    const claims_len = try decoder.calcSizeForSlice(claims_b64);
+    try decoder.decode(claims_buf[0..claims_len], claims_b64);
+    const claims = claims_buf[0..claims_len];
+    try std.testing.expect(std.mem.indexOf(u8, claims, "\"iss\":\"svc@flow.iam.gserviceaccount.com\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claims, "\"aud\":\"https://oauth2.googleapis.com/token\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claims, "\"scope\":\"https://www.googleapis.com/auth/cloud-platform\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claims, "\"iat\":1700000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claims, "\"exp\":1700003600") != null);
+
+    // The signature must verify over "<header>.<claims>".
+    var key = try parseRsaPrivateKeyFromPem(std.testing.allocator, test_rsa_pkcs8_pem);
+    defer key.deinit(std.testing.allocator);
+    const signing_input = jwt[0 .. header_b64.len + 1 + claims_b64.len];
+    var sig_buf: [256]u8 = undefined;
+    const sig_len = try decoder.calcSizeForSlice(sig_b64);
+    try std.testing.expectEqual(@as(usize, 256), sig_len);
+    try decoder.decode(sig_buf[0..sig_len], sig_b64);
+
+    const Rsa = std.crypto.Certificate.rsa;
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const public_exponent = [_]u8{ 0x01, 0x00, 0x01 };
+    const public_key = try Rsa.PublicKey.fromBytes(&public_exponent, key.modulus);
+    try Rsa.PKCS1v1_5Signature.verify(256, sig_buf, signing_input, public_key, Sha256);
+}
+
+test "service_account JWT-bearer payload uses the RFC 7523 grant type" {
+    // Assert the exact form-encoded grant_type field the token endpoint receives
+    // (the assertion value itself is the signed JWT). No network I/O, no secrets.
+    const grant_prefix = "grant_type=" ++ jwt_bearer_grant_type ++ "&assertion=";
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "grant_type={s}&assertion={s}",
+        .{ jwt_bearer_grant_type, "HEADER.CLAIMS.SIG" },
+    );
+    defer std.testing.allocator.free(payload);
+    try std.testing.expect(std.mem.startsWith(u8, payload, grant_prefix));
+    try std.testing.expectEqualStrings(
+        "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=HEADER.CLAIMS.SIG",
+        payload,
+    );
+}
+
+test "service_account key parsing rejects malformed PEM" {
+    try std.testing.expectError(
+        error.ServiceAccountKeyMalformed,
+        parseRsaPrivateKeyFromPem(std.testing.allocator, "not a pem"),
+    );
+    try std.testing.expectError(
+        error.ServiceAccountKeyMalformed,
+        parseRsaPrivateKeyFromPem(std.testing.allocator, "-----BEGIN PRIVATE KEY-----\n!!!notbase64!!!\n-----END PRIVATE KEY-----"),
+    );
+}
+
+test "AWS profile credentials parse from a shared credentials ini" {
+    const ini =
+        \\[default]
+        \\aws_access_key_id = AKIADEFAULT
+        \\aws_secret_access_key = default-secret
+        \\
+        \\# the bedrock profile is what AWS_PROFILE points at
+        \\[bedrock]
+        \\aws_access_key_id = AKIABEDROCK
+        \\aws_secret_access_key = bedrock-secret
+        \\aws_session_token = bedrock-session-token
+        \\region = us-west-2
+    ;
+    var creds = (try parseAwsProfile(std.testing.allocator, ini, "bedrock")).?;
+    defer creds.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("AKIABEDROCK", creds.access_key_id);
+    try std.testing.expectEqualStrings("bedrock-secret", creds.secret_access_key);
+    try std.testing.expectEqualStrings("bedrock-session-token", creds.session_token.?);
+    try std.testing.expectEqualStrings("us-west-2", creds.region.?);
+
+    // The default profile has no session token / region.
+    var default_creds = (try parseAwsProfile(std.testing.allocator, ini, "default")).?;
+    defer default_creds.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("AKIADEFAULT", default_creds.access_key_id);
+    try std.testing.expect(default_creds.session_token == null);
+    try std.testing.expect(default_creds.region == null);
+}
+
+test "AWS profile parsing accepts the [profile name] config spelling and rejects gaps" {
+    const config_style =
+        \\[profile bedrock]
+        \\aws_access_key_id = AKIACONFIG
+        \\aws_secret_access_key = config-secret
+    ;
+    var creds = (try parseAwsProfile(std.testing.allocator, config_style, "bedrock")).?;
+    defer creds.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("AKIACONFIG", creds.access_key_id);
+
+    // Missing profile -> null.
+    try std.testing.expect((try parseAwsProfile(std.testing.allocator, config_style, "absent")) == null);
+    // Present profile but missing secret -> null (no partial credentials).
+    const missing_secret = "[bedrock]\naws_access_key_id = AKIA\n";
+    try std.testing.expect((try parseAwsProfile(std.testing.allocator, missing_secret, "bedrock")) == null);
+}
+
+test "AWS profile resolution is gated on AWS_PROFILE" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    // No AWS_PROFILE -> never reads the file, returns null.
+    try std.testing.expect((try resolveAwsProfileCredentials(std.testing.io, std.testing.allocator, &env)) == null);
+    // AWS_PROFILE set but the shared credentials file is absent -> clean null.
+    try env.put("AWS_PROFILE", "bedrock");
+    try env.put("HOME", "/nonexistent-pi-zig-aws-home-xyz");
+    try std.testing.expect((try resolveAwsProfileCredentials(std.testing.io, std.testing.allocator, &env)) == null);
+}
+
+test "AWS credentials path honors AWS_SHARED_CREDENTIALS_FILE override" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("AWS_SHARED_CREDENTIALS_FILE", "/tmp/pi-zig-aws/credentials");
+    const path = (try awsCredentialsPath(std.testing.allocator, &env)).?;
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/pi-zig-aws/credentials", path);
+}
+
+test "interactive login is opt-in and skips cleanly without prerequisites" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    // Disabled by default -> unavailable, no crash, no output.
+    try std.testing.expectError(
+        error.InteractiveLoginUnavailable,
+        beginInteractiveLogin(std.testing.io, &env, "anthropic", false),
+    );
+    // Unknown provider -> unsupported.
+    try std.testing.expectError(
+        error.InteractiveLoginUnsupportedProvider,
+        beginInteractiveLogin(std.testing.io, &env, "not-a-provider", true),
+    );
+    // Enabled + known provider, but the test harness has no TTY (and the live loop
+    // is unimplemented) -> still unavailable, degrades cleanly.
+    try std.testing.expectError(
+        error.InteractiveLoginUnavailable,
+        beginInteractiveLogin(std.testing.io, &env, "anthropic", true),
+    );
+    // PI_OFFLINE forces unavailable regardless of TTY.
+    try env.put("PI_OFFLINE", "1");
+    try std.testing.expect(!interactiveLoginAvailable(std.testing.io, &env));
+}
+
+test "Vertex ADC path resolution prefers GOOGLE_APPLICATION_CREDENTIALS override" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    // An explicit override is honored verbatim (after tilde expansion) without a
+    // disk stat, so a caller-provided path is always tried first.
+    try env.put("GOOGLE_APPLICATION_CREDENTIALS", "/tmp/pi-zig-test-adc/application_default_credentials.json");
+    const path = (try vertexAdcPath(std.testing.io, std.testing.allocator, &env)).?;
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/pi-zig-test-adc/application_default_credentials.json", path);
+}
+
+test "Vertex ADC path resolution returns null when no credentials are discoverable" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    // No GOOGLE_APPLICATION_CREDENTIALS, no CLOUDSDK_CONFIG, and a HOME with no
+    // gcloud ADC file → clean null (callers must not crash when creds are absent).
+    try env.put("HOME", "/nonexistent-pi-zig-home-xyz");
+    const path = try vertexAdcPath(std.testing.io, std.testing.allocator, &env);
+    try std.testing.expect(path == null);
 }

@@ -14,6 +14,24 @@ pub const PrepareNextTurnCallback = *const fn (ctx: *anyopaque, turn: TurnContex
 pub const ShouldStopAfterTurnCallback = *const fn (ctx: *anyopaque, turn: TurnContext) anyerror!bool;
 pub const CancellationCallback = *const fn (ctx: *anyopaque) bool;
 
+// [FLOW_J_EXTENSION_EVENTS] Notify-style lifecycle emission seam fired from the
+// provider-backed prompt loop. The callback mirrors the upstream emit() points
+// (agent-session.ts _emitExtensionEvent + sdk.ts onPayload/onResponse): turn_start,
+// before_provider_request, after_provider_response, message_start, message_end, and
+// turn_end fire at the same positions upstream emits them. rpc.zig provides the
+// callback and fans each event out to the extension runner (reusing the persistent
+// process). It is notify-style here: pi-zig builds the low-level provider payload
+// inside ai_client (not owned by this seam), so before_provider_request surfaces the
+// provider/model for observation rather than rewriting the raw HTTP body. The callback
+// is best-effort and must not abort the turn, so callers swallow emission failures.
+pub const LifecycleEmitEvent = struct {
+    type: []const u8,
+    /// JSON object of extra fields merged into the emitted event (e.g.
+    /// {"turnIndex":0,"timestamp":1}); never null (use "{}" when empty).
+    fields_json: []const u8 = "{}",
+};
+pub const LifecycleEmitCallback = *const fn (ctx: *anyopaque, event: LifecycleEmitEvent) anyerror!void;
+
 pub const RunOptions = struct {
     provider: []const u8,
     model: []const u8,
@@ -45,6 +63,18 @@ pub const RunOptions = struct {
     should_cancel: ?CancellationCallback = null,
     text_event_context: ?*anyopaque = null,
     on_text_delta: ?TextDeltaCallback = null,
+    // [FLOW_J_EXTENSION_EVENTS] Optional extension lifecycle emission. When set, the
+    // prompt loop fires turn/provider/message events through this callback at the
+    // upstream-matching points (see LifecycleEmitCallback). Left null by callers that
+    // load no extensions, keeping the loop allocation-free on the hot path.
+    lifecycle_context: ?*anyopaque = null,
+    on_lifecycle_event: ?LifecycleEmitCallback = null,
+    // Honors the resolved `images.autoResize` setting. When true (default) the read-tool keeps the
+    // upstream-shaped encoded-size gate: oversized inline images are omitted with the resize note
+    // because pi-zig has no embedded image decoder to downscale them. When false the user has opted
+    // out of resizing entirely, so images always pass through at their original size with no resize
+    // note (pi-zig has no resize worker, so "false" simply means "never gate/omit on size").
+    auto_resize_images: bool = true,
 };
 
 pub const BeforeToolCallResult = struct {
@@ -350,6 +380,10 @@ pub fn runPrompt(
     var turn: usize = 0;
     while (turn < options.max_turns) : (turn += 1) {
         try checkCancellation(options);
+        // [FLOW_J_EXTENSION_EVENTS] turn_start (upstream agent-session.ts TurnStartEvent:
+        // {turnIndex,timestamp}). Fired before the provider request for this turn.
+        var turn_fields_buf: [64]u8 = undefined;
+        emitLifecycle(options, "turn_start", lifecycleTurnFields(&turn_fields_buf, turn));
         const borrowed = try borrowMessages(allocator, messages.items);
         defer allocator.free(borrowed);
         const request_provider = active_provider orelse options.provider;
@@ -365,16 +399,31 @@ pub fn runPrompt(
             .cancellation_context = options.cancellation_context,
             .should_cancel = options.should_cancel,
         };
+        // [FLOW_J_EXTENSION_EVENTS] before_provider_request (upstream sdk.ts onPayload):
+        // surfaces the provider/model for the upcoming request. Notify-style here because
+        // pi-zig assembles the raw HTTP payload inside ai_client (outside this seam).
+        var provider_fields_buf: [256]u8 = undefined;
+        emitLifecycle(options, "before_provider_request", lifecycleProviderRequestFields(&provider_fields_buf, request_provider, request_model));
         var response = if (options.stream_turns)
             try ai_client.streamChatTurnWithTextCallback(io, allocator, env, request, options.text_event_context, options.on_text_delta)
         else
             try ai_client.runChatTurn(io, allocator, env, request);
         defer response.deinit(allocator);
+        // [FLOW_J_EXTENSION_EVENTS] after_provider_response (upstream sdk.ts onResponse):
+        // fired once the provider response is received, before consuming the stream/tools.
+        emitLifecycle(options, "after_provider_response", "{\"status\":200}");
         try checkCancellation(options);
 
         if (response.tool_calls.len == 0) {
             const text = if (response.text) |value| value else try allocator.dupe(u8, "");
             response.text = null;
+            // [FLOW_J_EXTENSION_EVENTS] A final assistant message (no tool calls) ends the
+            // loop. Emit message_start/message_end around it and a terminal turn_end so the
+            // single-turn case still observes the message + turn lifecycle (upstream fires
+            // message_start/message_end per assistant message and turn_end per turn).
+            emitLifecycle(options, "message_start", "{\"role\":\"assistant\"}");
+            emitLifecycle(options, "message_end", "{\"role\":\"assistant\"}");
+            emitLifecycle(options, "turn_end", lifecycleTurnFields(&turn_fields_buf, turn));
             return .{
                 .final_text = text,
                 .tool_call_batches = try tool_call_batches.toOwnedSlice(allocator),
@@ -383,7 +432,11 @@ pub fn runPrompt(
             };
         }
 
+        // [FLOW_J_EXTENSION_EVENTS] An assistant message carrying tool calls: emit
+        // message_start/message_end around recording it (upstream MessageStart/MessageEnd).
+        emitLifecycle(options, "message_start", "{\"role\":\"assistant\"}");
         try appendAssistantToolCallMessage(allocator, &messages, &response);
+        emitLifecycle(options, "message_end", "{\"role\":\"assistant\"}");
         const tool_calls = messages.items[messages.items.len - 1].tool_calls;
         response.tool_calls = &.{};
 
@@ -440,6 +493,11 @@ pub fn runPrompt(
             tool_results_count += 1;
             if (traced_tool_result.terminate) terminating_results += 1;
         }
+
+        // [FLOW_J_EXTENSION_EVENTS] turn_end after the turn's tool results are recorded
+        // (upstream TurnEndEvent: {turnIndex,...}). The steering/prepare-next-turn hooks
+        // below are pi-zig's existing turn-lifecycle callbacks and stay unchanged.
+        emitLifecycle(options, "turn_end", lifecycleTurnFields(&turn_fields_buf, turn));
 
         const should_stop = try finishTurnLifecycle(allocator, &messages, options, .{
             .turn_index = turn,
@@ -677,6 +735,51 @@ fn checkCancellation(options: RunOptions) !void {
     }
 }
 
+// [FLOW_J_EXTENSION_EVENTS] Fire one notify-style lifecycle event from the prompt
+// loop. Best-effort: an extension/runner failure must not abort the turn (upstream's
+// emit() catches handler errors), so emission errors are swallowed. No-op when no
+// callback is registered (the no-extensions hot path).
+fn emitLifecycle(options: RunOptions, event_type: []const u8, fields_json: []const u8) void {
+    const callback = options.on_lifecycle_event orelse return;
+    const context = options.lifecycle_context orelse return;
+    callback(context, .{ .type = event_type, .fields_json = fields_json }) catch {};
+}
+
+// [FLOW_J_EXTENSION_EVENTS] Build a one-shot JSON fields object for an emission on the
+// fixed-size stack buffer (events carry a few small scalars). On overflow the event is
+// still emitted with empty fields rather than dropped, matching the best-effort contract.
+fn lifecycleTurnFields(buf: []u8, turn_index: usize) []const u8 {
+    var writer = std.Io.Writer.fixed(buf);
+    writer.print("{{\"turnIndex\":{d}}}", .{turn_index}) catch return "{}";
+    return writer.buffered();
+}
+
+fn lifecycleProviderRequestFields(buf: []u8, provider: []const u8, model: []const u8) []const u8 {
+    var writer = std.Io.Writer.fixed(buf);
+    writer.writeAll("{\"payload\":{\"provider\":") catch return "{}";
+    writeJsonStringValue(&writer, provider) catch return "{}";
+    writer.writeAll(",\"model\":") catch return "{}";
+    writeJsonStringValue(&writer, model) catch return "{}";
+    writer.writeAll("}}") catch return "{}";
+    return writer.buffered();
+}
+
+fn writeJsonStringValue(w: *std.Io.Writer, value: []const u8) !void {
+    try w.writeByte('"');
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            0...8, 11...12, 14...0x1f => try w.print("\\u{x:0>4}", .{byte}),
+            else => try w.writeByte(byte),
+        }
+    }
+    try w.writeByte('"');
+}
+
 fn emitToolUpdate(
     options: ?RunOptions,
     call: ai_client.ChatToolCall,
@@ -858,7 +961,7 @@ fn executeToolCallWithUpdates(
             }
         }
     }
-    if (std.mem.eql(u8, call.name, "read")) return executeReadTool(io, allocator, call.arguments_json, readToolModelSupportsImages(options));
+    if (std.mem.eql(u8, call.name, "read")) return executeReadTool(io, allocator, call.arguments_json, readToolModelSupportsImages(options), readToolAutoResizeImages(options));
     if (std.mem.eql(u8, call.name, "bash")) return executeBashTool(io, allocator, call, options);
     if (std.mem.eql(u8, call.name, "edit")) return executeEditTool(io, allocator, call.arguments_json);
     if (std.mem.eql(u8, call.name, "write")) return executeWriteTool(io, allocator, call.arguments_json);
@@ -881,7 +984,12 @@ fn readToolModelSupportsImages(options: ?RunOptions) bool {
     return model.input_image;
 }
 
-fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8, model_supports_images: bool) !ToolExecutionResult {
+fn readToolAutoResizeImages(options: ?RunOptions) bool {
+    const run_options = options orelse return true;
+    return run_options.auto_resize_images;
+}
+
+fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []const u8, model_supports_images: bool, auto_resize_images: bool) !ToolExecutionResult {
     var parsed = parseArguments(allocator, "read", arguments_json) catch |err| return toolError(try invalidJsonMessage(allocator, "read", err));
     defer parsed.deinit();
     const path = requiredString(parsed.value, "path") orelse return toolError(try allocator.dupe(u8, "read tool arguments are missing path."));
@@ -889,7 +997,7 @@ fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []c
         return toolError(try std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)}));
     };
     if (detected_mime) |mime_type| {
-        return executeReadImageTool(io, allocator, path, mime_type, model_supports_images) catch |err| {
+        return executeReadImageTool(io, allocator, path, mime_type, model_supports_images, auto_resize_images) catch |err| {
             return toolError(try std.fmt.allocPrint(allocator, "read tool failed: {s}", .{@errorName(err)}));
         };
     }
@@ -901,7 +1009,7 @@ fn executeReadTool(io: std.Io, allocator: std.mem.Allocator, arguments_json: []c
     return toolOk(content);
 }
 
-fn executeReadImageTool(io: std.Io, allocator: std.mem.Allocator, path: []const u8, mime_type: []const u8, model_supports_images: bool) !ToolExecutionResult {
+fn executeReadImageTool(io: std.Io, allocator: std.mem.Allocator, path: []const u8, mime_type: []const u8, model_supports_images: bool, auto_resize_images: bool) !ToolExecutionResult {
     const bytes = try tools.readFile(io, allocator, path, 16 * 1024 * 1024);
     defer allocator.free(bytes);
 
@@ -912,7 +1020,12 @@ fn executeReadImageTool(io: std.Io, allocator: std.mem.Allocator, path: []const 
     // images already under the limit pass through unchanged (upstream's "already within limits"
     // path), and oversized images are omitted with the same note upstream emits when Photon cannot
     // produce an under-limit encoding.
-    if (encoded_len >= image_resize_max_base64_bytes) {
+    //
+    // When `images.autoResize` is false the user has opted out of resizing entirely. pi-zig has no
+    // resize worker, so honoring that setting means skipping the size gate altogether: the image
+    // always passes through at its original size with no resize note, mirroring upstream's behavior
+    // of sending the un-resized bytes when auto-resize is disabled.
+    if (auto_resize_images and encoded_len >= image_resize_max_base64_bytes) {
         const content = if (model_supports_images)
             try std.fmt.allocPrint(allocator, "Read image file [{s}]\n{s}", .{ mime_type, image_resize_omitted_note })
         else
@@ -1159,6 +1272,57 @@ fn optionalTimeoutMilliseconds(value: std.json.Value, name: []const u8) !?i64 {
     return @max(1, @as(i64, @intFromFloat(milliseconds)));
 }
 
+test "[FLOW_J_EXTENSION_EVENTS] lifecycle field builders emit upstream-shaped JSON" {
+    var turn_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"turnIndex\":0}", lifecycleTurnFields(&turn_buf, 0));
+    try std.testing.expectEqualStrings("{\"turnIndex\":7}", lifecycleTurnFields(&turn_buf, 7));
+
+    var provider_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"payload\":{\"provider\":\"openai\",\"model\":\"gpt-4o\"}}",
+        lifecycleProviderRequestFields(&provider_buf, "openai", "gpt-4o"),
+    );
+    // A provider/model with a quote is escaped so the fields stay valid JSON.
+    try std.testing.expectEqualStrings(
+        "{\"payload\":{\"provider\":\"a\\\"b\",\"model\":\"m\"}}",
+        lifecycleProviderRequestFields(&provider_buf, "a\"b", "m"),
+    );
+}
+
+test "[FLOW_J_EXTENSION_EVENTS] emitLifecycle fires through the registered callback" {
+    const Collector = struct {
+        types: std.ArrayList([]const u8) = .empty,
+        allocator: std.mem.Allocator,
+        fn cb(ctx: *anyopaque, event: LifecycleEmitEvent) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.types.append(self.allocator, try self.allocator.dupe(u8, event.type));
+        }
+        fn deinit(self: *@This()) void {
+            for (self.types.items) |t| self.allocator.free(t);
+            self.types.deinit(self.allocator);
+        }
+    };
+    var collector = Collector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+    const options: RunOptions = .{
+        .provider = "p",
+        .model = "m",
+        .api_key = "k",
+        .prompt = "hi",
+        .lifecycle_context = &collector,
+        .on_lifecycle_event = Collector.cb,
+    };
+    emitLifecycle(options, "turn_start", "{}");
+    emitLifecycle(options, "after_provider_response", "{\"status\":200}");
+    try std.testing.expectEqual(@as(usize, 2), collector.types.items.len);
+    try std.testing.expectEqualStrings("turn_start", collector.types.items[0]);
+    try std.testing.expectEqualStrings("after_provider_response", collector.types.items[1]);
+
+    // With no callback registered the emission is a cheap no-op (no crash).
+    const no_cb: RunOptions = .{ .provider = "p", .model = "m", .api_key = "k", .prompt = "hi" };
+    emitLifecycle(no_cb, "turn_start", "{}");
+}
+
 test "unsupported tool call returns a tool result instead of aborting" {
     var call = ai_client.ChatToolCall{
         .id = try std.testing.allocator.dupe(u8, "call_unsupported"),
@@ -1344,6 +1508,86 @@ test "read oversized image for non-vision model appends both resize and non-visi
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings(
         "Read image file [image/png]\n" ++ image_resize_omitted_note ++ "\n" ++ non_vision_image_note,
+        result.content,
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.content_parts.len);
+}
+
+test "read oversized image passes through unchanged when auto-resize is disabled" {
+    // images.autoResize=false threads through RunOptions.auto_resize_images=false. pi-zig has no
+    // resize worker, so disabling auto-resize means the read-tool skips the encoded-size gate
+    // entirely: even an oversized image keeps its image part and emits no resize-omitted note,
+    // distinguishing this path from the default (auto_resize_images=true) which omits it.
+    const path = "zig-out/pi-zig-read-oversized-no-resize-test.png";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const oversized = try std.testing.allocator.alloc(u8, image_resize_max_base64_bytes);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'A');
+    const png_header = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52 };
+    @memcpy(oversized[0..png_header.len], &png_header);
+    try tools.writeFile(std.testing.io, path, oversized);
+
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_read_oversized_no_resize_image"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path}),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "amazon-bedrock",
+        .model = "amazon.nova-pro-v1:0",
+        .api_key = "",
+        .prompt = "",
+        .auto_resize_images = false,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    // No resize-omitted note: the bytes pass through at original size.
+    try std.testing.expectEqualStrings("Read image file [image/png]", result.content);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, image_resize_omitted_note) == null);
+    try std.testing.expectEqual(@as(usize, 2), result.content_parts.len);
+    switch (result.content_parts[1]) {
+        .image => |image| try std.testing.expectEqualStrings("image/png", image.mime_type),
+        .text => return error.ExpectedImageContentPart,
+    }
+}
+
+test "read oversized image keeps default resize-omit when auto-resize stays enabled" {
+    // Companion to the auto_resize_images=false test above: with the default RunOptions
+    // (auto_resize_images=true) the same oversized image is omitted with the resize note, proving
+    // the flag — not some unrelated change — is what flips the behavior.
+    const path = "zig-out/pi-zig-read-oversized-resize-default-test.png";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const oversized = try std.testing.allocator.alloc(u8, image_resize_max_base64_bytes);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'A');
+    const png_header = [_]u8{ 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52 };
+    @memcpy(oversized[0..png_header.len], &png_header);
+    try tools.writeFile(std.testing.io, path, oversized);
+
+    var call = ai_client.ChatToolCall{
+        .id = try std.testing.allocator.dupe(u8, "call_read_oversized_resize_default_image"),
+        .name = try std.testing.allocator.dupe(u8, "read"),
+        .arguments_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path}),
+    };
+    defer call.deinit(std.testing.allocator);
+
+    const result = try executeToolCallWithUpdates(std.testing.io, std.testing.allocator, call, .{
+        .provider = "amazon-bedrock",
+        .model = "amazon.nova-pro-v1:0",
+        .api_key = "",
+        .prompt = "",
+        // auto_resize_images defaults to true.
+    });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings(
+        "Read image file [image/png]\n" ++ image_resize_omitted_note,
         result.content,
     );
     try std.testing.expectEqual(@as(usize, 0), result.content_parts.len);

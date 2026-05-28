@@ -1,10 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("config.zig");
 
 const max_settings_bytes = 1024 * 1024;
 const project_settings_file = ".pi/settings.json";
 const upstream_package_name = "@earendil-works/pi-coding-agent";
 const latest_version_url = "https://pi.dev/api/latest-version";
+// Mirrors upstream windows-self-update.ts QUARANTINE_DIR_NAME: a sibling directory inside
+// the closest node_modules where loaded native addons are moved aside before an npm
+// self-update so Windows can overwrite the (otherwise locked) on-disk files.
+const quarantine_dir_name = ".pi-native-quarantine";
 
 const Command = enum {
     install,
@@ -758,23 +763,25 @@ fn parseHostPath(original: []const u8, raw: []const u8) ?ParsedSource {
     return .{ .kind = .git, .source = original, .host = host, .path = path, .ref = split.ref, .pinned = split.ref != null };
 }
 
-fn npmPackageName(spec: []const u8) []const u8 {
-    if (spec.len == 0) return spec;
+// Mirrors upstream parseNpmSpec regex /^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/: the name is the
+// optional leading "@scope" plus characters up to the FIRST subsequent "@", and the version
+// is everything after it. Using the first (not last) separator keeps npm-alias version specs
+// like "pkg@npm:other@1.0.0" intact (name="pkg", version="npm:other@1.0.0").
+fn npmSpecSeparator(spec: []const u8) ?usize {
+    if (spec.len == 0) return null;
     const search_start: usize = if (spec[0] == '@') 1 else 0;
-    if (std.mem.lastIndexOfScalar(u8, spec[search_start..], '@')) |relative_at| {
-        const at = search_start + relative_at;
-        return spec[0..at];
-    }
-    return spec;
+    const relative_at = std.mem.indexOfScalar(u8, spec[search_start..], '@') orelse return null;
+    return search_start + relative_at;
+}
+
+fn npmPackageName(spec: []const u8) []const u8 {
+    const at = npmSpecSeparator(spec) orelse return spec;
+    return spec[0..at];
 }
 
 fn npmPackageVersion(spec: []const u8) ?[]const u8 {
-    if (spec.len == 0) return null;
-    const search_start: usize = if (spec[0] == '@') 1 else 0;
-    if (std.mem.lastIndexOfScalar(u8, spec[search_start..], '@')) |relative_at| {
-        const at = search_start + relative_at;
-        if (at + 1 < spec.len) return spec[at + 1 ..];
-    }
+    const at = npmSpecSeparator(spec) orelse return null;
+    if (at + 1 < spec.len) return spec[at + 1 ..];
     return null;
 }
 
@@ -1265,6 +1272,13 @@ fn selfUpdateArgv(
         return error.PackageCommandFailed;
     }
 
+    // Mirrors package-manager-cli.ts: on Windows, self-update is only supported for npm and
+    // pnpm installs (other layouts hold native addons open and cannot be overwritten safely).
+    if (isWindows() and method != .npm and method != .pnpm) {
+        try writeWindowsSelfUpdateUnsupported(io, method);
+        return error.PackageCommandFailed;
+    }
+
     const package_dir = try entrypointPackageDir(io, allocator, cwd, exe_path);
     defer if (package_dir) |dir| allocator.free(dir);
 
@@ -1623,8 +1637,176 @@ fn runSelfUpdate(
 
     var argv = try selfUpdateArgv(io, allocator, env, cwd, agent_dir, exe_path, update_package_name);
     defer argv.deinit(allocator);
+
+    // Mirrors prepareWindowsNpmSelfUpdate(): only npm installs need the dance (pnpm rewrites
+    // the package directory wholesale). cleanup first, then move loaded native addons aside so
+    // the subsequent npm install can overwrite their on-disk files.
+    if (isWindows() and detectInstallMethodFromArgv(argv.items) == .npm) {
+        if (try entrypointPackageDir(io, allocator, cwd, exe_path)) |package_dir| {
+            defer allocator.free(package_dir);
+            cleanupWindowsSelfUpdateQuarantine(io, allocator, package_dir);
+            quarantineWindowsNativeDependencies(io, allocator, env, package_dir) catch {};
+        }
+    }
+
     try runCommand(io, allocator, argv.items, null);
     return true;
+}
+
+fn isWindows() bool {
+    return builtin.target.os.tag == .windows;
+}
+
+// The self-update argv's package manager is the source of truth for whether this is an npm
+// install (vs pnpm, which doesn't need the quarantine dance). Reuses packageManagerName so
+// wrapper commands like `mise exec node@20 -- npm install -g ...` are classified correctly.
+fn detectInstallMethodFromArgv(argv: []const []const u8) InstallMethod {
+    const name = packageManagerName(argv);
+    if (std.mem.eql(u8, name, "npm")) return .npm;
+    if (std.mem.eql(u8, name, "pnpm")) return .pnpm;
+    if (std.mem.eql(u8, name, "yarn")) return .yarn;
+    if (std.mem.eql(u8, name, "bun")) return .bun;
+    return .unknown;
+}
+
+fn writeWindowsSelfUpdateUnsupported(io: std.Io, method: InstallMethod) !void {
+    try writeStderr(io, config.app_name);
+    try writeStderr(io, " self-update on Windows is only supported for npm and pnpm installs.\n");
+    try writeStderr(io, "Detected install method: ");
+    try writeStderr(io, installMethodName(method));
+    try writeStderr(io, ". Update ");
+    try writeStderr(io, config.app_name);
+    try writeStderr(io, " manually.\n");
+}
+
+// Mirrors windows-self-update.ts getQuarantineRoot(): walk up from packageDir until a
+// directory named "node_modules" (case-insensitive) is found; the quarantine root lives
+// inside it. Returns null when no node_modules ancestor exists (e.g. a source checkout).
+fn quarantineRoot(allocator: std.mem.Allocator, package_dir: []const u8) !?[]u8 {
+    var current = try std.fs.path.resolve(allocator, &.{package_dir});
+    defer allocator.free(current);
+    while (true) {
+        const base = std.fs.path.basename(current);
+        if (std.ascii.eqlIgnoreCase(base, "node_modules")) {
+            return try std.fs.path.join(allocator, &.{ current, quarantine_dir_name });
+        }
+        const parent = std.fs.path.dirname(current) orelse return null;
+        if (std.mem.eql(u8, parent, current)) return null;
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+    }
+}
+
+// Mirrors cleanupWindowsSelfUpdateQuarantine(): best-effort removal of the whole quarantine
+// root. A previous pi process may still hold a native addon, so failures are ignored.
+fn cleanupWindowsSelfUpdateQuarantine(io: std.Io, allocator: std.mem.Allocator, package_dir: []const u8) void {
+    const root = (quarantineRoot(allocator, package_dir) catch return) orelse return;
+    defer allocator.free(root);
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+}
+
+// Mirrors quarantineWindowsNativeDependencies(): for each native addon under the package
+// directory, move it into a fresh per-run quarantine directory and copy it back. The
+// rename frees the original inode/handle so npm can replace the file even while the addon
+// stays loaded; the copy keeps the running process working until exit.
+//
+// DIVERGENCE: upstream enumerates the *loaded* shared objects via process.report (a Node
+// runtime API unavailable to a Zig binary). pi-zig instead enumerates native artifacts
+// (.node/.dll) on disk under the package directory, which is the same set Windows would
+// lock. The path math, per-run directory naming, and move+copy-back sequence match upstream.
+fn quarantineWindowsNativeDependencies(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, package_dir: []const u8) !void {
+    const resolved = try std.fs.path.resolve(allocator, &.{package_dir});
+    defer allocator.free(resolved);
+    const root = (try quarantineRoot(allocator, resolved)) orelse return;
+    defer allocator.free(root);
+
+    var loaded: std.ArrayList([]u8) = .empty;
+    defer {
+        for (loaded.items) |item| allocator.free(item);
+        loaded.deinit(allocator);
+    }
+    try collectNativeArtifacts(io, allocator, &loaded, resolved);
+    if (loaded.items.len == 0) return;
+
+    const run_dir = try quarantineRunDirName(io, allocator, root);
+    defer allocator.free(run_dir);
+
+    for (loaded.items) |loaded_file| {
+        if (!pathExists(io, loaded_file)) continue;
+        // Inputs are already absolute, so cwd/env are unused; pass them through for the
+        // Windows drive-relative path rules upstream relies on.
+        const rel = try std.fs.path.relative(allocator, resolved, env, resolved, loaded_file);
+        defer allocator.free(rel);
+        const quarantine_path = try std.fs.path.join(allocator, &.{ run_dir, rel });
+        defer allocator.free(quarantine_path);
+        if (std.fs.path.dirname(quarantine_path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+        // cwd-relative rename works for both absolute and cwd-relative paths (resolve() may
+        // return either depending on platform), avoiding renameAbsolute's absolute assertion.
+        const cwd_dir = std.Io.Dir.cwd();
+        try cwd_dir.rename(loaded_file, cwd_dir, quarantine_path, io);
+        try copyFileAbsolute(io, allocator, quarantine_path, loaded_file);
+    }
+}
+
+// Per-run quarantine directory name, mirroring upstream `${Date.now()}-${pid}-${uuid}`.
+// A timestamp + pid + random suffix keeps concurrent self-updates from colliding.
+fn quarantineRunDirName(io: std.Io, allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    const now = std.Io.Clock.real.now(io);
+    const millis: u64 = @intCast(@max(0, now.toMilliseconds()));
+    const pid: u32 = if (@hasDecl(std.posix, "getpid")) @bitCast(std.posix.getpid()) else 0;
+    // Random suffix (jiti-style uuid analog) seeded from the high-resolution clock so two
+    // self-update runs in the same millisecond still land in distinct run directories.
+    const nanos: u64 = @truncate(@as(u96, @bitCast(now.toNanoseconds())));
+    var prng = std.Random.DefaultPrng.init(nanos ^ (@as(u64, pid) << 32));
+    var random_bytes: [16]u8 = undefined;
+    prng.random().bytes(&random_bytes);
+    const suffix = std.fmt.bytesToHex(random_bytes, .lower);
+    const name = try std.fmt.allocPrint(allocator, "{d}-{d}-{s}", .{ millis, pid, suffix });
+    defer allocator.free(name);
+    return std.fs.path.join(allocator, &.{ root, name });
+}
+
+fn copyFileAbsolute(io: std.Io, allocator: std.mem.Allocator, source: []const u8, dest: []const u8) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, source, allocator, .limited(256 * 1024 * 1024));
+    defer allocator.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dest, .data = bytes });
+}
+
+// A native addon is a Windows-loadable artifact: Node native modules (.node) or shared
+// libraries (.dll). These are exactly the files Windows keeps open while loaded.
+fn isNativeArtifact(name: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(name, ".node") or std.ascii.endsWithIgnoreCase(name, ".dll");
+}
+
+fn collectNativeArtifacts(io: std.Io, allocator: std.mem.Allocator, out: *std.ArrayList([]u8), dir_path: []const u8) !void {
+    // Never descend into the quarantine directory itself (its files were copied back and
+    // would otherwise be re-quarantined on a later run).
+    if (std.mem.eql(u8, std.fs.path.basename(dir_path), quarantine_dir_name)) return;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, quarantine_dir_name)) continue;
+        const full = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        var keep = false;
+        defer if (!keep) allocator.free(full);
+        const stat = std.Io.Dir.cwd().statFile(io, full, .{}) catch continue;
+        switch (stat.kind) {
+            .file, .sym_link => {
+                if (isNativeArtifact(entry.name)) {
+                    try out.append(allocator, full);
+                    keep = true;
+                }
+            },
+            .directory => try collectNativeArtifacts(io, allocator, out, full),
+            else => {},
+        }
+    }
 }
 
 fn appendNpmCommandFromSettings(io: std.Io, allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), path: []const u8) !bool {
@@ -2017,6 +2199,30 @@ test "npmPackageName and npmPackageVersion split scoped specs" {
     try std.testing.expectEqualStrings("1.0.0", npmPackageVersion("pkg@1.0.0").?);
     try std.testing.expectEqualStrings("2.0.0", npmPackageVersion("@scope/pkg@2.0.0").?);
     try std.testing.expect(npmPackageVersion("@scope/pkg") == null);
+
+    // Version-range pins are detected (pinned = version present), matching upstream parseNpmSpec.
+    try std.testing.expectEqualStrings("left-pad", npmPackageName("left-pad@^1.2.3"));
+    try std.testing.expectEqualStrings("^1.2.3", npmPackageVersion("left-pad@^1.2.3").?);
+
+    // npm-alias specs keep the FIRST "@" as the separator so the alias target (which itself
+    // contains "@") stays in the version, not the name. Upstream's regex behaves identically.
+    try std.testing.expectEqualStrings("pkg", npmPackageName("pkg@npm:other@1.0.0"));
+    try std.testing.expectEqualStrings("npm:other@1.0.0", npmPackageVersion("pkg@npm:other@1.0.0").?);
+}
+
+test "parseSource marks version-range and alias npm specs as pinned" {
+    // Pinning drives upstream update behavior: a pinned npm source is skipped by `update`.
+    const ranged = parseSource("npm:left-pad@^1.2.3");
+    try std.testing.expectEqual(SourceKind.npm, ranged.kind);
+    try std.testing.expectEqualStrings("left-pad", ranged.name);
+    try std.testing.expect(ranged.pinned);
+
+    const aliased = parseSource("npm:pkg@npm:other@1.0.0");
+    try std.testing.expectEqualStrings("pkg", aliased.name);
+    try std.testing.expect(aliased.pinned);
+
+    const unpinned = parseSource("npm:pkg");
+    try std.testing.expect(!unpinned.pinned);
 }
 
 test "isNewerPackageVersion compares semantic versions" {
@@ -2089,4 +2295,119 @@ test "isPathInsideRoot honors directory boundaries" {
     try std.testing.expect(!isPathInsideRoot("/a/bc", "/a/b"));
     try std.testing.expect(!isPathInsideRoot("/a", "/a/b"));
     try std.testing.expect(!isPathInsideRoot("/a/b", ""));
+}
+
+test "quarantineRoot resolves the closest node_modules ancestor" {
+    const allocator = std.testing.allocator;
+    // Mirrors getQuarantineRoot(): the quarantine root is inside the nearest node_modules.
+    const root = (try quarantineRoot(allocator, "/usr/lib/node_modules/@scope/pi/dist")).?;
+    defer allocator.free(root);
+    try std.testing.expectEqualStrings("/usr/lib/node_modules/" ++ quarantine_dir_name, root);
+
+    // Case-insensitive match, matching upstream basename(current).toLowerCase().
+    const upper = (try quarantineRoot(allocator, "/opt/Node_Modules/pi")).?;
+    defer allocator.free(upper);
+    try std.testing.expectEqualStrings("/opt/Node_Modules/" ++ quarantine_dir_name, upper);
+
+    // No node_modules ancestor (e.g. a source checkout) -> null, so quarantine is skipped.
+    try std.testing.expect((try quarantineRoot(allocator, "/home/user/src/pi/dist")) == null);
+}
+
+test "isNativeArtifact recognizes Windows-loadable addons" {
+    try std.testing.expect(isNativeArtifact("addon.node"));
+    try std.testing.expect(isNativeArtifact("sharp.win32-x64.node"));
+    try std.testing.expect(isNativeArtifact("libvips.DLL"));
+    try std.testing.expect(!isNativeArtifact("index.js"));
+    try std.testing.expect(!isNativeArtifact("package.json"));
+    try std.testing.expect(!isNativeArtifact("readme.node.md"));
+}
+
+test "detectInstallMethodFromArgv classifies self-update commands" {
+    try std.testing.expectEqual(InstallMethod.npm, detectInstallMethodFromArgv(&.{ "npm", "install", "-g", "pkg" }));
+    try std.testing.expectEqual(InstallMethod.npm, detectInstallMethodFromArgv(&.{ "mise", "exec", "node@20", "--", "npm", "install", "-g", "pkg" }));
+    try std.testing.expectEqual(InstallMethod.pnpm, detectInstallMethodFromArgv(&.{ "pnpm", "install", "-g", "pkg" }));
+    try std.testing.expectEqual(InstallMethod.yarn, detectInstallMethodFromArgv(&.{ "yarn", "global", "add", "pkg" }));
+    try std.testing.expectEqual(InstallMethod.bun, detectInstallMethodFromArgv(&.{ "bun", "install", "-g", "pkg" }));
+    try std.testing.expectEqual(InstallMethod.unknown, detectInstallMethodFromArgv(&.{"corepack"}));
+}
+
+test "collectNativeArtifacts gathers .node/.dll and skips the quarantine dir" {
+    const allocator = std.testing.allocator;
+    const fixture = "zig-out/pi-zig-pkgmgr-native-collect-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, fixture) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture ++ "/build/Release");
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture ++ "/" ++ quarantine_dir_name ++ "/old");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = fixture ++ "/build/Release/addon.node", .data = "BIN" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = fixture ++ "/build/Release/native.dll", .data = "BIN" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = fixture ++ "/index.js", .data = "module.exports={}" });
+    // A previously-quarantined copy must NOT be re-collected.
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = fixture ++ "/" ++ quarantine_dir_name ++ "/old/stale.node", .data = "BIN" });
+
+    const resolved = try std.fs.path.resolve(allocator, &.{fixture});
+    defer allocator.free(resolved);
+
+    var found: std.ArrayList([]u8) = .empty;
+    defer {
+        for (found.items) |item| allocator.free(item);
+        found.deinit(allocator);
+    }
+    try collectNativeArtifacts(std.testing.io, allocator, &found, resolved);
+    try std.testing.expectEqual(@as(usize, 2), found.items.len);
+    var saw_node = false;
+    var saw_dll = false;
+    for (found.items) |item| {
+        if (std.mem.endsWith(u8, item, "addon.node")) saw_node = true;
+        if (std.mem.endsWith(u8, item, "native.dll")) saw_dll = true;
+        try std.testing.expect(std.mem.indexOf(u8, item, quarantine_dir_name) == null);
+    }
+    try std.testing.expect(saw_node and saw_dll);
+}
+
+test "quarantineWindowsNativeDependencies moves native addons aside and copies them back" {
+    const allocator = std.testing.allocator;
+    // The package dir lives inside a node_modules so getQuarantineRoot resolves a root.
+    const root = "zig-out/pi-zig-pkgmgr-quarantine-test/node_modules";
+    const package_dir = root ++ "/@scope/pi";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, "zig-out/pi-zig-pkgmgr-quarantine-test") catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, "zig-out/pi-zig-pkgmgr-quarantine-test") catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, package_dir ++ "/build/Release");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = package_dir ++ "/build/Release/addon.node", .data = "NATIVE-BYTES" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = package_dir ++ "/index.js", .data = "module.exports={}" });
+
+    const resolved = try std.fs.path.resolve(allocator, &.{package_dir});
+    defer allocator.free(resolved);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try quarantineWindowsNativeDependencies(std.testing.io, allocator, &env, resolved);
+
+    // The original on-disk file still exists (copied back) so the running process keeps working.
+    const copied_back = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, package_dir ++ "/build/Release/addon.node", allocator, .limited(1024));
+    defer allocator.free(copied_back);
+    try std.testing.expectEqualStrings("NATIVE-BYTES", copied_back);
+
+    // ...but it now lives behind a fresh inode: a quarantine run directory was created holding
+    // the moved-aside original. (The rename frees the handle npm needs to overwrite.)
+    const quarantine_parent = root ++ "/" ++ quarantine_dir_name;
+    var quarantine_dir = try std.Io.Dir.cwd().openDir(std.testing.io, quarantine_parent, .{ .iterate = true });
+    defer quarantine_dir.close(std.testing.io);
+    var run_dirs: usize = 0;
+    var found_quarantined_copy = false;
+    var it = quarantine_dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        run_dirs += 1;
+        const quarantined = std.fs.path.join(allocator, &.{ quarantine_parent, entry.name, "build", "Release", "addon.node" }) catch continue;
+        defer allocator.free(quarantined);
+        if (pathExists(std.testing.io, quarantined)) found_quarantined_copy = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), run_dirs);
+    try std.testing.expect(found_quarantined_copy);
+
+    // Non-native files are left untouched in place.
+    try std.testing.expect(pathExists(std.testing.io, package_dir ++ "/index.js"));
+
+    // Cleanup removes the whole quarantine root, matching cleanupWindowsSelfUpdateQuarantine.
+    cleanupWindowsSelfUpdateQuarantine(std.testing.io, allocator, resolved);
+    try std.testing.expect(!pathExists(std.testing.io, quarantine_parent));
 }

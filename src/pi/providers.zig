@@ -8,7 +8,25 @@ const EnvMapping = struct {
 const anthropic_keys = [_][]const u8{ "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY" };
 const github_copilot_keys = [_][]const u8{"COPILOT_GITHUB_TOKEN"};
 const openai_keys = [_][]const u8{"OPENAI_API_KEY"};
+// Azure OpenAI Responses' api-key env mapping mirrors upstream env-api-keys.ts,
+// which lists only AZURE_OPENAI_API_KEY. The deployment-routing variables
+// (AZURE_OPENAI_BASE_URL / AZURE_OPENAI_RESOURCE_NAME /
+// AZURE_OPENAI_DEPLOYMENT_NAME_MAP / AZURE_OPENAI_API_VERSION) are intentionally
+// NOT listed here: they are endpoint configuration consumed directly by the
+// Azure deployment-URL builder in ai_client.zig, not resolvable "api keys".
+// Adding them would make findEnvKey resolve a base URL or resource name as the
+// api_key and diverge from the upstream provider-env contract.
 const azure_openai_keys = [_][]const u8{"AZURE_OPENAI_API_KEY"};
+// Bedrock's api-key env mapping mirrors upstream env-api-keys.ts
+// (getApiKeyEnvVars), which lists only the bearer token. The IAM SigV4
+// credential variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+// AWS_SESSION_TOKEN / AWS_REGION) are intentionally NOT listed here: they are
+// not single "api keys" but a credential set consumed directly by the SigV4
+// signer in ai_client.zig. auth.zig surfaces the `<authenticated>` placeholder
+// when those creds are present, which routes ai_client to SigV4 instead of a
+// bearer header. Adding them here would make findEnvKey resolve a raw access
+// key id as the api_key (a broken `Bearer AKIA...`) and would diverge from the
+// upstream provider-env contract.
 const amazon_bedrock_keys = [_][]const u8{"AWS_BEARER_TOKEN_BEDROCK"};
 const deepseek_keys = [_][]const u8{"DEEPSEEK_API_KEY"};
 const google_keys = [_][]const u8{"GEMINI_API_KEY"};
@@ -104,4 +122,32 @@ test "provider env map includes OpenRouter and Groq" {
 
 test "provider env map includes Bedrock bearer token" {
     try std.testing.expectEqualStrings("AWS_BEARER_TOKEN_BEDROCK", envKeysFor("amazon-bedrock").?[0]);
+}
+
+test "Azure api-key env mapping excludes deployment-routing config variables" {
+    // Azure deployment routing (base URL / resource name / deployment map / api
+    // version) is consumed by the request builder, not resolvable as an api_key,
+    // so only AZURE_OPENAI_API_KEY belongs in the env map.
+    const keys = envKeysFor("azure-openai-responses").?;
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", keys[0]);
+    for (keys) |key| {
+        try std.testing.expect(!std.mem.eql(u8, key, "AZURE_OPENAI_BASE_URL"));
+        try std.testing.expect(!std.mem.eql(u8, key, "AZURE_OPENAI_RESOURCE_NAME"));
+        try std.testing.expect(!std.mem.eql(u8, key, "AZURE_OPENAI_DEPLOYMENT_NAME_MAP"));
+        try std.testing.expect(!std.mem.eql(u8, key, "AZURE_OPENAI_API_VERSION"));
+    }
+}
+
+test "Bedrock api-key env mapping excludes SigV4 IAM credential variables" {
+    // SigV4 IAM credentials are consumed directly by the request signer, not as
+    // a resolvable api_key, so they must never appear in the bearer-token list.
+    const keys = envKeysFor("amazon-bedrock").?;
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    for (keys) |key| {
+        try std.testing.expect(!std.mem.eql(u8, key, "AWS_ACCESS_KEY_ID"));
+        try std.testing.expect(!std.mem.eql(u8, key, "AWS_SECRET_ACCESS_KEY"));
+        try std.testing.expect(!std.mem.eql(u8, key, "AWS_SESSION_TOKEN"));
+        try std.testing.expect(!std.mem.eql(u8, key, "AWS_REGION"));
+    }
 }

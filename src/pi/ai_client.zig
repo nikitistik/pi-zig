@@ -100,6 +100,55 @@ pub const ChatCompletionError = error{
     AgentAborted,
 } || std.mem.Allocator.Error || std.http.Client.FetchError;
 
+// === Image generation ========================================================
+//
+// Mirrors upstream packages/ai/src/providers/images/openrouter.ts. The OpenRouter
+// images API is the OpenAI chat-completions shape extended with a `modalities`
+// array and a per-message `images[]` field on the assistant response. We model
+// the request input and parsed output as the same text/image content parts used
+// everywhere else in this module.
+
+/// A single piece of generated-image output: either model text or an image
+/// (decoded from a `data:<mime>;base64,<data>` URL into mime + base64 data).
+pub const GeneratedImagePart = union(enum) {
+    text: []u8,
+    image: ChatImageContent,
+
+    pub fn deinit(self: GeneratedImagePart, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .text => |text| allocator.free(text),
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        }
+    }
+};
+
+pub const ImageGenerationResult = struct {
+    output: []GeneratedImagePart = &.{},
+    response_id: ?[]u8 = null,
+
+    pub fn deinit(self: ImageGenerationResult, allocator: std.mem.Allocator) void {
+        for (self.output) |part| part.deinit(allocator);
+        allocator.free(self.output);
+        if (self.response_id) |id| allocator.free(id);
+    }
+};
+
+pub const ImageGenerationRequest = struct {
+    /// Image-generation provider. Only "openrouter" is wired today; it is the
+    /// sole built-in upstream images-api provider ("openrouter-images").
+    provider: []const u8,
+    model: []const u8,
+    api_key: []const u8,
+    /// Prompt + reference-image content parts forwarded to the model.
+    input: []const ChatContentPart,
+    /// When true, request both text and image modalities (matches upstream
+    /// `model.output.includes("text")`); otherwise request image-only.
+    include_text: bool = false,
+};
+
 pub const StreamTextCallback = *const fn (ctx: *anyopaque, delta: []const u8) anyerror!void;
 const StreamDataCallback = *const fn (ctx: *anyopaque, data: []const u8) anyerror!void;
 const max_provider_error_body_bytes = 16 * 1024;
@@ -300,6 +349,9 @@ pub fn runChatTurn(
     if (isBedrockProvider(request.provider)) {
         return runBedrockConverseTurn(io, allocator, env, request);
     }
+    if (isAzureOpenAIResponsesProvider(request.provider)) {
+        return runAzureOpenAIResponsesTurn(io, allocator, env, request);
+    }
 
     const endpoint = try endpointForProvider(allocator, env, request.provider);
     defer allocator.free(endpoint);
@@ -410,6 +462,9 @@ fn streamChatTurnData(
     }
     if (isBedrockProvider(request.provider)) {
         return streamBedrockConverseData(io, allocator, env, request, callback_context, callback);
+    }
+    if (isAzureOpenAIResponsesProvider(request.provider)) {
+        return streamAzureOpenAIResponsesData(io, allocator, env, request, callback_context, callback);
     }
 
     const endpoint = try endpointForProvider(allocator, env, request.provider);
@@ -532,6 +587,10 @@ fn isMistralProvider(provider: []const u8) bool {
 
 fn isBedrockProvider(provider: []const u8) bool {
     return std.mem.eql(u8, provider, "amazon-bedrock");
+}
+
+fn isAzureOpenAIResponsesProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "azure-openai-responses");
 }
 
 fn runAnthropicMessagesTurn(
@@ -865,6 +924,119 @@ fn streamGoogleVertexGenerateContentData(
     try readGoogleSseStream(reader, callback_context, callback, cancellationState(request));
 }
 
+fn runAzureOpenAIResponsesTurn(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+) ChatCompletionError!ChatCompletionResult {
+    const endpoint = azureOpenAIResponsesEndpoint(allocator, env, request.model) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedProvider => return error.UnsupportedProvider,
+        else => return error.ProviderClientError,
+    };
+    defer allocator.free(endpoint);
+
+    const payload = try buildAzureResponsesPayload(allocator, env, request, false);
+    defer allocator.free(payload);
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    // Azure authenticates the Responses API with an `api-key` header, not a
+    // Bearer authorization header (mirrors the AzureOpenAI SDK default).
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "api-key", .value = request.api_key },
+    };
+    const result = try client.fetch(.{
+        .location = .{ .url = endpoint },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+        },
+        .extra_headers = &extra_headers,
+    });
+    try checkCancellation(cancellationState(request));
+
+    const body = response_body.written();
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        return providerErrorForStatusAndBody(result.status, body);
+    }
+
+    return parseOpenAIResponsesResult(allocator, body);
+}
+
+fn streamAzureOpenAIResponsesData(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    callback_context: *anyopaque,
+    callback: StreamDataCallback,
+) !void {
+    const endpoint = try azureOpenAIResponsesEndpoint(allocator, env, request.model);
+    defer allocator.free(endpoint);
+
+    const payload = try buildAzureResponsesPayload(allocator, env, request, true);
+    defer allocator.free(payload);
+
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(endpoint);
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "api-key", .value = request.api_key },
+    };
+    var request_handle = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+            .accept_encoding = .{ .override = "identity" },
+        },
+        .extra_headers = &extra_headers,
+    });
+    defer request_handle.deinit();
+
+    request_handle.transfer_encoding = .{ .content_length = payload.len };
+    var body_writer = try request_handle.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(payload);
+    try body_writer.end();
+    try checkCancellation(cancellationState(request));
+    try request_handle.connection.?.flush();
+    try checkCancellation(cancellationState(request));
+
+    var response = try request_handle.receiveHead(&.{});
+    try checkCancellation(cancellationState(request));
+    if (@intFromEnum(response.head.status) < 200 or @intFromEnum(response.head.status) >= 300) {
+        var transfer_buffer: [1024]u8 = undefined;
+        const reader = response.reader(&transfer_buffer);
+        return providerErrorForStatusAndReader(allocator, response.head.status, reader);
+    }
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    try readDoneTerminatedSseStream(reader, callback_context, callback, cancellationState(request));
+}
+
 fn runMistralChatTurn(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -999,6 +1171,465 @@ fn runBedrockConverseTurn(
     };
 }
 
+// === Amazon Bedrock authentication ============================================
+//
+// Bedrock supports two local credential paths, mirroring the AWS SDK precedence
+// that upstream pi relies on:
+//
+//   1. Bearer token (AWS_BEARER_TOKEN_BEDROCK). When set, auth.zig resolves it as
+//      the request api_key and we send `Authorization: Bearer <token>` unchanged.
+//   2. IAM credentials (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY, optional
+//      AWS_SESSION_TOKEN). When no bearer token is present, auth.zig surfaces the
+//      `<authenticated>` placeholder api_key and we sign the ConverseStream POST
+//      with AWS Signature Version 4 (SigV4) using these environment credentials.
+//
+// Full ~/.aws/credentials profile resolution (AWS_PROFILE) and container/IMDS
+// credential providers are SDK-only behaviors; the documented divergence is that
+// pi-zig implements the equivalent SigV4 request signer over environment
+// credentials rather than re-implementing the entire AWS credential chain.
+
+const aws_sigv4_algorithm = "AWS4-HMAC-SHA256";
+const aws_bedrock_service = "bedrock";
+const aws_sigv4_request = "aws4_request";
+
+const BedrockSigV4Credentials = struct {
+    access_key_id: []const u8,
+    secret_access_key: []const u8,
+    session_token: ?[]const u8 = null,
+    region: []const u8,
+};
+
+const BedrockAuth = struct {
+    // When set, the value passed to the standard `authorization` override header.
+    authorization: []u8,
+    // SigV4 requests carry these extra signed/unsigned headers; the bearer path
+    // leaves them empty.
+    amz_date: ?[]u8 = null,
+    content_sha256: ?[]u8 = null,
+    security_token: ?[]const u8 = null,
+
+    fn deinit(self: *BedrockAuth, allocator: std.mem.Allocator) void {
+        allocator.free(self.authorization);
+        if (self.amz_date) |value| allocator.free(value);
+        if (self.content_sha256) |value| allocator.free(value);
+    }
+
+    fn extraHeaders(self: BedrockAuth, buf: *[3]std.http.Header) []const std.http.Header {
+        var len: usize = 0;
+        if (self.amz_date) |value| {
+            buf[len] = .{ .name = "x-amz-date", .value = value };
+            len += 1;
+        }
+        if (self.content_sha256) |value| {
+            buf[len] = .{ .name = "x-amz-content-sha256", .value = value };
+            len += 1;
+        }
+        if (self.security_token) |value| {
+            buf[len] = .{ .name = "x-amz-security-token", .value = value };
+            len += 1;
+        }
+        return buf[0..len];
+    }
+};
+
+/// True when the resolved Bedrock api_key is the ambient `<authenticated>`
+/// placeholder (or empty), which signals "no bearer token — use SigV4".
+fn isBedrockPlaceholderApiKey(api_key: []const u8) bool {
+    const trimmed = std.mem.trim(u8, api_key, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    return std.mem.eql(u8, trimmed, "<authenticated>");
+}
+
+fn bedrockRegion(env: *const std.process.Environ.Map) []const u8 {
+    return env.get("AWS_REGION") orelse env.get("AWS_DEFAULT_REGION") orelse "us-east-1";
+}
+
+fn bedrockSigV4CredentialsFromEnv(env: *const std.process.Environ.Map) ?BedrockSigV4Credentials {
+    const access_key_id = env.get("AWS_ACCESS_KEY_ID") orelse return null;
+    const secret_access_key = env.get("AWS_SECRET_ACCESS_KEY") orelse return null;
+    if (std.mem.trim(u8, access_key_id, " \t\r\n").len == 0) return null;
+    if (std.mem.trim(u8, secret_access_key, " \t\r\n").len == 0) return null;
+    var session_token: ?[]const u8 = null;
+    if (env.get("AWS_SESSION_TOKEN")) |token| {
+        if (std.mem.trim(u8, token, " \t\r\n").len > 0) session_token = token;
+    }
+    return .{
+        .access_key_id = access_key_id,
+        .secret_access_key = secret_access_key,
+        .session_token = session_token,
+        .region = bedrockRegion(env),
+    };
+}
+
+fn bedrockAuth(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    uri: std.Uri,
+    api_key: []const u8,
+    payload: []const u8,
+) !BedrockAuth {
+    if (!isBedrockPlaceholderApiKey(api_key)) {
+        // Existing bearer-token path. Keep behavior identical to before.
+        return .{ .authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) };
+    }
+    const credentials = bedrockSigV4CredentialsFromEnv(env) orelse {
+        // No bearer token and no IAM credentials: surface a client error rather
+        // than sending an empty `Bearer <authenticated>` header that would 4xx.
+        return error.ProviderClientError;
+    };
+    return signBedrockSigV4(allocator, uri, credentials, payload, bedrockSigV4Timestamp(io));
+}
+
+const AwsTimestamp = struct {
+    // YYYYMMDDTHHMMSSZ
+    amz_date: [16]u8,
+    // YYYYMMDD
+    date_stamp: [8]u8,
+};
+
+fn bedrockSigV4Timestamp(io: std.Io) AwsTimestamp {
+    const seconds = std.Io.Clock.real.now(io).toSeconds();
+    const secs: u64 = if (seconds > 0) @intCast(seconds) else 0;
+    return awsTimestampFromUnixSeconds(secs);
+}
+
+fn awsTimestampFromUnixSeconds(unix_seconds: u64) AwsTimestamp {
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = unix_seconds };
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    const year: u16 = year_day.year;
+    const month: u8 = month_day.month.numeric();
+    const day: u8 = month_day.day_index + 1;
+    const hour: u8 = day_seconds.getHoursIntoDay();
+    const minute: u8 = day_seconds.getMinutesIntoHour();
+    const second: u8 = day_seconds.getSecondsIntoMinute();
+
+    var ts: AwsTimestamp = undefined;
+    _ = std.fmt.bufPrint(&ts.date_stamp, "{d:0>4}{d:0>2}{d:0>2}", .{ year, month, day }) catch unreachable;
+    _ = std.fmt.bufPrint(&ts.amz_date, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{ year, month, day, hour, minute, second }) catch unreachable;
+    return ts;
+}
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+
+fn sha256Hex(input: []const u8) [Sha256.digest_length * 2]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(input, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn hmacSha256(key: []const u8, msg: []const u8) [HmacSha256.mac_length]u8 {
+    var out: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&out, msg, key);
+    return out;
+}
+
+/// AWS URI-encode per RFC 3986: only A-Z a-z 0-9 - . _ ~ stay literal; when
+/// `keep_slash` is true (path segments) the '/' separator is also preserved.
+fn writeAwsUriEncoded(w: *std.Io.Writer, value: []const u8, keep_slash: bool) !void {
+    const hex = "0123456789ABCDEF";
+    for (value) |byte| {
+        switch (byte) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => try w.writeByte(byte),
+            '/' => {
+                if (keep_slash) {
+                    try w.writeByte('/');
+                } else {
+                    try w.writeAll("%2F");
+                }
+            },
+            else => {
+                try w.writeByte('%');
+                try w.writeByte(hex[byte >> 4]);
+                try w.writeByte(hex[byte & 0x0f]);
+            },
+        }
+    }
+}
+
+/// Compute the host header value exactly as std.http.Client emits it, i.e. the
+/// URI authority (host plus ":port" for non-default ports). The signature must
+/// cover the same bytes the client puts on the wire.
+fn awsHostHeaderValue(allocator: std.mem.Allocator, uri: std.Uri) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try uri.writeToStream(&out.writer, .{ .authority = true });
+    return out.toOwnedSlice();
+}
+
+/// Canonical URI path component, AWS URI-encoded (segment-by-segment). An empty
+/// path canonicalizes to "/".
+fn awsCanonicalUriPath(allocator: std.mem.Allocator, uri: std.Uri) ![]u8 {
+    // Decode the path to raw bytes, then re-encode per AWS rules. The endpoint
+    // builder already percent-encodes ':' as %3A; round-tripping through the raw
+    // form keeps a single, canonical encoding regardless of input casing.
+    var raw_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer raw_buf.deinit();
+    try uri.path.formatRaw(&raw_buf.writer);
+    const raw_path = raw_buf.written();
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    if (raw_path.len == 0) {
+        try out.writer.writeByte('/');
+    } else {
+        try writeAwsUriEncoded(&out.writer, raw_path, true);
+    }
+    return out.toOwnedSlice();
+}
+
+fn awsCanonicalQueryString(allocator: std.mem.Allocator, uri: std.Uri) ![]u8 {
+    const query = uri.query orelse return allocator.dupe(u8, "");
+    var raw_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer raw_buf.deinit();
+    try query.formatRaw(&raw_buf.writer);
+    const raw_query = raw_buf.written();
+    if (raw_query.len == 0) return allocator.dupe(u8, "");
+
+    // Split on '&', then on the first '=', AWS-encode each side, sort by encoded
+    // key. ConverseStream uses no query parameters, so this stays simple but is
+    // implemented for canonical-request correctness.
+    const Pair = struct { key: []u8, value: []u8 };
+    var pairs: std.ArrayListUnmanaged(Pair) = .empty;
+    defer {
+        for (pairs.items) |pair| {
+            allocator.free(pair.key);
+            allocator.free(pair.value);
+        }
+        pairs.deinit(allocator);
+    }
+
+    var it = std.mem.splitScalar(u8, raw_query, '&');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, part, '=');
+        const raw_key = if (eq) |i| part[0..i] else part;
+        const raw_value = if (eq) |i| part[i + 1 ..] else "";
+
+        var key_buf: std.Io.Writer.Allocating = .init(allocator);
+        errdefer key_buf.deinit();
+        try writeAwsUriEncoded(&key_buf.writer, raw_key, false);
+        var value_buf: std.Io.Writer.Allocating = .init(allocator);
+        errdefer value_buf.deinit();
+        try writeAwsUriEncoded(&value_buf.writer, raw_value, false);
+        try pairs.append(allocator, .{ .key = try key_buf.toOwnedSlice(), .value = try value_buf.toOwnedSlice() });
+    }
+
+    std.mem.sort(Pair, pairs.items, {}, struct {
+        fn lessThan(_: void, a: Pair, b: Pair) bool {
+            return std.mem.order(u8, a.key, b.key) == .lt;
+        }
+    }.lessThan);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (pairs.items, 0..) |pair, index| {
+        if (index != 0) try out.writer.writeByte('&');
+        try out.writer.writeAll(pair.key);
+        try out.writer.writeByte('=');
+        try out.writer.writeAll(pair.value);
+    }
+    return out.toOwnedSlice();
+}
+
+const BedrockSigV4Inputs = struct {
+    canonical_request: []u8,
+    string_to_sign: []u8,
+    signature_hex: [HmacSha256.mac_length * 2]u8,
+    authorization: []u8,
+
+    fn deinit(self: *BedrockSigV4Inputs, allocator: std.mem.Allocator) void {
+        allocator.free(self.canonical_request);
+        allocator.free(self.string_to_sign);
+        allocator.free(self.authorization);
+    }
+};
+
+/// Generic SigV4 signer over a fully-built canonical-headers block. This is the
+/// algorithm core (canonical request -> string-to-sign -> signing key ->
+/// signature) shared by Bedrock and exercised directly by unit tests against the
+/// published AWS SigV4 test-suite vectors. No secret material is ever logged.
+fn awsSigV4SignCanonical(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    canonical_uri: []const u8,
+    canonical_query: []const u8,
+    canonical_headers: []const u8,
+    signed_headers: []const u8,
+    payload_hash: []const u8,
+    access_key_id: []const u8,
+    secret_access_key: []const u8,
+    region: []const u8,
+    service: []const u8,
+    amz_date: []const u8,
+    date_stamp: []const u8,
+) !BedrockSigV4Inputs {
+    var canonical_request_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer canonical_request_buf.deinit();
+    try canonical_request_buf.writer.print("{s}\n{s}\n{s}\n{s}\n{s}\n{s}", .{
+        method,
+        canonical_uri,
+        canonical_query,
+        canonical_headers,
+        signed_headers,
+        payload_hash,
+    });
+    const canonical_request = try canonical_request_buf.toOwnedSlice();
+    errdefer allocator.free(canonical_request);
+
+    const canonical_request_hash = sha256Hex(canonical_request);
+
+    // credential scope: <date>/<region>/<service>/aws4_request
+    var scope_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer scope_buf.deinit();
+    try scope_buf.writer.print("{s}/{s}/{s}/{s}", .{ date_stamp, region, service, aws_sigv4_request });
+    const credential_scope = scope_buf.written();
+
+    var string_to_sign_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer string_to_sign_buf.deinit();
+    try string_to_sign_buf.writer.print("{s}\n{s}\n{s}\n{s}", .{
+        aws_sigv4_algorithm,
+        amz_date,
+        credential_scope,
+        canonical_request_hash[0..],
+    });
+    const string_to_sign = try string_to_sign_buf.toOwnedSlice();
+    errdefer allocator.free(string_to_sign);
+
+    // Derive the signing key: HMAC chain date -> region -> service -> aws4_request.
+    var initial_key_buf: [4 + 256]u8 = undefined;
+    const initial_key = std.fmt.bufPrint(&initial_key_buf, "AWS4{s}", .{secret_access_key}) catch return error.ProviderClientError;
+    const k_date = hmacSha256(initial_key, date_stamp);
+    const k_region = hmacSha256(k_date[0..], region);
+    const k_service = hmacSha256(k_region[0..], service);
+    const k_signing = hmacSha256(k_service[0..], aws_sigv4_request);
+    const signature = hmacSha256(k_signing[0..], string_to_sign);
+    const signature_hex = std.fmt.bytesToHex(signature, .lower);
+
+    var authorization_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer authorization_buf.deinit();
+    try authorization_buf.writer.print("{s} Credential={s}/{s}, SignedHeaders={s}, Signature={s}", .{
+        aws_sigv4_algorithm,
+        access_key_id,
+        credential_scope,
+        signed_headers,
+        signature_hex[0..],
+    });
+    const authorization = try authorization_buf.toOwnedSlice();
+
+    return .{
+        .canonical_request = canonical_request,
+        .string_to_sign = string_to_sign,
+        .signature_hex = signature_hex,
+        .authorization = authorization,
+    };
+}
+
+/// Build the SigV4 canonical request, string-to-sign, signing key, and the final
+/// Authorization header for a Bedrock POST. Pure/deterministic given its inputs
+/// so it can be exercised by unit tests against published AWS vectors without
+/// touching the network. No secret material is ever written to logs.
+fn computeBedrockSigV4(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    canonical_uri: []const u8,
+    canonical_query: []const u8,
+    host_header: []const u8,
+    payload: []const u8,
+    credentials: BedrockSigV4Credentials,
+    timestamp: AwsTimestamp,
+    service: []const u8,
+) !BedrockSigV4Inputs {
+    const payload_hash = sha256Hex(payload);
+
+    // Canonical headers: lowercase name, trimmed value, sorted by name. We sign
+    // content-type, host, x-amz-content-sha256, x-amz-date and (when present)
+    // x-amz-security-token — the deterministic subset pi-zig controls.
+    var signed_headers_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer signed_headers_buf.deinit();
+    var canonical_headers_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer canonical_headers_buf.deinit();
+
+    try canonical_headers_buf.writer.print("content-type:application/json\nhost:{s}\nx-amz-content-sha256:{s}\nx-amz-date:{s}\n", .{ host_header, payload_hash[0..], timestamp.amz_date[0..] });
+    if (credentials.session_token != null) {
+        try canonical_headers_buf.writer.print("x-amz-security-token:{s}\n", .{credentials.session_token.?});
+        try signed_headers_buf.writer.writeAll("content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token");
+    } else {
+        try signed_headers_buf.writer.writeAll("content-type;host;x-amz-content-sha256;x-amz-date");
+    }
+
+    return awsSigV4SignCanonical(
+        allocator,
+        method,
+        canonical_uri,
+        canonical_query,
+        canonical_headers_buf.written(),
+        signed_headers_buf.written(),
+        payload_hash[0..],
+        credentials.access_key_id,
+        credentials.secret_access_key,
+        credentials.region,
+        service,
+        timestamp.amz_date[0..],
+        timestamp.date_stamp[0..],
+    );
+}
+
+fn signBedrockSigV4(
+    allocator: std.mem.Allocator,
+    uri: std.Uri,
+    credentials: BedrockSigV4Credentials,
+    payload: []const u8,
+    timestamp: AwsTimestamp,
+) !BedrockAuth {
+    const host_header = try awsHostHeaderValue(allocator, uri);
+    defer allocator.free(host_header);
+    const canonical_uri = try awsCanonicalUriPath(allocator, uri);
+    defer allocator.free(canonical_uri);
+    const canonical_query = try awsCanonicalQueryString(allocator, uri);
+    defer allocator.free(canonical_query);
+
+    const inputs = try computeBedrockSigV4(
+        allocator,
+        "POST",
+        canonical_uri,
+        canonical_query,
+        host_header,
+        payload,
+        credentials,
+        timestamp,
+        aws_bedrock_service,
+    );
+    // We only keep the Authorization header and the amz headers; the canonical
+    // request/string-to-sign are intermediate and freed here.
+    defer {
+        allocator.free(inputs.canonical_request);
+        allocator.free(inputs.string_to_sign);
+    }
+
+    const amz_date = try allocator.dupe(u8, timestamp.amz_date[0..]);
+    errdefer allocator.free(amz_date);
+    const content_sha256 = try sha256HexAlloc(allocator, payload);
+    errdefer allocator.free(content_sha256);
+
+    return .{
+        .authorization = inputs.authorization,
+        .amz_date = amz_date,
+        .content_sha256 = content_sha256,
+        .security_token = credentials.session_token,
+    };
+}
+
+fn sha256HexAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const hex = sha256Hex(input);
+    return allocator.dupe(u8, hex[0..]);
+}
+
 fn streamBedrockConverseData(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1013,10 +1644,16 @@ fn streamBedrockConverseData(
     const payload = try buildBedrockConversePayload(allocator, request);
     defer allocator.free(payload);
 
-    const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
-    defer allocator.free(authorization);
     const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
     defer allocator.free(user_agent);
+
+    const uri = try std.Uri.parse(endpoint);
+
+    // Resolve Bedrock auth: prefer a bearer token when one was supplied as the
+    // api_key (AWS_BEARER_TOKEN_BEDROCK path), otherwise sign the request with
+    // AWS Signature Version 4 using IAM credentials from the environment.
+    var auth = try bedrockAuth(io, allocator, env, uri, request.api_key, payload);
+    defer auth.deinit(allocator);
 
     var client: std.http.Client = .{
         .allocator = allocator,
@@ -1024,15 +1661,17 @@ fn streamBedrockConverseData(
     };
     defer client.deinit();
 
-    const uri = try std.Uri.parse(endpoint);
+    var extra_headers_buf: [3]std.http.Header = undefined;
+    const extra_headers = auth.extraHeaders(&extra_headers_buf);
     var request_handle = try client.request(.POST, uri, .{
         .redirect_behavior = .unhandled,
         .headers = .{
-            .authorization = .{ .override = authorization },
+            .authorization = .{ .override = auth.authorization },
             .content_type = .{ .override = "application/json" },
             .user_agent = .{ .override = user_agent },
             .accept_encoding = .{ .override = "identity" },
         },
+        .extra_headers = extra_headers,
     });
     defer request_handle.deinit();
 
@@ -1151,6 +1790,476 @@ fn isGoogleVertexPlaceholderApiKey(api_key: []const u8) bool {
     return std.mem.eql(u8, api_key, "<authenticated>") or
         std.mem.eql(u8, api_key, "gcp-vertex-credentials") or
         (api_key.len >= 2 and api_key[0] == '<' and api_key[api_key.len - 1] == '>');
+}
+
+// === Image generation request/response =======================================
+
+const ImageGenerationError = error{
+    UnsupportedProvider,
+    ProviderClientError,
+    ProviderRequestFailed,
+    ProviderResponseInvalid,
+    EmptyPrompt,
+} || std.mem.Allocator.Error || std.http.Client.FetchError;
+
+/// Run an OpenRouter image-generation request. Mirrors upstream
+/// generateImagesOpenRouter: POST the chat-completions shape with a
+/// `modalities` array, then parse `choices[0].message.images[]` data URLs (plus
+/// any leading text) into image/text content parts.
+pub fn runImageGeneration(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ImageGenerationRequest,
+) ImageGenerationError!ImageGenerationResult {
+    if (!isOpenRouterImagesProvider(request.provider)) return error.UnsupportedProvider;
+
+    const endpoint = try imageGenerationEndpointForProvider(allocator, env, request.provider);
+    defer allocator.free(endpoint);
+
+    const payload = try buildOpenRouterImagesPayload(allocator, request);
+    defer allocator.free(payload);
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
+    const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{request.api_key});
+    defer allocator.free(authorization);
+    const user_agent = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.app_name, config.version });
+    defer allocator.free(user_agent);
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const result = try client.fetch(.{
+        .location = .{ .url = endpoint },
+        .method = .POST,
+        .payload = payload,
+        .response_writer = &response_body.writer,
+        .headers = .{
+            .authorization = .{ .override = authorization },
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = user_agent },
+        },
+    });
+
+    const body = response_body.written();
+    if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        const code = @intFromEnum(result.status);
+        return if (code == 429 or code >= 500) error.ProviderRequestFailed else error.ProviderClientError;
+    }
+
+    return parseOpenRouterImagesResult(allocator, body);
+}
+
+fn isOpenRouterImagesProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "openrouter") or std.mem.eql(u8, provider, "openrouter-images");
+}
+
+fn imageGenerationEndpointForProvider(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    provider: []const u8,
+) ![]u8 {
+    if (env.get("PI_ZIG_IMAGES_BASE_URL")) |base_url| {
+        return endpointFromBaseUrl(allocator, base_url);
+    }
+    if (env.get("PI_ZIG_PROVIDER_BASE_URL")) |base_url| {
+        return endpointFromBaseUrl(allocator, base_url);
+    }
+    if (isOpenRouterImagesProvider(provider)) {
+        return allocator.dupe(u8, "https://openrouter.ai/api/v1/chat/completions");
+    }
+    return error.UnsupportedProvider;
+}
+
+/// Build the OpenRouter images request body. Equivalent to upstream buildParams:
+/// a single user message whose content is the text/image input parts, with
+/// `stream:false` and a `modalities` array.
+fn buildOpenRouterImagesPayload(allocator: std.mem.Allocator, request: ImageGenerationRequest) ![]u8 {
+    var has_prompt = false;
+    for (request.input) |part| {
+        switch (part) {
+            .text => |text| if (std.mem.trim(u8, text, " \t\r\n").len > 0) {
+                has_prompt = true;
+            },
+            .image => has_prompt = true,
+        }
+    }
+    if (!has_prompt) return error.EmptyPrompt;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    try w.writeAll("{\"model\":");
+    try writeJsonString(w, request.model);
+    try w.writeAll(",\"messages\":[{\"role\":\"user\",\"content\":");
+    // OpenRouter images always sends content as an array of parts (never the
+    // bare-string shortcut), matching upstream's ChatCompletionContentPart[].
+    try writeContentParts(w, request.input, null);
+    try w.writeAll("}],\"stream\":false,\"modalities\":");
+    if (request.include_text) {
+        try w.writeAll("[\"image\",\"text\"]");
+    } else {
+        try w.writeAll("[\"image\"]");
+    }
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+/// Parse an OpenRouter images response. Equivalent to the upstream output loop:
+/// pull `choices[0].message.content` (text) and each `choices[0].message.images[]`
+/// entry whose `image_url` is a `data:<mime>;base64,<data>` URL.
+fn parseOpenRouterImagesResult(allocator: std.mem.Allocator, body: []const u8) !ImageGenerationResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.ProviderResponseInvalid;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ProviderResponseInvalid;
+
+    var output: std.ArrayList(GeneratedImagePart) = .empty;
+    errdefer {
+        for (output.items) |part| part.deinit(allocator);
+        output.deinit(allocator);
+    }
+
+    var result: ImageGenerationResult = .{};
+    errdefer result.deinit(allocator);
+
+    if (parsed.value.object.get("id")) |id| {
+        if (id == .string) result.response_id = try allocator.dupe(u8, id.string);
+    }
+
+    const choices = parsed.value.object.get("choices") orelse return error.ProviderResponseInvalid;
+    if (choices != .array) return error.ProviderResponseInvalid;
+    if (choices.array.items.len == 0) {
+        result.output = try output.toOwnedSlice(allocator);
+        return result;
+    }
+
+    const first = choices.array.items[0];
+    if (first != .object) return error.ProviderResponseInvalid;
+    const message = first.object.get("message") orelse return error.ProviderResponseInvalid;
+    if (message != .object) return error.ProviderResponseInvalid;
+
+    if (message.object.get("content")) |content| {
+        if (content == .string and content.string.len > 0) {
+            const text = try allocator.dupe(u8, content.string);
+            errdefer allocator.free(text);
+            try output.append(allocator, .{ .text = text });
+        }
+    }
+
+    if (message.object.get("images")) |images| {
+        if (images == .array) {
+            for (images.array.items) |image| {
+                if (image != .object) continue;
+                const image_url_value = image.object.get("image_url") orelse continue;
+                const url = switch (image_url_value) {
+                    .string => |s| s,
+                    .object => |obj| blk: {
+                        const url_field = obj.get("url") orelse continue;
+                        if (url_field != .string) continue;
+                        break :blk url_field.string;
+                    },
+                    else => continue,
+                };
+                const decoded = parseBase64DataUrl(url) orelse continue;
+                const mime = try allocator.dupe(u8, decoded.mime_type);
+                errdefer allocator.free(mime);
+                const data = try allocator.dupe(u8, decoded.data);
+                errdefer allocator.free(data);
+                try output.append(allocator, .{ .image = .{ .mime_type = mime, .data = data } });
+            }
+        }
+    }
+
+    result.output = try output.toOwnedSlice(allocator);
+    return result;
+}
+
+/// Split `data:<mime>;base64,<payload>` into its mime type and base64 payload,
+/// matching upstream's `/^data:([^;]+);base64,(.+)$/`. Returns null for any URL
+/// that is not a base64 data URL.
+fn parseBase64DataUrl(url: []const u8) ?ChatImageContent {
+    const prefix = "data:";
+    if (!std.mem.startsWith(u8, url, prefix)) return null;
+    const after_prefix = url[prefix.len..];
+    const semicolon = std.mem.indexOfScalar(u8, after_prefix, ';') orelse return null;
+    const mime = after_prefix[0..semicolon];
+    if (mime.len == 0) return null;
+    const marker = ";base64,";
+    if (!std.mem.startsWith(u8, url[prefix.len + semicolon ..], marker)) return null;
+    const data = url[prefix.len + semicolon + marker.len ..];
+    if (data.len == 0) return null;
+    return .{ .mime_type = mime, .data = data };
+}
+
+// === Image resize (system-tool shell-out) =====================================
+//
+// Documented divergence from upstream's resize worker: Zig 0.16 has no built-in
+// image codec, so an in-process decode/scale/encode is not feasible. The honest
+// equivalent is to shell out to a system image tool when one is present:
+//
+//   * macOS:        `sips` (always available on macOS).
+//   * ImageMagick:  `magick` (v7) or `convert` (v6), when installed.
+//
+// When NO such tool is available the request is not silently "succeeded": the
+// caller receives `error.ResizeToolUnavailable` and can skip the resize step,
+// exactly like the smoke harness does on CI runners without an image tool.
+
+pub const ResizeError = error{
+    ResizeToolUnavailable,
+    ResizeFailed,
+    InvalidImageData,
+} || std.mem.Allocator.Error;
+
+pub const ResizeTool = enum { sips, magick, convert };
+
+pub const ResizedImage = struct {
+    tool: ResizeTool,
+    image: ChatImageContent, // mime_type + base64 data, both owned by caller
+
+    pub fn deinit(self: ResizedImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.image.data);
+        allocator.free(self.image.mime_type);
+    }
+};
+
+/// Probe for an available system image tool by running its version command.
+/// Returns null when neither sips, magick, nor convert can be executed.
+pub fn detectResizeTool(io: std.Io, allocator: std.mem.Allocator) ?ResizeTool {
+    const candidates = [_]struct { tool: ResizeTool, argv: []const []const u8 }{
+        .{ .tool = .sips, .argv = &.{ "sips", "--version" } },
+        .{ .tool = .magick, .argv = &.{ "magick", "--version" } },
+        .{ .tool = .convert, .argv = &.{ "convert", "--version" } },
+    };
+    for (candidates) |candidate| {
+        const run_result = std.process.run(allocator, io, .{
+            .argv = candidate.argv,
+            .expand_arg0 = .expand,
+        }) catch continue;
+        allocator.free(run_result.stdout);
+        allocator.free(run_result.stderr);
+        switch (run_result.term) {
+            .exited => |code| if (code == 0) return candidate.tool,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Re-encode `image` downscaled so its longest side is at most `max_dimension`
+/// pixels, using whichever system tool `detectResizeTool` finds. The image is
+/// written to a temp file, resized in place by the tool, and re-read + re-encoded
+/// to base64. Returns `error.ResizeToolUnavailable` when no tool exists so the
+/// caller can cleanly skip rather than fake a result.
+pub fn resizeImageWithSystemTool(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    image: ChatImageContent,
+    max_dimension: u32,
+) ResizeError!ResizedImage {
+    const tool = detectResizeTool(io, allocator) orelse return error.ResizeToolUnavailable;
+    return resizeImageWithTool(io, allocator, env, tool, image, max_dimension);
+}
+
+fn imageExtensionForMime(mime_type: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(mime_type, "image/png")) return "png";
+    if (std.ascii.eqlIgnoreCase(mime_type, "image/jpeg") or std.ascii.eqlIgnoreCase(mime_type, "image/jpg")) return "jpg";
+    if (std.ascii.eqlIgnoreCase(mime_type, "image/webp")) return "webp";
+    if (std.ascii.eqlIgnoreCase(mime_type, "image/gif")) return "gif";
+    return "png";
+}
+
+fn resizeImageWithTool(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    tool: ResizeTool,
+    image: ChatImageContent,
+    max_dimension: u32,
+) ResizeError!ResizedImage {
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(image.data) catch return error.InvalidImageData;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    decoder.decode(decoded, image.data) catch return error.InvalidImageData;
+
+    const ext = imageExtensionForMime(image.mime_type);
+
+    // Unique temp directory under the system temp root. The tool reads and
+    // re-writes the same absolute path in place, so no realpath() is needed. The
+    // unique suffix is seeded from the real-time clock + a PRNG draw so parallel
+    // resizes never collide.
+    const tmp_root = systemTempRoot(env);
+    const nanos: u96 = @bitCast(std.Io.Clock.real.now(io).toNanoseconds());
+    const seed: u64 = @truncate(nanos);
+    var prng = std.Random.DefaultPrng.init(seed);
+    var random_bytes: [12]u8 = undefined;
+    prng.random().bytes(&random_bytes);
+    var random_hex: [24]u8 = undefined;
+    _ = std.fmt.bufPrint(&random_hex, "{x}", .{&random_bytes}) catch unreachable;
+
+    const dir_path = std.fmt.allocPrint(allocator, "{s}/pi-zig-resize-{s}", .{ tmp_root, random_hex }) catch return error.OutOfMemory;
+    defer allocator.free(dir_path);
+    std.Io.Dir.cwd().createDirPath(io, dir_path) catch return error.ResizeFailed;
+    defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+
+    const in_path = std.fmt.allocPrint(allocator, "{s}/in.{s}", .{ dir_path, ext }) catch return error.OutOfMemory;
+    defer allocator.free(in_path);
+
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = in_path, .data = decoded }) catch return error.ResizeFailed;
+
+    const max_str = std.fmt.allocPrint(allocator, "{d}", .{max_dimension}) catch return error.OutOfMemory;
+    defer allocator.free(max_str);
+
+    // For sips the output overwrites the input file in place. For ImageMagick we
+    // pass the same path as input and output (`magick in -resize WxH> in`).
+    const geometry = std.fmt.allocPrint(allocator, "{d}x{d}>", .{ max_dimension, max_dimension }) catch return error.OutOfMemory;
+    defer allocator.free(geometry);
+
+    const argv: []const []const u8 = switch (tool) {
+        .sips => &.{ "sips", "-Z", max_str, in_path },
+        .magick => &.{ "magick", in_path, "-resize", geometry, in_path },
+        .convert => &.{ "convert", in_path, "-resize", geometry, in_path },
+    };
+
+    const run_result = std.process.run(allocator, io, .{
+        .argv = argv,
+        .expand_arg0 = .expand,
+    }) catch return error.ResizeFailed;
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+    switch (run_result.term) {
+        .exited => |code| if (code != 0) return error.ResizeFailed,
+        else => return error.ResizeFailed,
+    }
+
+    const resized_bytes = std.Io.Dir.cwd().readFileAlloc(io, in_path, allocator, .unlimited) catch return error.ResizeFailed;
+    defer allocator.free(resized_bytes);
+    if (resized_bytes.len == 0) return error.ResizeFailed;
+
+    const encoder = std.base64.standard.Encoder;
+    const encoded_len = encoder.calcSize(resized_bytes.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    errdefer allocator.free(encoded);
+    _ = encoder.encode(encoded, resized_bytes);
+
+    const mime = try allocator.dupe(u8, image.mime_type);
+    return .{ .tool = tool, .image = .{ .mime_type = mime, .data = encoded } };
+}
+
+fn systemTempRoot(env: *const std.process.Environ.Map) []const u8 {
+    if (env.get("TMPDIR")) |value| {
+        var end = value.len;
+        while (end > 0 and value[end - 1] == '/') end -= 1;
+        if (end > 0) return value[0..end];
+    }
+    return "/tmp";
+}
+
+// === Azure OpenAI Responses deployment routing ================================
+//
+// Mirrors azure-openai-responses.ts: an Azure-configured request must hit
+//   <baseUrl>/deployments/<deployment>/responses?api-version=<version>
+// where baseUrl is either AZURE_OPENAI_BASE_URL, derived from
+// AZURE_OPENAI_RESOURCE_NAME (https://<resource>.openai.azure.com/openai/v1), or
+// PI_ZIG_PROVIDER_BASE_URL (test/override). The deployment name is resolved from
+// AZURE_OPENAI_DEPLOYMENT_NAME_MAP ("modelId=deployment,...") falling back to the
+// model id, and the api-version defaults to AZURE_OPENAI_API_VERSION or "v1".
+
+const azure_default_api_version = "v1";
+
+/// Resolve the deployment name for `model` from AZURE_OPENAI_DEPLOYMENT_NAME_MAP
+/// ("modelA=deployA,modelB=deployB"), falling back to the model id when unmapped.
+fn azureResolveDeploymentName(env: *const std.process.Environ.Map, model: []const u8) []const u8 {
+    const map = env.get("AZURE_OPENAI_DEPLOYMENT_NAME_MAP") orelse return model;
+    var entries = std.mem.splitScalar(u8, map, ',');
+    while (entries.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const model_id = std.mem.trim(u8, trimmed[0..eq], " \t\r\n");
+        const deployment = std.mem.trim(u8, trimmed[eq + 1 ..], " \t\r\n");
+        if (model_id.len == 0 or deployment.len == 0) continue;
+        if (std.mem.eql(u8, model_id, model)) return deployment;
+    }
+    return model;
+}
+
+fn azureApiVersion(env: *const std.process.Environ.Map) []const u8 {
+    if (env.get("AZURE_OPENAI_API_VERSION")) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return azure_default_api_version;
+}
+
+/// Resolve the Azure base URL (without trailing slash). Precedence matches
+/// upstream resolveAzureConfig: explicit base URL > resource name > test
+/// override. Caller owns the returned slice.
+fn azureResolveBaseUrl(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
+    if (env.get("AZURE_OPENAI_BASE_URL")) |base_url| {
+        const trimmed = std.mem.trim(u8, base_url, " \t\r\n");
+        if (trimmed.len > 0) return trimAndDupeTrailingSlashes(allocator, trimmed);
+    }
+    if (env.get("AZURE_OPENAI_RESOURCE_NAME")) |resource_name| {
+        const trimmed = std.mem.trim(u8, resource_name, " \t\r\n");
+        if (trimmed.len > 0) {
+            return std.fmt.allocPrint(allocator, "https://{s}.openai.azure.com/openai/v1", .{trimmed});
+        }
+    }
+    if (env.get("PI_ZIG_PROVIDER_BASE_URL")) |base_url| {
+        const trimmed = std.mem.trim(u8, base_url, " \t\r\n");
+        if (trimmed.len > 0) return trimAndDupeTrailingSlashes(allocator, trimmed);
+    }
+    return error.UnsupportedProvider;
+}
+
+fn trimAndDupeTrailingSlashes(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') end -= 1;
+    return allocator.dupe(u8, value[0..end]);
+}
+
+/// Build the Azure OpenAI Responses endpoint:
+/// `<baseUrl>/deployments/<deployment>/responses?api-version=<version>`.
+fn azureOpenAIResponsesEndpoint(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    model: []const u8,
+) ![]u8 {
+    const base_url = try azureResolveBaseUrl(allocator, env);
+    defer allocator.free(base_url);
+    const deployment = azureResolveDeploymentName(env, model);
+    const api_version = azureApiVersion(env);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(base_url);
+    try out.writer.writeAll("/deployments/");
+    try writeUriPathSegment(&out.writer, deployment);
+    try out.writer.writeAll("/responses?api-version=");
+    try writeUriQueryComponent(&out.writer, api_version);
+    return out.toOwnedSlice();
+}
+
+fn writeUriQueryComponent(w: *std.Io.Writer, value: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (value) |byte| {
+        switch (byte) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => try w.writeByte(byte),
+            else => {
+                try w.writeByte('%');
+                try w.writeByte(hex[byte >> 4]);
+                try w.writeByte(hex[byte & 0x0f]);
+            },
+        }
+    }
 }
 
 fn endpointForProvider(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, provider: []const u8) ![]u8 {
@@ -1317,6 +2426,43 @@ fn requestSupportsImages(request: ChatTurnRequest) bool {
     return true;
 }
 
+/// Resolve the catalog entry for a turn the same way requestSupportsImages does:
+/// exact (provider,id) first, then a provider-qualified bare-id fallback.
+fn requestModelEntry(request: ChatTurnRequest) ?*const models.ModelEntry {
+    if (models.find(request.provider, request.model)) |model| return model;
+    if (models.findExactModelReference(request.model)) |model| {
+        if (std.ascii.eqlIgnoreCase(model.provider, request.provider)) return model;
+    }
+    return null;
+}
+
+/// Reasoning-effort string emitted for the Azure OpenAI Responses default path,
+/// mirroring azure-openai-responses.ts buildParams (and the shared
+/// openai-responses.ts logic). pi-zig has no explicit reasoning-effort option on
+/// ChatTurnRequest, so this reproduces the no-`reasoningEffort`/`reasoningSummary`
+/// branch only:
+///
+///   if (model.reasoning) {
+///     if (reasoningEffort || reasoningSummary) { ... }   // not reachable here
+///     else if (model.thinkingLevelMap?.off !== null) {
+///       params.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
+///     }
+///   }
+///
+/// The generated catalog encodes `thinkingLevelMap.off === null` as
+/// `thinking_off_disabled` (see scripts/generate-model-catalog.mjs `thinkingDisabled`).
+/// Across the entire upstream catalog the `off` key is only ever `null`, the
+/// string `"none"`, or absent, so when the branch fires the effort is always
+/// "none" (`?? "none"` with the sole explicit value being "none"). Non-reasoning
+/// models, and reasoning models whose `off` maps to null, emit nothing — matching
+/// upstream omitting `params.reasoning` entirely.
+fn azureDefaultReasoningEffort(request: ChatTurnRequest) ?[]const u8 {
+    const model = requestModelEntry(request) orelse return null;
+    if (!model.reasoning) return null;
+    if (model.thinking_off_disabled) return null;
+    return "none";
+}
+
 fn imagePlaceholderForMessage(message: ChatMessage, supports_images: bool) ?[]const u8 {
     if (supports_images) return null;
     return switch (message.role) {
@@ -1372,6 +2518,225 @@ fn buildPayloadWithStream(allocator: std.mem.Allocator, request: ChatTurnRequest
     }
     try w.writeByte('}');
     return out.toOwnedSlice();
+}
+
+/// Build the Azure OpenAI Responses request body. Mirrors azure-openai-responses
+/// buildParams + the shared convertResponsesMessages: the `model` field carries
+/// the resolved deployment name, and `input` is the Responses item array
+/// (`input_text`/`input_image`/`output_text`/`function_call`/`function_call_output`).
+fn buildAzureResponsesPayload(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    request: ChatTurnRequest,
+    stream: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const supports_images = requestSupportsImages(request);
+    const deployment = azureResolveDeploymentName(env, request.model);
+
+    // The wire `model` is the Azure deployment name, not the catalog model id.
+    try w.writeAll("{\"model\":");
+    try writeJsonString(w, deployment);
+    try w.writeAll(",\"input\":[");
+    var emitted: usize = 0;
+    var index: usize = 0;
+    while (index < request.messages.len) {
+        const message = request.messages[index];
+        switch (message.role) {
+            .tool => {
+                while (index < request.messages.len and request.messages[index].role == .tool) : (index += 1) {
+                    if (emitted != 0) try w.writeByte(',');
+                    try writeResponsesToolResultItem(w, request.messages[index], supports_images);
+                    emitted += 1;
+                }
+            },
+            .assistant => {
+                try writeResponsesAssistantItems(w, message, &emitted);
+                index += 1;
+            },
+            else => {
+                if (emitted != 0) try w.writeByte(',');
+                try writeResponsesInputMessage(w, message, supports_images);
+                emitted += 1;
+                index += 1;
+            },
+        }
+    }
+    try w.writeAll("],\"stream\":");
+    try w.writeAll(if (stream) "true" else "false");
+    if (request.tools.len > 0) {
+        try w.writeAll(",\"tools\":[");
+        for (request.tools, 0..) |tool, tool_index| {
+            if (tool_index != 0) try w.writeByte(',');
+            try writeResponsesToolDefinition(w, tool);
+        }
+        try w.writeByte(']');
+    }
+    // Reasoning effort for reasoning-capable models (upstream buildParams sets
+    // params.reasoning last, after tools). Omitted for non-reasoning models.
+    if (azureDefaultReasoningEffort(request)) |effort| {
+        try w.writeAll(",\"reasoning\":{\"effort\":");
+        try writeJsonString(w, effort);
+        try w.writeByte('}');
+    }
+    try w.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+/// A `system`/`developer`/`user` input message. Upstream sends user content as
+/// an array of `input_text`/`input_image` parts; system/developer prompts use a
+/// bare string.
+fn writeResponsesInputMessage(w: *std.Io.Writer, message: ChatMessage, supports_images: bool) !void {
+    const role_label = switch (message.role) {
+        .system => "system",
+        .user => "user",
+        else => "user",
+    };
+    try w.writeAll("{\"role\":\"");
+    try w.writeAll(role_label);
+    try w.writeAll("\",\"content\":");
+    if (message.role != .user) {
+        // System/developer prompt: bare string content.
+        try writeJsonString(w, message.content);
+        try w.writeByte('}');
+        return;
+    }
+    try w.writeByte('[');
+    var emitted: usize = 0;
+    if (message.content_parts.len > 0) {
+        const placeholder = imagePlaceholderForMessage(message, supports_images);
+        for (message.content_parts) |part| {
+            switch (part) {
+                .text => |text| {
+                    if (emitted != 0) try w.writeByte(',');
+                    try writeResponsesInputText(w, text);
+                    emitted += 1;
+                },
+                .image => |image| {
+                    if (emitted != 0) try w.writeByte(',');
+                    if (placeholder) |value| {
+                        try writeResponsesInputText(w, value);
+                    } else {
+                        try writeResponsesInputImage(w, image);
+                    }
+                    emitted += 1;
+                },
+            }
+        }
+    } else {
+        try writeResponsesInputText(w, message.content);
+        emitted += 1;
+    }
+    try w.writeAll("]}");
+}
+
+fn writeResponsesInputText(w: *std.Io.Writer, text: []const u8) !void {
+    try w.writeAll("{\"type\":\"input_text\",\"text\":");
+    try writeJsonString(w, text);
+    try w.writeByte('}');
+}
+
+fn writeResponsesInputImage(w: *std.Io.Writer, image: ChatImageContent) !void {
+    try w.writeAll("{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":\"data:");
+    try writeJsonStringFragment(w, image.mime_type);
+    try w.writeAll(";base64,");
+    try writeJsonStringFragment(w, image.data);
+    try w.writeAll("\"}");
+}
+
+/// An assistant turn becomes one `message` item (when it has text) plus one
+/// `function_call` item per tool call, matching convertResponsesMessages.
+fn writeResponsesAssistantItems(w: *std.Io.Writer, message: ChatMessage, emitted: *usize) !void {
+    if (message.content.len > 0) {
+        if (emitted.* != 0) try w.writeByte(',');
+        try w.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":");
+        try writeJsonString(w, message.content);
+        try w.writeAll(",\"annotations\":[]}]}");
+        emitted.* += 1;
+    }
+    for (message.tool_calls) |call| {
+        if (emitted.* != 0) try w.writeByte(',');
+        try w.writeAll("{\"type\":\"function_call\",\"call_id\":");
+        try writeJsonString(w, call.id);
+        try w.writeAll(",\"name\":");
+        try writeJsonString(w, call.name);
+        try w.writeAll(",\"arguments\":");
+        try writeJsonString(w, call.arguments_json);
+        try w.writeByte('}');
+        emitted.* += 1;
+    }
+}
+
+/// A `tool` message becomes a `function_call_output` item. Text-only results
+/// send a string output; results with images (on vision models) send an array
+/// of `input_text`/`input_image` parts.
+fn writeResponsesToolResultItem(w: *std.Io.Writer, message: ChatMessage, supports_images: bool) !void {
+    try w.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
+    try writeJsonString(w, message.tool_call_id orelse "");
+    try w.writeAll(",\"output\":");
+    const has_images = hasImageContentParts(message.content_parts);
+    if (has_images and supports_images) {
+        try w.writeByte('[');
+        var emitted: usize = 0;
+        if (hasTextContentParts(message.content_parts)) {
+            for (message.content_parts) |part| {
+                switch (part) {
+                    .text => |text| {
+                        if (text.len == 0) continue;
+                        if (emitted != 0) try w.writeByte(',');
+                        try writeResponsesInputText(w, text);
+                        emitted += 1;
+                    },
+                    .image => {},
+                }
+            }
+        } else if (message.content.len > 0) {
+            try writeResponsesInputText(w, message.content);
+            emitted += 1;
+        }
+        for (message.content_parts) |part| {
+            switch (part) {
+                .image => |image| {
+                    if (emitted != 0) try w.writeByte(',');
+                    try writeResponsesInputImage(w, image);
+                    emitted += 1;
+                },
+                .text => {},
+            }
+        }
+        try w.writeByte(']');
+    } else {
+        // Text-only output. Mirror upstream's "(see attached image)" fallback
+        // when a non-vision model would otherwise drop image-only results.
+        try writeJsonString(w, writeResponsesToolResultText(message));
+    }
+    try w.writeByte('}');
+}
+
+fn writeResponsesToolResultText(message: ChatMessage) []const u8 {
+    if (message.content.len > 0) return message.content;
+    if (hasTextContentParts(message.content_parts)) {
+        for (message.content_parts) |part| {
+            switch (part) {
+                .text => |text| if (text.len > 0) return text,
+                .image => {},
+            }
+        }
+    }
+    if (hasImageContentParts(message.content_parts)) return "(see attached image)";
+    return "";
+}
+
+fn writeResponsesToolDefinition(w: *std.Io.Writer, tool: ChatToolDefinition) !void {
+    try w.writeAll("{\"type\":\"function\",\"name\":");
+    try writeJsonString(w, tool.name);
+    try w.writeAll(",\"description\":");
+    try writeJsonString(w, tool.description);
+    try w.writeAll(",\"parameters\":");
+    try w.writeAll(tool.parameters_json);
+    try w.writeAll(",\"strict\":false}");
 }
 
 fn buildAnthropicMessagesPayload(allocator: std.mem.Allocator, request: ChatTurnRequest, stream: bool) ![]u8 {
@@ -3521,6 +4886,71 @@ fn parseOpenAICompatibleResult(allocator: std.mem.Allocator, body: []const u8) !
     return error.ProviderResponseInvalid;
 }
 
+/// Parse a non-streaming OpenAI/Azure Responses API result. The Responses API
+/// returns an `output[]` array whose items are `message` (with `content[]` of
+/// `output_text`) and `function_call` entries; a top-level `output_text`
+/// convenience string is also honored.
+fn parseOpenAIResponsesResult(allocator: std.mem.Allocator, body: []const u8) !ChatCompletionResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.ProviderResponseInvalid;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ProviderResponseInvalid;
+
+    var result: ChatCompletionResult = .{};
+    errdefer result.deinit(allocator);
+
+    var text_out: std.Io.Writer.Allocating = .init(allocator);
+    defer text_out.deinit();
+
+    var calls: std.ArrayList(ChatToolCall) = .empty;
+    errdefer {
+        for (calls.items) |call| call.deinit(allocator);
+        calls.deinit(allocator);
+    }
+
+    if (parsed.value.object.get("output")) |output| {
+        if (output != .array) return error.ProviderResponseInvalid;
+        for (output.array.items) |item| {
+            if (item != .object) continue;
+            const item_type = item.object.get("type") orelse continue;
+            if (item_type != .string) continue;
+            if (std.mem.eql(u8, item_type.string, "message")) {
+                const content = item.object.get("content") orelse continue;
+                if (content != .array) continue;
+                for (content.array.items) |part| {
+                    if (part != .object) continue;
+                    const part_type = part.object.get("type") orelse continue;
+                    if (part_type != .string or !std.mem.eql(u8, part_type.string, "output_text")) continue;
+                    const text = part.object.get("text") orelse continue;
+                    if (text != .string) continue;
+                    if (text_out.written().len != 0) try text_out.writer.writeByte('\n');
+                    try text_out.writer.writeAll(text.string);
+                }
+            } else if (std.mem.eql(u8, item_type.string, "function_call")) {
+                const call_id = item.object.get("call_id") orelse item.object.get("id") orelse continue;
+                if (call_id != .string) continue;
+                const name = item.object.get("name") orelse continue;
+                if (name != .string) continue;
+                const arguments = item.object.get("arguments") orelse continue;
+                if (arguments != .string) continue;
+                try calls.append(allocator, .{
+                    .id = try allocator.dupe(u8, call_id.string),
+                    .name = try allocator.dupe(u8, name.string),
+                    .arguments_json = try allocator.dupe(u8, arguments.string),
+                });
+            }
+        }
+    } else if (parsed.value.object.get("output_text")) |output_text| {
+        if (output_text == .string) try text_out.writer.writeAll(output_text.string);
+    } else {
+        return error.ProviderResponseInvalid;
+    }
+
+    if (text_out.written().len > 0) result.text = try text_out.toOwnedSlice();
+    result.tool_calls = try calls.toOwnedSlice(allocator);
+    if (result.text == null and result.tool_calls.len == 0) return error.ProviderResponseInvalid;
+    return result;
+}
+
 fn parseToolCalls(allocator: std.mem.Allocator, value: std.json.Value) ![]ChatToolCall {
     if (value != .array) return error.ProviderResponseInvalid;
     var calls: std.ArrayList(ChatToolCall) = .empty;
@@ -4386,4 +5816,509 @@ test "Bedrock provider base URL appends encoded converse stream endpoint" {
     const endpoint = try bedrockConverseStreamEndpointForProvider(std.testing.allocator, &env, "anthropic.claude-test-v1:0");
     defer std.testing.allocator.free(endpoint);
     try std.testing.expectEqualStrings("http://127.0.0.1:43123/model/anthropic.claude-test-v1%3A0/converse-stream", endpoint);
+}
+
+test "AWS SigV4 signing key matches AWS published derivation vector" {
+    // From the AWS docs "Examples of how to derive a signing key for Signature
+    // Version 4": secret + 20120215/us-east-1/iam yields a documented signing key.
+    var initial_key_buf: [4 + 256]u8 = undefined;
+    const initial_key = try std.fmt.bufPrint(&initial_key_buf, "AWS4{s}", .{"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"});
+    const k_date = hmacSha256(initial_key, "20120215");
+    const k_region = hmacSha256(k_date[0..], "us-east-1");
+    const k_service = hmacSha256(k_region[0..], "iam");
+    const k_signing = hmacSha256(k_service[0..], aws_sigv4_request);
+    const signing_hex = std.fmt.bytesToHex(k_signing, .lower);
+    try std.testing.expectEqualStrings(
+        "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d",
+        signing_hex[0..],
+    );
+}
+
+test "AWS SigV4 core reproduces the get-vanilla test-suite signature" {
+    // Official aws-sig-v4-test-suite "get-vanilla" vector: GET / with only the
+    // host and x-amz-date headers signed over an empty payload.
+    const empty_payload_hash = sha256Hex("");
+    const canonical_headers = "host:example.amazonaws.com\nx-amz-date:20150830T123600Z\n";
+    var inputs = try awsSigV4SignCanonical(
+        std.testing.allocator,
+        "GET",
+        "/",
+        "",
+        canonical_headers,
+        "host;x-amz-date",
+        empty_payload_hash[0..],
+        "AKIDEXAMPLE",
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        "us-east-1",
+        "service",
+        "20150830T123600Z",
+        "20150830",
+    );
+    defer inputs.deinit(std.testing.allocator);
+
+    // Published canonical-request hash and signature for get-vanilla.
+    const canonical_request_hash = sha256Hex(inputs.canonical_request);
+    try std.testing.expectEqualStrings(
+        "bb579772317eb040ac9ed261061d46c1f17a8133879d6129b6e1c25292927e63",
+        canonical_request_hash[0..],
+    );
+    try std.testing.expectEqualStrings(
+        "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31",
+        inputs.signature_hex[0..],
+    );
+    try std.testing.expectEqualStrings(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31",
+        inputs.authorization,
+    );
+}
+
+test "Bedrock SigV4 builds a stable, structurally-correct authorization header" {
+    const uri = try std.Uri.parse("https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-test-v1%3A0/converse-stream");
+    const credentials = BedrockSigV4Credentials{
+        .access_key_id = "AKIDEXAMPLE",
+        .secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+    };
+    const timestamp = AwsTimestamp{ .amz_date = "20150830T123600Z".*, .date_stamp = "20150830".* };
+    const payload = "{\"messages\":[]}";
+
+    var first = try signBedrockSigV4(std.testing.allocator, uri, credentials, payload, timestamp);
+    defer first.deinit(std.testing.allocator);
+
+    // Authorization carries the SigV4 algorithm, the bedrock-scoped credential,
+    // the deterministic SignedHeaders subset, and a 64-hex-char signature.
+    try std.testing.expect(std.mem.startsWith(u8, first.authorization, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature="));
+    const sig_marker = "Signature=";
+    const sig_index = std.mem.indexOf(u8, first.authorization, sig_marker).?;
+    const signature = first.authorization[sig_index + sig_marker.len ..];
+    try std.testing.expectEqual(@as(usize, 64), signature.len);
+    for (signature) |byte| try std.testing.expect(std.ascii.isHex(byte) and !std.ascii.isUpper(byte));
+
+    // The signed x-amz-date header value matches the timestamp, and the content
+    // hash header is the SHA-256 of the exact payload.
+    try std.testing.expectEqualStrings("20150830T123600Z", first.amz_date.?);
+    const expected_payload_hash = sha256Hex(payload);
+    try std.testing.expectEqualStrings(expected_payload_hash[0..], first.content_sha256.?);
+    try std.testing.expect(first.security_token == null);
+
+    // Determinism: identical inputs reproduce an identical signature.
+    var second = try signBedrockSigV4(std.testing.allocator, uri, credentials, payload, timestamp);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(first.authorization, second.authorization);
+
+    // Sensitivity: a different payload changes the signature.
+    var changed_payload = try signBedrockSigV4(std.testing.allocator, uri, credentials, "{\"messages\":[{\"role\":\"user\"}]}", timestamp);
+    defer changed_payload.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(u8, first.authorization, changed_payload.authorization));
+
+    // Sensitivity: a different request date changes the signature.
+    const other_timestamp = AwsTimestamp{ .amz_date = "20150831T000000Z".*, .date_stamp = "20150831".* };
+    var changed_date = try signBedrockSigV4(std.testing.allocator, uri, credentials, payload, other_timestamp);
+    defer changed_date.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(u8, first.authorization, changed_date.authorization));
+}
+
+test "Bedrock SigV4 session token participates in SignedHeaders and changes the signature" {
+    const uri = try std.Uri.parse("https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-test-v1%3A0/converse-stream");
+    const timestamp = AwsTimestamp{ .amz_date = "20150830T123600Z".*, .date_stamp = "20150830".* };
+    const payload = "{\"messages\":[]}";
+
+    const base = BedrockSigV4Credentials{
+        .access_key_id = "AKIDEXAMPLE",
+        .secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+    };
+    var without_token = try signBedrockSigV4(std.testing.allocator, uri, base, payload, timestamp);
+    defer without_token.deinit(std.testing.allocator);
+
+    var with_token_creds = base;
+    with_token_creds.session_token = "FAKESESSIONTOKEN==";
+    var with_token = try signBedrockSigV4(std.testing.allocator, uri, with_token_creds, payload, timestamp);
+    defer with_token.deinit(std.testing.allocator);
+
+    // The security token must be sent as an extra header and folded into the
+    // signed-header list, which in turn changes the computed signature.
+    try std.testing.expectEqualStrings("FAKESESSIONTOKEN==", with_token.security_token.?);
+    try std.testing.expect(std.mem.indexOf(u8, with_token.authorization, "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token") != null);
+    try std.testing.expect(!std.mem.eql(u8, without_token.authorization, with_token.authorization));
+
+    var buf: [3]std.http.Header = undefined;
+    const headers = with_token.extraHeaders(&buf);
+    try std.testing.expectEqual(@as(usize, 3), headers.len);
+    try std.testing.expectEqualStrings("x-amz-date", headers[0].name);
+    try std.testing.expectEqualStrings("x-amz-content-sha256", headers[1].name);
+    try std.testing.expectEqualStrings("x-amz-security-token", headers[2].name);
+    try std.testing.expectEqualStrings("FAKESESSIONTOKEN==", headers[2].value);
+}
+
+test "Bedrock SigV4 canonical URI and query are AWS encoded" {
+    const uri = try std.Uri.parse("https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-test-v1%3A0/converse-stream?b=2&a=1%20space");
+    const canonical_uri = try awsCanonicalUriPath(std.testing.allocator, uri);
+    defer std.testing.allocator.free(canonical_uri);
+    // ':' encodes to %3A, '/' separators are preserved.
+    try std.testing.expectEqualStrings("/model/anthropic.claude-test-v1%3A0/converse-stream", canonical_uri);
+
+    const canonical_query = try awsCanonicalQueryString(std.testing.allocator, uri);
+    defer std.testing.allocator.free(canonical_query);
+    // Parameters are sorted by key and values AWS-encoded (space -> %20).
+    try std.testing.expectEqualStrings("a=1%20space&b=2", canonical_query);
+
+    // The host header matches the URI authority emitted by std.http.Client,
+    // including a non-default port.
+    const ported = try std.Uri.parse("http://127.0.0.1:43123/model/x/converse-stream");
+    const host = try awsHostHeaderValue(std.testing.allocator, ported);
+    defer std.testing.allocator.free(host);
+    try std.testing.expectEqualStrings("127.0.0.1:43123", host);
+}
+
+test "Bedrock auth selects bearer token over SigV4 and falls back to SigV4 for placeholder keys" {
+    const uri = try std.Uri.parse("https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-test-v1%3A0/converse-stream");
+    const payload = "{\"messages\":[]}";
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    // IAM credentials are present, but a real bearer token must still win.
+    try env.put("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    try env.put("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+
+    var bearer = try bedrockAuth(std.testing.io, std.testing.allocator, &env, uri, "real-bearer-token", payload);
+    defer bearer.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Bearer real-bearer-token", bearer.authorization);
+    try std.testing.expect(bearer.amz_date == null);
+
+    // The ambient `<authenticated>` placeholder routes to SigV4 over the IAM creds.
+    var sigv4 = try bedrockAuth(std.testing.io, std.testing.allocator, &env, uri, "<authenticated>", payload);
+    defer sigv4.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, sigv4.authorization, "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"));
+    try std.testing.expect(std.mem.indexOf(u8, sigv4.authorization, "/us-east-1/bedrock/aws4_request") != null);
+    try std.testing.expect(sigv4.amz_date != null);
+
+    // A placeholder key with no IAM credentials is a client error, not a silent
+    // empty bearer header.
+    var empty_env = std.process.Environ.Map.init(std.testing.allocator);
+    defer empty_env.deinit();
+    try std.testing.expectError(error.ProviderClientError, bedrockAuth(std.testing.io, std.testing.allocator, &empty_env, uri, "<authenticated>", payload));
+}
+
+test "Bedrock SigV4 credential resolution honors region and session-token env precedence" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    // No creds -> no SigV4 credentials.
+    try std.testing.expect(bedrockSigV4CredentialsFromEnv(&env) == null);
+
+    try env.put("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    // Missing secret key still yields null.
+    try std.testing.expect(bedrockSigV4CredentialsFromEnv(&env) == null);
+
+    try env.put("AWS_SECRET_ACCESS_KEY", "secret");
+    const default_region = bedrockSigV4CredentialsFromEnv(&env).?;
+    try std.testing.expectEqualStrings("us-east-1", default_region.region);
+    try std.testing.expect(default_region.session_token == null);
+
+    try env.put("AWS_DEFAULT_REGION", "eu-west-1");
+    try std.testing.expectEqualStrings("eu-west-1", bedrockSigV4CredentialsFromEnv(&env).?.region);
+
+    // AWS_REGION takes precedence over AWS_DEFAULT_REGION.
+    try env.put("AWS_REGION", "ap-southeast-2");
+    try std.testing.expectEqualStrings("ap-southeast-2", bedrockSigV4CredentialsFromEnv(&env).?.region);
+
+    try env.put("AWS_SESSION_TOKEN", "session-token");
+    try std.testing.expectEqualStrings("session-token", bedrockSigV4CredentialsFromEnv(&env).?.session_token.?);
+
+    try std.testing.expect(isBedrockPlaceholderApiKey("<authenticated>"));
+    try std.testing.expect(isBedrockPlaceholderApiKey(""));
+    try std.testing.expect(isBedrockPlaceholderApiKey("   "));
+    try std.testing.expect(!isBedrockPlaceholderApiKey("AWS_BEARER_real_token"));
+}
+
+// === Image generation tests ===================================================
+
+test "serializes OpenRouter image-generation request with modalities" {
+    const input = [_]ChatContentPart{
+        .{ .text = "draw a red square" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const image_only = try buildOpenRouterImagesPayload(std.testing.allocator, .{
+        .provider = "openrouter",
+        .model = "google/gemini-2.5-flash-image",
+        .api_key = "unused",
+        .input = input[0..],
+    });
+    defer std.testing.allocator.free(image_only);
+
+    try std.testing.expect(std.mem.indexOf(u8, image_only, "\"model\":\"google/gemini-2.5-flash-image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, image_only, "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"draw a red square\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGVsbG8=\"}}]}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, image_only, "\"stream\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, image_only, "\"modalities\":[\"image\"]") != null);
+
+    const with_text = try buildOpenRouterImagesPayload(std.testing.allocator, .{
+        .provider = "openrouter",
+        .model = "google/gemini-2.5-flash-image",
+        .api_key = "unused",
+        .input = input[0..],
+        .include_text = true,
+    });
+    defer std.testing.allocator.free(with_text);
+    try std.testing.expect(std.mem.indexOf(u8, with_text, "\"modalities\":[\"image\",\"text\"]") != null);
+}
+
+test "rejects empty OpenRouter image-generation input" {
+    const blank = [_]ChatContentPart{.{ .text = "   " }};
+    try std.testing.expectError(error.EmptyPrompt, buildOpenRouterImagesPayload(std.testing.allocator, .{
+        .provider = "openrouter",
+        .model = "google/gemini-2.5-flash-image",
+        .api_key = "unused",
+        .input = blank[0..],
+    }));
+}
+
+test "parses OpenRouter image-generation response into image and text parts" {
+    const body =
+        \\{"id":"gen-123","choices":[{"message":{"content":"here is your image","images":[{"image_url":{"url":"data:image/png;base64,aGVsbG8="}},{"image_url":"data:image/jpeg;base64,d29ybGQ="},{"image_url":"https://example.com/not-a-data-url.png"}]}}]}
+    ;
+    var result = try parseOpenRouterImagesResult(std.testing.allocator, body);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("gen-123", result.response_id.?);
+    // text part + two valid data-url images; the http(s) url is skipped.
+    try std.testing.expectEqual(@as(usize, 3), result.output.len);
+    try std.testing.expectEqualStrings("here is your image", result.output[0].text);
+    try std.testing.expectEqualStrings("image/png", result.output[1].image.mime_type);
+    try std.testing.expectEqualStrings("aGVsbG8=", result.output[1].image.data);
+    try std.testing.expectEqualStrings("image/jpeg", result.output[2].image.mime_type);
+    try std.testing.expectEqualStrings("d29ybGQ=", result.output[2].image.data);
+}
+
+test "parses OpenRouter image-generation response with no images" {
+    const body =
+        \\{"id":"gen-empty","choices":[{"message":{"content":"refused"}}]}
+    ;
+    var result = try parseOpenRouterImagesResult(std.testing.allocator, body);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), result.output.len);
+    try std.testing.expectEqualStrings("refused", result.output[0].text);
+}
+
+test "parses base64 data URLs and rejects non-data URLs" {
+    const ok = parseBase64DataUrl("data:image/png;base64,aGVsbG8=").?;
+    try std.testing.expectEqualStrings("image/png", ok.mime_type);
+    try std.testing.expectEqualStrings("aGVsbG8=", ok.data);
+
+    try std.testing.expect(parseBase64DataUrl("https://example.com/foo.png") == null);
+    try std.testing.expect(parseBase64DataUrl("data:image/png,notbase64") == null);
+    try std.testing.expect(parseBase64DataUrl("data:;base64,abc") == null);
+    try std.testing.expect(parseBase64DataUrl("data:image/png;base64,") == null);
+}
+
+test "image-generation endpoint defaults to OpenRouter and honors overrides" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    const default_endpoint = try imageGenerationEndpointForProvider(std.testing.allocator, &env, "openrouter");
+    defer std.testing.allocator.free(default_endpoint);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/chat/completions", default_endpoint);
+
+    try env.put("PI_ZIG_IMAGES_BASE_URL", "http://127.0.0.1:43321/v1/");
+    const override_endpoint = try imageGenerationEndpointForProvider(std.testing.allocator, &env, "openrouter");
+    defer std.testing.allocator.free(override_endpoint);
+    try std.testing.expectEqualStrings("http://127.0.0.1:43321/v1/chat/completions", override_endpoint);
+}
+
+// === Azure OpenAI Responses tests =============================================
+
+test "Azure Responses endpoint maps deployment name and api-version" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    // Resource-name derivation + default api-version.
+    try env.put("AZURE_OPENAI_RESOURCE_NAME", "contoso");
+    const from_resource = try azureOpenAIResponsesEndpoint(std.testing.allocator, &env, "gpt-5");
+    defer std.testing.allocator.free(from_resource);
+    try std.testing.expectEqualStrings(
+        "https://contoso.openai.azure.com/openai/v1/deployments/gpt-5/responses?api-version=v1",
+        from_resource,
+    );
+
+    // Explicit base URL wins over resource name; deployment-name map applies.
+    try env.put("AZURE_OPENAI_BASE_URL", "https://contoso.openai.azure.com/openai/v1/");
+    try env.put("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "gpt-5=prod-gpt5,gpt-4o=prod-4o");
+    try env.put("AZURE_OPENAI_API_VERSION", "2025-04-01-preview");
+    const mapped = try azureOpenAIResponsesEndpoint(std.testing.allocator, &env, "gpt-5");
+    defer std.testing.allocator.free(mapped);
+    try std.testing.expectEqualStrings(
+        "https://contoso.openai.azure.com/openai/v1/deployments/prod-gpt5/responses?api-version=2025-04-01-preview",
+        mapped,
+    );
+
+    // Unmapped model falls back to its own id as the deployment name.
+    const unmapped = try azureOpenAIResponsesEndpoint(std.testing.allocator, &env, "o3-mini");
+    defer std.testing.allocator.free(unmapped);
+    try std.testing.expectEqualStrings(
+        "https://contoso.openai.azure.com/openai/v1/deployments/o3-mini/responses?api-version=2025-04-01-preview",
+        unmapped,
+    );
+}
+
+test "Azure Responses endpoint requires base URL or resource name" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.UnsupportedProvider, azureOpenAIResponsesEndpoint(std.testing.allocator, &env, "gpt-5"));
+}
+
+test "Azure Responses endpoint accepts test override base URL" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("PI_ZIG_PROVIDER_BASE_URL", "http://127.0.0.1:43777");
+    try env.put("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "gpt-5=dep-5");
+    const endpoint = try azureOpenAIResponsesEndpoint(std.testing.allocator, &env, "gpt-5");
+    defer std.testing.allocator.free(endpoint);
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:43777/deployments/dep-5/responses?api-version=v1",
+        endpoint,
+    );
+}
+
+test "serializes Azure Responses payload as input items" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "azure-test=prod-deployment");
+
+    const user_parts = [_]ChatContentPart{
+        .{ .text = "inspect this" },
+        .{ .image = .{ .mime_type = "image/png", .data = "aGVsbG8=" } },
+    };
+    const tool_calls = [_]ChatToolCall{
+        .{ .id = @constCast("call_1"), .name = @constCast("bash"), .arguments_json = @constCast("{\"command\":\"ls\"}") },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "be terse" },
+        .{ .role = .user, .content_parts = user_parts[0..] },
+        .{ .role = .assistant, .content = "running", .tool_calls = tool_calls[0..] },
+        .{ .role = .tool, .content = "done", .tool_call_id = "call_1" },
+    };
+    const tools = [_]ChatToolDefinition{
+        .{ .name = "bash", .description = "run shell", .parameters_json = "{\"type\":\"object\"}" },
+    };
+    const payload = try buildAzureResponsesPayload(std.testing.allocator, &env, .{
+        .provider = "azure-openai-responses",
+        .model = "azure-test",
+        .api_key = "unused",
+        .messages = messages[0..],
+        .tools = tools[0..],
+    }, true);
+    defer std.testing.allocator.free(payload);
+
+    // The wire model is the resolved deployment name, not the catalog id.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"model\":\"prod-deployment\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"role\":\"system\",\"content\":\"be terse\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"inspect this\"},{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":\"data:image/png;base64,aGVsbG8=\"}]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"running\",\"annotations\":[]}]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"done\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "{\"type\":\"function\",\"name\":\"bash\",\"description\":\"run shell\",\"parameters\":{\"type\":\"object\"},\"strict\":false}") != null);
+}
+
+test "Azure Responses payload emits reasoning effort for reasoning models and omits it otherwise" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "hi" },
+    };
+
+    // o3-mini (azure-openai-responses) is reasoning-capable with no
+    // thinkingLevelMap.off override, so upstream buildParams emits
+    // params.reasoning = { effort: "none" } in the default (no explicit
+    // reasoningEffort) path.
+    const reasoning_payload = try buildAzureResponsesPayload(std.testing.allocator, &env, .{
+        .provider = "azure-openai-responses",
+        .model = "o3-mini",
+        .api_key = "unused",
+        .messages = messages[0..],
+    }, false);
+    defer std.testing.allocator.free(reasoning_payload);
+    try std.testing.expect(std.mem.indexOf(u8, reasoning_payload, "\"reasoning\":{\"effort\":\"none\"}") != null);
+    // The default path never sets params.include (only the explicit
+    // reasoningEffort/Summary branch does).
+    try std.testing.expect(std.mem.indexOf(u8, reasoning_payload, "\"include\"") == null);
+
+    // gpt-5 (azure-openai-responses) is reasoning-capable but has
+    // thinkingLevelMap.off === null (thinking_off_disabled), so the upstream
+    // else-if guard is false and no reasoning field is emitted.
+    const off_null_payload = try buildAzureResponsesPayload(std.testing.allocator, &env, .{
+        .provider = "azure-openai-responses",
+        .model = "gpt-5",
+        .api_key = "unused",
+        .messages = messages[0..],
+    }, false);
+    defer std.testing.allocator.free(off_null_payload);
+    try std.testing.expect(std.mem.indexOf(u8, off_null_payload, "\"reasoning\"") == null);
+
+    // gpt-4o-mini is not a reasoning model: no reasoning field at all (this is
+    // the model the wave2-transports smoke drives, so it must stay unchanged).
+    const non_reasoning_payload = try buildAzureResponsesPayload(std.testing.allocator, &env, .{
+        .provider = "azure-openai-responses",
+        .model = "gpt-4o-mini",
+        .api_key = "unused",
+        .messages = messages[0..],
+    }, false);
+    defer std.testing.allocator.free(non_reasoning_payload);
+    try std.testing.expect(std.mem.indexOf(u8, non_reasoning_payload, "\"reasoning\"") == null);
+}
+
+test "parses Azure/OpenAI Responses result text and tool calls" {
+    const body =
+        \\{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello azure"}]},{"type":"function_call","call_id":"call_9","name":"bash","arguments":"{\"command\":\"pwd\"}"}]}
+    ;
+    var result = try parseOpenAIResponsesResult(std.testing.allocator, body);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("hello azure", result.text.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_9", result.tool_calls[0].id);
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", result.tool_calls[0].arguments_json);
+}
+
+// === Image resize (system-tool shell-out) tests ===============================
+
+test "resize tool detection and round-trip when a system tool is present" {
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    const tiny_png_b64 = tinyPngBase64();
+    const tool = detectResizeTool(io, std.testing.allocator);
+    if (tool == null) {
+        // Documented divergence: with no system image tool (sips/magick/convert),
+        // resize cannot run in-process and must surface ResizeToolUnavailable.
+        try std.testing.expectError(error.ResizeToolUnavailable, resizeImageWithSystemTool(
+            io,
+            std.testing.allocator,
+            &env,
+            .{ .mime_type = "image/png", .data = tiny_png_b64 },
+            64,
+        ));
+        return error.SkipZigTest;
+    }
+
+    var resized = try resizeImageWithSystemTool(
+        io,
+        std.testing.allocator,
+        &env,
+        .{ .mime_type = "image/png", .data = tiny_png_b64 },
+        64,
+    );
+    defer resized.deinit(std.testing.allocator);
+    // Re-encoded output must be non-empty, valid base64, and keep the mime type.
+    try std.testing.expectEqualStrings("image/png", resized.image.mime_type);
+    try std.testing.expect(resized.image.data.len > 0);
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = try decoder.calcSizeForSlice(resized.image.data);
+    try std.testing.expect(decoded_len > 0);
+}
+
+/// A minimal valid 1x1 PNG, base64-encoded, used to exercise the resize path.
+fn tinyPngBase64() []const u8 {
+    return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 }

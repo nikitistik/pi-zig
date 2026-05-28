@@ -1,0 +1,29 @@
+{
+  "generatedAt": "2026-05-28T09:39:58Z",
+  "prin7rCheckout": "/Users/keer/projects/prin7r-openwork-zero_native",
+  "pi_zig_sidecar": {
+    "manifest": "patches/pi-zig-backend/manifest/pi-zig.application.json",
+    "binary": "patches/pi-zig-backend/payload/bin/pi-zig",
+    "binarySha256": "3c0875357041f9d449b0933ddfa38241a0f66e2ff12b82f290ee01a4eb6256b3",
+    "frontend": "patches/pi-zig-backend/payload/frontend/index.html"
+  },
+  "prin7rBundle": {
+    "path": "zig-out/package/prin7r",
+    "bundleContents": [
+      "Contents/Info.plist",
+      "Contents/PkgInfo",
+      "Contents/MacOS/README.txt",
+      "Contents/Resources/package-manifest.zon",
+      "Contents/Resources/signing-plan.txt",
+      "Contents/Resources/frontend/out/index.html",
+      "Contents/Resources/icon.icns"
+    ],
+    "rebuiltAt": "2026-05-28T16:39:04Z"
+  },
+  "appliedRules": [
+    "no in-place Prin7r source edits",
+    "no Dockerfile edits (modules/9router/Dockerfile untouched)",
+    "no secrets copied (keys referenced by path only via PRIN7R_KEYS_FILE / HOME/.nth-kir-keys.env)",
+    "patch package self-contained at <prin7r>/patches/pi-zig-backend/"
+  ]
+}

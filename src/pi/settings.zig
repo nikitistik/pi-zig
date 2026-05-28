@@ -382,9 +382,12 @@ fn mergeSettings(allocator: std.mem.Allocator, global: std.json.Value, project: 
 
 fn resolvedSettings(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, settings: std.json.Value) !std.json.Value {
     var root = std.json.ObjectMap.empty;
+    try root.put(allocator, "lastChangelogVersion", optionalStringValue(fieldString(settings, "lastChangelogVersion")));
     try root.put(allocator, "defaultProvider", optionalStringValue(fieldString(settings, "defaultProvider")));
     try root.put(allocator, "defaultModel", optionalStringValue(fieldString(settings, "defaultModel")));
-    try root.put(allocator, "defaultThinkingLevel", optionalStringValue(fieldString(settings, "defaultThinkingLevel")));
+    // Upstream restricts defaultThinkingLevel to a fixed enum (Settings type). Mirror that:
+    // unrecognized values resolve to null rather than passing arbitrary strings through.
+    try root.put(allocator, "defaultThinkingLevel", optionalStringValue(validChoice(fieldString(settings, "defaultThinkingLevel"), &.{ "off", "minimal", "low", "medium", "high", "xhigh" })));
     try root.put(allocator, "transport", .{ .string = fieldString(settings, "transport") orelse "auto" });
     try root.put(allocator, "steeringMode", .{ .string = fieldString(settings, "steeringMode") orelse "one-at-a-time" });
     try root.put(allocator, "followUpMode", .{ .string = fieldString(settings, "followUpMode") orelse "one-at-a-time" });
@@ -409,8 +412,39 @@ fn resolvedSettings(allocator: std.mem.Allocator, env: *const std.process.Enviro
     try root.put(allocator, "editorPaddingX", .{ .integer = clamp(numberAt(settings, &.{"editorPaddingX"}) orelse 0, 0, 3) });
     try root.put(allocator, "autocompleteMaxVisible", .{ .integer = clamp(numberAt(settings, &.{"autocompleteMaxVisible"}) orelse 5, 3, 20) });
     try root.put(allocator, "markdown", try markdownSettings(allocator, settings));
-    try root.put(allocator, "warnings", nestedObjectValue(settings, &.{"warnings"}) orelse std.json.Value{ .object = std.json.ObjectMap.empty });
+    try root.put(allocator, "warnings", try warningSettings(allocator, settings));
+    try root.put(allocator, "thinkingBudgets", thinkingBudgetsValue(settings));
+    try root.put(allocator, "enabledModels", stringArrayPassthrough(settings, "enabledModels"));
+    try root.put(allocator, "npmCommand", stringArrayPassthrough(settings, "npmCommand"));
     return .{ .object = root };
+}
+
+// Mirrors upstream getWarnings(): the merged warnings object is returned, but the
+// documented WarningSettings default (anthropicExtraUsage: true) is filled in when the
+// key is absent so consumers see the same default the upstream getter would produce.
+fn warningSettings(allocator: std.mem.Allocator, settings: std.json.Value) !std.json.Value {
+    var root = std.json.ObjectMap.empty;
+    if (nestedObjectValue(settings, &.{"warnings"})) |warnings| {
+        var it = warnings.object.iterator();
+        while (it.next()) |entry| try root.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    if (root.get("anthropicExtraUsage") == null) {
+        try root.put(allocator, "anthropicExtraUsage", .{ .bool = true });
+    }
+    return .{ .object = root };
+}
+
+// Mirrors upstream getThinkingBudgets(): returns the raw object (or null) untouched. The
+// per-level numbers (minimal/low/medium/high) carry through as provided.
+fn thinkingBudgetsValue(settings: std.json.Value) std.json.Value {
+    return nestedObjectValue(settings, &.{"thinkingBudgets"}) orelse .null;
+}
+
+// Mirrors upstream getters that return optional string arrays (getEnabledModels/getNpmCommand):
+// pass a present array through as-is, otherwise resolve to null.
+fn stringArrayPassthrough(settings: std.json.Value, field: []const u8) std.json.Value {
+    const found = nestedValue(settings, &.{field}) orelse return .null;
+    return if (found == .array) found else .null;
 }
 
 fn compactionSettings(allocator: std.mem.Allocator, settings: std.json.Value) !std.json.Value {
@@ -871,4 +905,73 @@ test "findPath reads nested dotted values" {
     try std.testing.expectEqual(@as(i64, 222), value.integer);
     try std.testing.expect(findPath(parsed.value, "compaction.missing") == null);
     try std.testing.expect(findPath(parsed.value, "absent") == null);
+}
+
+fn resolveProbe(arena: std.mem.Allocator, env: *const std.process.Environ.Map, json: []const u8) !std.json.Value {
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, json, .{});
+    try migrateSettings(arena, &parsed.value);
+    return resolvedSettings(arena, env, parsed.value);
+}
+
+test "resolvedSettings fills warnings.anthropicExtraUsage default true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    // Default-on when absent (upstream WarningSettings default).
+    const defaults = try resolveProbe(arena.allocator(), &env, "{}");
+    const warnings_default = defaults.object.get("warnings").?.object;
+    try std.testing.expectEqual(true, warnings_default.get("anthropicExtraUsage").?.bool);
+
+    // Explicit false survives, and unrelated keys carry through.
+    const explicit = try resolveProbe(arena.allocator(), &env, "{\"warnings\":{\"anthropicExtraUsage\":false,\"custom\":true}}");
+    const warnings_explicit = explicit.object.get("warnings").?.object;
+    try std.testing.expectEqual(false, warnings_explicit.get("anthropicExtraUsage").?.bool);
+    try std.testing.expectEqual(true, warnings_explicit.get("custom").?.bool);
+}
+
+test "resolvedSettings validates defaultThinkingLevel against upstream enum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    const valid = try resolveProbe(arena.allocator(), &env, "{\"defaultThinkingLevel\":\"xhigh\"}");
+    try std.testing.expectEqualStrings("xhigh", valid.object.get("defaultThinkingLevel").?.string);
+
+    // An out-of-enum value resolves to null rather than passing through.
+    const invalid = try resolveProbe(arena.allocator(), &env, "{\"defaultThinkingLevel\":\"ultra\"}");
+    try std.testing.expect(invalid.object.get("defaultThinkingLevel").? == .null);
+
+    const absent = try resolveProbe(arena.allocator(), &env, "{}");
+    try std.testing.expect(absent.object.get("defaultThinkingLevel").? == .null);
+}
+
+test "resolvedSettings exposes thinkingBudgets, enabledModels, npmCommand, lastChangelogVersion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    const present = try resolveProbe(
+        arena.allocator(),
+        &env,
+        "{\"lastChangelogVersion\":\"1.2.3\",\"thinkingBudgets\":{\"high\":42000},\"enabledModels\":[\"anthropic/*\"],\"npmCommand\":[\"mise\",\"exec\",\"node@20\",\"--\",\"npm\"]}",
+    );
+    try std.testing.expectEqualStrings("1.2.3", present.object.get("lastChangelogVersion").?.string);
+    try std.testing.expectEqual(@as(i64, 42000), present.object.get("thinkingBudgets").?.object.get("high").?.integer);
+    const enabled = present.object.get("enabledModels").?;
+    try std.testing.expectEqual(@as(usize, 1), enabled.array.items.len);
+    try std.testing.expectEqualStrings("anthropic/*", enabled.array.items[0].string);
+    const npm = present.object.get("npmCommand").?;
+    try std.testing.expectEqual(@as(usize, 5), npm.array.items.len);
+    try std.testing.expectEqualStrings("npm", npm.array.items[4].string);
+
+    // Absent optionals resolve to null (mirrors upstream undefined getters).
+    const absent = try resolveProbe(arena.allocator(), &env, "{}");
+    try std.testing.expect(absent.object.get("lastChangelogVersion").? == .null);
+    try std.testing.expect(absent.object.get("thinkingBudgets").? == .null);
+    try std.testing.expect(absent.object.get("enabledModels").? == .null);
+    try std.testing.expect(absent.object.get("npmCommand").? == .null);
 }

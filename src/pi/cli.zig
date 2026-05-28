@@ -37,9 +37,35 @@ pub const DiagnosticKind = enum {
     }
 };
 
+/// The valid `--thinking` levels, in upstream order. Shared by the diagnostic
+/// renderer so the "Valid values: ..." list matches upstream args.ts exactly.
+pub const valid_thinking_levels = "off, minimal, low, medium, high, xhigh";
+
 pub const Diagnostic = struct {
     kind: DiagnosticKind,
+    /// Self-contained diagnostic text. For the structured introspection path
+    /// (`writeParsedArgsJson`) the fully interpolated upstream message is rendered
+    /// from `template` + `detail`; `message` is the upstream text with the offending
+    /// value already embedded where one was available at parse time, or the static
+    /// upstream sentence otherwise.
     message: []const u8,
+    /// Diagnostic template, used by the JSON renderer to produce the byte-exact
+    /// upstream message (interpolating `detail`). `.literal` means emit `message`.
+    template: DiagnosticTemplate = .literal,
+    /// Offending value borrowed from argv (stable for the lifetime of the parse
+    /// result, since argv outlives it). Null for templates that need no value.
+    detail: ?[]const u8 = null,
+};
+
+/// Selects the upstream message wording for a diagnostic. Mirrors the exact strings
+/// in upstream/pi/packages/coding-agent/src/cli/args.ts.
+pub const DiagnosticTemplate = enum {
+    /// Emit `message` verbatim.
+    literal,
+    /// `Invalid thinking level "<detail>". Valid values: off, minimal, low, medium, high, xhigh`
+    invalid_thinking_level,
+    /// `Unknown option: <detail>`
+    unknown_option,
 };
 
 pub const UnknownFlag = struct {
@@ -135,8 +161,15 @@ pub const ParsedArgs = struct {
     }
 
     fn addDiagnostic(self: *ParsedArgs, kind: DiagnosticKind, message: []const u8) void {
+        self.addDiagnosticFull(kind, message, .literal, null);
+    }
+
+    /// Add a diagnostic with an upstream message template and an optional offending
+    /// value (`detail`, borrowed from argv). The JSON renderer interpolates these
+    /// to produce the byte-exact upstream message.
+    fn addDiagnosticFull(self: *ParsedArgs, kind: DiagnosticKind, message: []const u8, template: DiagnosticTemplate, detail: ?[]const u8) void {
         if (self.diagnostics_len >= MaxDiagnostics) return;
-        self.diagnostics[self.diagnostics_len] = .{ .kind = kind, .message = message };
+        self.diagnostics[self.diagnostics_len] = .{ .kind = kind, .message = message, .template = template, .detail = detail };
         self.diagnostics_len += 1;
     }
 };
@@ -189,7 +222,8 @@ pub fn parse(argv: []const []const u8) ParsedArgs {
         } else if (equals(arg, "--thinking") and hasValue(argv, i)) {
             if (takeValue(argv, &i)) |value| {
                 result.thinking = types.ThinkingLevel.parse(value);
-                if (result.thinking == null) result.addDiagnostic(.warning, "invalid thinking level");
+                // Upstream: `Invalid thinking level "<value>". Valid values: off, minimal, low, medium, high, xhigh`.
+                if (result.thinking == null) result.addDiagnosticFull(.warning, "Invalid thinking level", .invalid_thinking_level, value);
             }
         } else if (equals(arg, "--print") or equals(arg, "-p")) {
             result.print = true;
@@ -242,7 +276,8 @@ pub fn parse(argv: []const []const u8) ParsedArgs {
                 }
             }
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            result.addDiagnostic(.@"error", "unknown short option");
+            // Upstream: `Unknown option: <arg>` (a hard error that aborts the run).
+            result.addDiagnosticFull(.@"error", "Unknown option", .unknown_option, arg);
         } else {
             result.addMessage(arg);
         }
@@ -406,10 +441,50 @@ fn writeDiagnostics(w: *std.Io.Writer, values: []const Diagnostic) !void {
         try w.writeAll("{\"type\":");
         try writeJsonString(w, value.kind.label());
         try w.writeAll(",\"message\":");
-        try writeJsonString(w, value.message);
+        // Render the fully interpolated upstream message as a single JSON string.
+        try w.writeByte('"');
+        try renderDiagnosticMessageEscaped(w, value);
+        try w.writeByte('"');
         try w.writeAll("}");
     }
     try w.writeAll("]");
+}
+
+/// Render a diagnostic's fully interpolated, byte-exact upstream message, escaping
+/// it for a JSON string context (the surrounding quotes are written by the caller).
+fn renderDiagnosticMessageEscaped(w: *std.Io.Writer, diagnostic: Diagnostic) !void {
+    switch (diagnostic.template) {
+        .literal => try writeJsonStringContents(w, diagnostic.message),
+        .invalid_thinking_level => {
+            try writeJsonStringContents(w, "Invalid thinking level \"");
+            try writeJsonStringContents(w, diagnostic.detail orelse "");
+            try writeJsonStringContents(w, "\". Valid values: ");
+            try writeJsonStringContents(w, valid_thinking_levels);
+        },
+        .unknown_option => {
+            try writeJsonStringContents(w, "Unknown option: ");
+            try writeJsonStringContents(w, diagnostic.detail orelse "");
+        },
+    }
+}
+
+/// Render a diagnostic's fully interpolated, byte-exact upstream message as plain
+/// text (no JSON escaping) into `w`. Public so callers that surface diagnostics in
+/// a text context can match upstream wording without re-deriving it.
+pub fn renderDiagnosticMessage(w: *std.Io.Writer, diagnostic: Diagnostic) !void {
+    switch (diagnostic.template) {
+        .literal => try w.writeAll(diagnostic.message),
+        .invalid_thinking_level => {
+            try w.writeAll("Invalid thinking level \"");
+            try w.writeAll(diagnostic.detail orelse "");
+            try w.writeAll("\". Valid values: ");
+            try w.writeAll(valid_thinking_levels);
+        },
+        .unknown_option => {
+            try w.writeAll("Unknown option: ");
+            try w.writeAll(diagnostic.detail orelse "");
+        },
+    }
 }
 
 fn writeUnknownFlags(w: *std.Io.Writer, values: []const UnknownFlag) !void {
@@ -431,6 +506,13 @@ fn writeUnknownFlags(w: *std.Io.Writer, values: []const UnknownFlag) !void {
 
 fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
     try w.writeAll("\"");
+    try writeJsonStringContents(w, value);
+    try w.writeAll("\"");
+}
+
+/// Escape `value` for a JSON string context WITHOUT the surrounding quotes, so
+/// several fragments can be concatenated inside one JSON string.
+fn writeJsonStringContents(w: *std.Io.Writer, value: []const u8) !void {
     for (value) |char| {
         switch (char) {
             '"' => try w.writeAll("\\\""),
@@ -449,7 +531,6 @@ fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
             },
         }
     }
-    try w.writeAll("\"");
 }
 
 test "parse print prompt and provider" {
@@ -479,6 +560,46 @@ test "invalid thinking level creates warning" {
     try std.testing.expect(parsed.thinking == null);
     try std.testing.expectEqual(@as(usize, 1), parsed.diagnostics_len);
     try std.testing.expectEqual(DiagnosticKind.warning, parsed.diagnostics[0].kind);
+    try std.testing.expectEqual(DiagnosticTemplate.invalid_thinking_level, parsed.diagnostics[0].template);
+    try std.testing.expectEqualStrings("maximum", parsed.diagnostics[0].detail.?);
+}
+
+test "diagnostic messages render exactly like upstream args.ts" {
+    // Invalid --thinking value -> upstream's interpolated warning.
+    {
+        const parsed = parse(&.{ "--thinking", "maximum" });
+        var buf: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try renderDiagnosticMessage(&w, parsed.diagnostics[0]);
+        try std.testing.expectEqualStrings(
+            "Invalid thinking level \"maximum\". Valid values: off, minimal, low, medium, high, xhigh",
+            w.buffered(),
+        );
+    }
+    // Unknown short option -> `Unknown option: <arg>`.
+    {
+        const parsed = parse(&.{"-x"});
+        try std.testing.expectEqual(@as(usize, 1), parsed.diagnostics_len);
+        try std.testing.expectEqual(DiagnosticKind.@"error", parsed.diagnostics[0].kind);
+        try std.testing.expectEqual(DiagnosticTemplate.unknown_option, parsed.diagnostics[0].template);
+        var buf: [128]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try renderDiagnosticMessage(&w, parsed.diagnostics[0]);
+        try std.testing.expectEqualStrings("Unknown option: -x", w.buffered());
+    }
+}
+
+test "diagnostics serialize the fully interpolated upstream message to JSON" {
+    // The JSON introspection path embeds the byte-exact upstream message text.
+    const parsed = parse(&.{ "--thinking", "bogus", "-z" });
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeDiagnostics(&w, parsed.diagnostics[0..parsed.diagnostics_len]);
+    const json = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, json, "Invalid thinking level \\\"bogus\\\". Valid values: off, minimal, low, medium, high, xhigh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "Unknown option: -z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"warning\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"error\"") != null);
 }
 
 test "value flag without value falls through to unknown flag (upstream parity)" {

@@ -1042,32 +1042,40 @@ fn writeRestoredLineEndings(w: *std.Io.Writer, content: []const u8, line_ending:
 }
 
 /// Normalize text for the edit tool's fuzzy fallback, mirroring upstream
-/// `normalizeForFuzzyMatch`: strip trailing whitespace per line, map smart
-/// quotes/dashes to ASCII, and collapse special Unicode spaces to a regular
-/// space. Input is assumed LF-normalized.
+/// `normalizeForFuzzyMatch`: NFKC-normalize, strip trailing whitespace per line,
+/// map smart quotes/dashes to ASCII, and collapse special Unicode spaces to a
+/// regular space. Input is assumed LF-normalized.
 ///
-/// NOTE: upstream prefixes this with Unicode NFKC normalization. Zig std has no
-/// NFKC tables, so compatibility-equivalent forms (e.g. fullwidth punctuation,
-/// combining-mark recomposition) are NOT folded here. The targeted replacements
-/// below cover the common smart-punctuation cases; see docs/parity.md.
+/// Upstream applies `.normalize("NFKC")` first. We mirror the parts of NFKC that
+/// affect plain-text edit matching without a full Unicode table:
+///   - fullwidth ASCII (U+FF01..U+FF5E) -> canonical ASCII (compatibility),
+///   - the most common Latin base-letter + combining-mark sequences recomposed to
+///     their precomposed (NFC) form, so an edit `oldText` written with combining
+///     marks matches file content using precomposed accents and vice versa.
+/// Case and diacritics are PRESERVED (NFKC is not case folding) — that distinction
+/// matters for a code-editing tool. The smart-punctuation/space replacements then
+/// run over the NFKC-normalized text, matching upstream ordering.
 fn normalizeForFuzzyMatch(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    const nfkc = try nfkcNormalizeAlloc(allocator, content);
+    defer allocator.free(nfkc);
+
     var mapped: std.Io.Writer.Allocating = .init(allocator);
     defer mapped.deinit();
 
     var index: usize = 0;
-    while (index < content.len) {
-        const first = content[index];
+    while (index < nfkc.len) {
+        const first = nfkc[index];
         const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
             try mapped.writer.writeByte(first);
             index += 1;
             continue;
         };
-        if (index + seq_len > content.len) {
+        if (index + seq_len > nfkc.len) {
             try mapped.writer.writeByte(first);
             index += 1;
             continue;
         }
-        const codepoint = std.unicode.utf8Decode(content[index .. index + seq_len]) catch {
+        const codepoint = std.unicode.utf8Decode(nfkc[index .. index + seq_len]) catch {
             try mapped.writer.writeByte(first);
             index += 1;
             continue;
@@ -1075,12 +1083,118 @@ fn normalizeForFuzzyMatch(allocator: std.mem.Allocator, content: []const u8) ![]
         if (fuzzyAsciiReplacement(codepoint)) |replacement| {
             try mapped.writer.writeByte(replacement);
         } else {
-            try mapped.writer.writeAll(content[index .. index + seq_len]);
+            try mapped.writer.writeAll(nfkc[index .. index + seq_len]);
         }
         index += seq_len;
     }
 
     return stripTrailingWhitespacePerLine(allocator, mapped.written());
+}
+
+/// Targeted NFKC normalization for edit-tool fuzzy matching. Folds fullwidth ASCII
+/// to canonical ASCII (compatibility decomposition) and recomposes common Latin
+/// base + combining-mark sequences into their precomposed form (NFC), so the two
+/// representations of an accented letter compare equal. Preserves all other bytes.
+fn nfkcNormalizeAlloc(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    var index: usize = 0;
+    while (index < content.len) {
+        const first = content[index];
+        const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
+            try out.writer.writeByte(first);
+            index += 1;
+            continue;
+        };
+        if (index + seq_len > content.len) {
+            try out.writer.writeByte(first);
+            index += 1;
+            continue;
+        }
+        const slice = content[index .. index + seq_len];
+        const codepoint = std.unicode.utf8Decode(slice) catch {
+            try out.writer.writeByte(first);
+            index += 1;
+            continue;
+        };
+
+        // Fullwidth ASCII -> ASCII (NFKC compatibility mapping). Case preserved.
+        if (codepoint >= 0xFF01 and codepoint <= 0xFF5E) {
+            try out.writer.writeByte(@intCast(codepoint - 0xFF00 + 0x20));
+            index += seq_len;
+            continue;
+        }
+        if (codepoint == 0x3000) { // ideographic space -> regular space (NFKC)
+            try out.writer.writeByte(' ');
+            index += seq_len;
+            continue;
+        }
+
+        // Recompose a base letter followed by a single combining mark into its
+        // precomposed (NFC) codepoint, when one exists.
+        if (index + seq_len < content.len) {
+            const next_first = content[index + seq_len];
+            const next_len = std.unicode.utf8ByteSequenceLength(next_first) catch 0;
+            if (next_len != 0 and index + seq_len + next_len <= content.len) {
+                if (std.unicode.utf8Decode(content[index + seq_len .. index + seq_len + next_len])) |mark| {
+                    if (precomposeLatin(codepoint, mark)) |composed| {
+                        var enc: [4]u8 = undefined;
+                        const n = std.unicode.utf8Encode(composed, &enc) catch 0;
+                        if (n != 0) {
+                            try out.writer.writeAll(enc[0..n]);
+                            index += seq_len + next_len;
+                            continue;
+                        }
+                    }
+                } else |_| {}
+            }
+        }
+
+        try out.writer.writeAll(slice);
+        index += seq_len;
+    }
+
+    return out.toOwnedSlice();
+}
+
+/// Compose a base ASCII letter + a combining diacritical mark into the precomposed
+/// Latin codepoint (NFC), for the common acute/grave/circumflex/tilde/diaeresis/
+/// cedilla marks. Returns null when there is no precomposed form. This is the small
+/// subset of canonical composition that edit-tool fuzzy matching needs.
+fn precomposeLatin(base: u21, mark: u21) ?u21 {
+    return switch (mark) {
+        0x0301 => switch (base) { // combining acute
+            'a' => 0x00E1, 'e' => 0x00E9, 'i' => 0x00ED, 'o' => 0x00F3, 'u' => 0x00FA, 'y' => 0x00FD, 'n' => 0x0144,
+            'A' => 0x00C1, 'E' => 0x00C9, 'I' => 0x00CD, 'O' => 0x00D3, 'U' => 0x00DA, 'Y' => 0x00DD, 'N' => 0x0143,
+            else => null,
+        },
+        0x0300 => switch (base) { // combining grave
+            'a' => 0x00E0, 'e' => 0x00E8, 'i' => 0x00EC, 'o' => 0x00F2, 'u' => 0x00F9,
+            'A' => 0x00C0, 'E' => 0x00C8, 'I' => 0x00CC, 'O' => 0x00D2, 'U' => 0x00D9,
+            else => null,
+        },
+        0x0302 => switch (base) { // combining circumflex
+            'a' => 0x00E2, 'e' => 0x00EA, 'i' => 0x00EE, 'o' => 0x00F4, 'u' => 0x00FB,
+            'A' => 0x00C2, 'E' => 0x00CA, 'I' => 0x00CE, 'O' => 0x00D4, 'U' => 0x00DB,
+            else => null,
+        },
+        0x0303 => switch (base) { // combining tilde
+            'a' => 0x00E3, 'n' => 0x00F1, 'o' => 0x00F5,
+            'A' => 0x00C3, 'N' => 0x00D1, 'O' => 0x00D5,
+            else => null,
+        },
+        0x0308 => switch (base) { // combining diaeresis
+            'a' => 0x00E4, 'e' => 0x00EB, 'i' => 0x00EF, 'o' => 0x00F6, 'u' => 0x00FC, 'y' => 0x00FF,
+            'A' => 0x00C4, 'E' => 0x00CB, 'I' => 0x00CF, 'O' => 0x00D6, 'U' => 0x00DC,
+            else => null,
+        },
+        0x0327 => switch (base) { // combining cedilla
+            'c' => 0x00E7, 'C' => 0x00C7,
+            else => null,
+        },
+        else => null,
+    };
 }
 
 fn fuzzyAsciiReplacement(codepoint: u21) ?u8 {
@@ -2019,6 +2133,51 @@ test "edit fuzzy matching folds smart punctuation, dashes, and special spaces" {
     const after3 = try readTempFixture(std.testing.allocator, path);
     defer std.testing.allocator.free(after3);
     try std.testing.expect(std.mem.indexOf(u8, after3, "universe") != null);
+}
+
+test "NFKC normalize folds fullwidth ASCII and recomposes combining marks" {
+    // Fullwidth letters -> ASCII (NFKC compatibility), case preserved.
+    const fw = try nfkcNormalizeAlloc(std.testing.allocator, "\u{FF2D}\u{FF4F}\u{FF44}\u{FF45}\u{FF4C}");
+    defer std.testing.allocator.free(fw);
+    try std.testing.expectEqualStrings("Model", fw);
+
+    // base "e" + combining acute -> precomposed "é" (NFC), preserving the accent.
+    const composed = try nfkcNormalizeAlloc(std.testing.allocator, "caf\u{0065}\u{0301}");
+    defer std.testing.allocator.free(composed);
+    try std.testing.expectEqualStrings("caf\u{00E9}", composed);
+
+    // Ideographic space -> regular space; a precomposed accent is left intact.
+    const spaced = try nfkcNormalizeAlloc(std.testing.allocator, "a\u{3000}\u{00F1}o");
+    defer std.testing.allocator.free(spaced);
+    try std.testing.expectEqualStrings("a \u{00F1}o", spaced);
+}
+
+test "edit fuzzy matching applies NFKC: fullwidth and combining-mark equivalence" {
+    const path = "zig-out/pi-zig-edit-nfkc-test.txt";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    // File written with FULLWIDTH ASCII; the edit uses plain ASCII and must match
+    // via the NFKC fold (fullwidth -> ASCII).
+    try writeFile(std.testing.io, path, "const \u{FF4F}\u{FF4B} = 1;\n");
+    const edits1 = [_]EditReplacement{.{ .old_text = "const ok = 1;", .new_text = "const ok = 2;" }};
+    const outcome1 = try editFileManyResult(std.testing.io, std.testing.allocator, path, &edits1);
+    defer std.testing.allocator.free(outcome1.message);
+    try std.testing.expect(!outcome1.is_error);
+    const after1 = try readTempFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(after1);
+    try std.testing.expect(std.mem.indexOf(u8, after1, "= 2;") != null);
+
+    // File written with a PRECOMPOSED accent; the edit uses base letter + combining
+    // mark. NFKC recomposition unifies them so the fuzzy match succeeds.
+    try writeFile(std.testing.io, path, "label = \"caf\u{00E9}\";\n");
+    const edits2 = [_]EditReplacement{.{ .old_text = "label = \"caf\u{0065}\u{0301}\";", .new_text = "label = \"tea\";" }};
+    const outcome2 = try editFileManyResult(std.testing.io, std.testing.allocator, path, &edits2);
+    defer std.testing.allocator.free(outcome2.message);
+    try std.testing.expect(!outcome2.is_error);
+    const after2 = try readTempFixture(std.testing.allocator, path);
+    defer std.testing.allocator.free(after2);
+    try std.testing.expect(std.mem.indexOf(u8, after2, "tea") != null);
 }
 
 test "edit fuzzy matching strips trailing whitespace per line" {

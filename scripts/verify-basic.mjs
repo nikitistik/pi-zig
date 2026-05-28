@@ -700,7 +700,7 @@ const server = http.createServer((req, res) => {
       !userMessages.includes('rpc active slash resource steer start') &&
       !userMessages.includes('rpc active slash resource follow start')
     ) {
-      const expected = 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta';
+      const expected = 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha beta gamma delta';
       if (user !== expected) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'slash prompt template expansion mismatch', user, expected }));
@@ -1972,7 +1972,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (userMessages.includes('rpc active slash resource steer start')) {
-      if (userMessages.includes('rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta')) {
+      if (userMessages.includes('rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha beta gamma delta')) {
         const content = 'rpc active slash resource steer observed';
         if (body.stream === true) {
           writeStreamEvents([{ choices: [{ delta: { content } }] }]);
@@ -2000,7 +2000,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (userMessages.includes('rpc active slash resource follow start')) {
-      if (userMessages.includes('rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta')) {
+      if (userMessages.includes('rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha beta gamma delta')) {
         const content = 'rpc active slash resource follow observed';
         if (body.stream === true) {
           writeStreamEvents([{ choices: [{ delta: { content } }] }]);
@@ -6954,7 +6954,7 @@ try {
       queuedResponse?.data?.steeringCount !== (isFollow ? 0 : 1) ||
       queuedResponse?.data?.followUpCount !== (isFollow ? 1 : 0) ||
       promptResponse?.data?.text !== `rpc active slash resource ${kind} observed` ||
-      !messages.some((message) => message.role === 'user' && message.content === 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta') ||
+      !messages.some((message) => message.role === 'user' && message.content === 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha beta gamma delta') ||
       messages.some((message) => typeof message.content === 'string' && message.content.includes('/resource-check')) ||
       (!isFollow && baseIndex !== -1) ||
       (isFollow && (baseIndex === -1 || observedIndex === -1 || baseIndex > observedIndex))
@@ -7142,7 +7142,7 @@ export default function(pi) {
 
   const rpcProviderResourceExpansionSessionFile = path.resolve('zig-out/pi-zig-rpc-provider-resource-expansion-smoke.jsonl');
   fs.rmSync(rpcProviderResourceExpansionSessionFile, { force: true });
-  const expectedPromptExpansion = 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha "beta gamma" delta';
+  const expectedPromptExpansion = 'rpc slash prompt template expansion: first=alpha rest=beta gamma delta all=alpha beta gamma delta';
   const expectedSkillExpansion = [
     '<skill name="resource-skill" location=".pi/skills/resource-skill/SKILL.md">',
     'References are relative to .pi/skills/resource-skill.',

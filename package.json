@@ -7,7 +7,7 @@
     "build": "zig build && npm --prefix frontend run build",
     "dev": "npm --prefix frontend run dev",
     "inventory": "node scripts/upstream-inventory.mjs",
-    "test": "zig build test && node scripts/upstream-inventory.mjs && node scripts/check-cli-parity.mjs && node scripts/generate-model-catalog.mjs --check && zig build && node scripts/verify-basic.mjs"
+    "test": "zig build test && node scripts/upstream-inventory.mjs && node scripts/check-cli-parity.mjs && node scripts/generate-model-catalog.mjs --check && zig build && node scripts/verify-basic.mjs && node scripts/flow-c-smoke.mjs && node scripts/flow-d-auth-smoke.mjs && node scripts/flow-d-bedrock-smoke.mjs && node scripts/flow-e-compaction-smoke.mjs && node scripts/flow-e-html-smoke.mjs && node scripts/flow-f-runner-smoke.mjs && node scripts/wave2-tui-smoke.mjs && node scripts/wave2-transports-smoke.mjs && node scripts/wave2-resources-smoke.mjs && node scripts/wave2-sessions-smoke.mjs && node scripts/wave2-ext-settings-smoke.mjs && node scripts/wave2-misc-smoke.mjs && node scripts/wave3-runtime-smoke.mjs && node scripts/wave3-tui-cli-smoke.mjs && node scripts/wave3-polish-smoke.mjs && bash release/package-cli.sh && node scripts/wave3-standalone-cli-smoke.mjs && node scripts/tui-pty-harness.mjs && npm --prefix frontend run build && bash release/package.sh && node scripts/workbench-packaged-smoke.mjs"
   },
   "devDependencies": {}
 }

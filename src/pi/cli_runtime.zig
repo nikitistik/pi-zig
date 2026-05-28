@@ -18,6 +18,15 @@ const tui = @import("tui.zig");
 
 const all_tool_names = [_][]const u8{ "read", "bash", "edit", "write", "grep", "find", "ls" };
 
+/// Summarization system prompt for the interactive `/compact` provider path. Byte-identical to
+/// upstream SUMMARIZATION_SYSTEM_PROMPT (packages/coding-agent/src/core/compaction/utils.ts) and
+/// to the RPC runtime's private copy; redeclared here so the TUI compaction path matches upstream
+/// without coupling cli_runtime.zig to rpc.zig internals. The conversation body + instructions are
+/// built App-side (tui.buildCompactionPromptText + tui.compaction_summarization_prompt).
+const compaction_summarization_system_prompt =
+    "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\n" ++
+    "Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+
 const PromptResult = struct {
     text: []const u8,
     owned: bool = false,
@@ -72,10 +81,44 @@ const AssistantStatus = struct {
     error_message: []const u8,
 };
 
+// ===== Top-level JSON-mode abort lifecycle (SIGINT) =====
+// Upstream's interactive/print agent aborts an in-flight turn on Ctrl+C and emits the
+// "aborted" assistant lifecycle (mirrored by rpc.zig's AgentAborted handling). The top-level
+// JSON path already maps error.AgentAborted -> stopReason:"aborted"/errorMessage:"Request was
+// aborted" via assistantStatusForError + emitJsonAssistantStatusLifecycle, but nothing could
+// trigger that abort because no run was cancellable. A process-global SIGINT handler flips an
+// atomic flag that the agent/provider stream poll through should_cancel, so a cancelled
+// `--mode json` run now surfaces the same abort lifecycle events as RPC.
+var json_abort_requested = std.atomic.Value(bool).init(false);
+var json_abort_handler_installed = std.atomic.Value(bool).init(false);
+
+fn jsonAbortSignalHandler(_: std.posix.SIG) callconv(.c) void {
+    json_abort_requested.store(true, .seq_cst);
+}
+
+/// Install the SIGINT handler once and reset the abort flag for a fresh run. Idempotent: the
+/// handler is registered at most once per process; every call clears the flag so a prior run's
+/// abort never leaks into the next. POSIX-only; a no-op shim keeps non-POSIX builds compiling.
+fn armJsonAbortHandler() void {
+    json_abort_requested.store(false, .seq_cst);
+    if (@import("builtin").os.tag == .windows) return;
+    if (json_abort_handler_installed.swap(true, .seq_cst)) return;
+    var action = std.posix.Sigaction{
+        .handler = .{ .handler = jsonAbortSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &action, null);
+}
+
+fn jsonAbortRequested(_: *anyopaque) bool {
+    return json_abort_requested.load(.seq_cst);
+}
+
 pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     const parsed = cli.parse(argv);
 
-    try writeDiagnostics(init.io, parsed);
+    try writeDiagnostics(init.io, init.gpa, parsed);
     if (hasErrorDiagnostics(parsed)) return error.InvalidCliArguments;
 
     if (parsed.help) return writeTopLevelHelpWithExtensions(init.io, init.gpa, init.environ_map);
@@ -103,27 +146,35 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     try validateSessionFlags(init.io, parsed);
     try validateExtensionFlags(init.io, init.gpa, init.environ_map, parsed);
 
-    const mode = parsed.mode orelse cli.Mode.text;
+    // Model fallback/default selection (upstream model-resolver.ts resolveInitialModel /
+    // buildFallbackModel parity): when a --provider is given but --model is omitted, resolve a
+    // sensible default model id from the catalog instead of dropping to the inert foundation
+    // response. Mutate a local copy so every downstream mode (rpc/text/json/interactive) sees the
+    // resolved model. Leaves `parsed` untouched when both flags are absent or a model is explicit.
+    var resolved_parsed = parsed;
+    applyDefaultModelSelection(&resolved_parsed);
+
+    const mode = resolved_parsed.mode orelse cli.Mode.text;
     if (mode == .rpc) {
-        if (parsed.file_args_len > 0) {
+        if (resolved_parsed.file_args_len > 0) {
             try writeStderr(init.io, "Error: @file arguments are not supported in RPC mode.\n");
             return error.InvalidCliArguments;
         }
-        const path = try resolveSessionPath(init.io, init.gpa, init.environ_map, parsed);
+        const path = try resolveSessionPath(init.io, init.gpa, init.environ_map, resolved_parsed);
         defer path.deinit(init.gpa);
-        var runtime_extensions = try discoverRuntimeExtensionPaths(init.io, init.gpa, init.environ_map, parsed);
+        var runtime_extensions = try discoverRuntimeExtensionPaths(init.io, init.gpa, init.environ_map, resolved_parsed);
         defer runtime_extensions.deinit(init.gpa);
-        var command_options = commandOptionsFromParsed(init, &parsed);
+        var command_options = commandOptionsFromParsed(init, &resolved_parsed);
         command_options.extension_paths = runtime_extensions.paths;
-        const extension_flag_values = try extensionFlagValuesFromParsed(init.gpa, parsed);
+        const extension_flag_values = try extensionFlagValuesFromParsed(init.gpa, resolved_parsed);
         defer if (extension_flag_values.len > 0) init.gpa.free(extension_flag_values);
         return rpc.run(init.io, init.gpa, init.environ_map, path.path, .{
             .command_options = command_options,
             .extension_paths = runtime_extensions.paths,
             .extension_flag_values = extension_flag_values,
-            .tool_set = toolSetFromParsed(parsed),
-            .custom_tools_enabled = !parsed.no_tools,
-            .tool_allowlist = parsed.tools,
+            .tool_set = toolSetFromParsed(resolved_parsed),
+            .custom_tools_enabled = !resolved_parsed.no_tools,
+            .tool_allowlist = resolved_parsed.tools,
         });
     }
 
@@ -133,18 +184,46 @@ pub fn runTopLevel(init: std.process.Init, argv: []const []const u8) !void {
     const stdin_content = try readPipedStdin(init.io, init.gpa);
     defer if (stdin_content) |content| init.gpa.free(content);
 
-    const prompt = try buildPrompt(init.io, init.gpa, parsed, stdin_content);
+    const prompt = try buildPrompt(init.io, init.gpa, resolved_parsed, stdin_content);
     defer prompt.deinit(init.gpa);
 
-    if (prompt.text.len == 0 and !parsed.print and parsed.messages_len == 0 and parsed.file_args_len == 0 and stdin_content == null) {
-        return runInteractive(init, parsed);
+    if (prompt.text.len == 0 and !resolved_parsed.print and resolved_parsed.messages_len == 0 and resolved_parsed.file_args_len == 0 and stdin_content == null) {
+        return runInteractive(init, resolved_parsed);
     }
 
     return switch (mode) {
-        .json => runJsonPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text, prompt.image_parts),
-        .text => runTextPrintFoundation(init.io, init.gpa, init.environ_map, parsed, prompt.text, prompt.image_parts),
+        .json => runJsonPrintFoundation(init.io, init.gpa, init.environ_map, resolved_parsed, prompt.text, prompt.image_parts),
+        .text => runTextPrintFoundation(init.io, init.gpa, init.environ_map, resolved_parsed, prompt.text, prompt.image_parts),
         .rpc => unreachable,
     };
+}
+
+/// Resolve a default model when `--provider` was supplied without `--model`.
+///
+/// Mirrors upstream `model-resolver.ts` `buildFallbackModel`/`resolveInitialModel`: when only a
+/// provider is known we pick its catalog default (curated id when present, otherwise the provider's
+/// first listed model). Without a model previously the run dropped to the inert foundation response
+/// (`buildFoundationResponse`); resolving here lets text/json/rpc/interactive proceed against a real
+/// model. No-op when both flags are absent (true interactive boot) or when a model is already set.
+fn applyDefaultModelSelection(parsed: *cli.ParsedArgs) void {
+    if (parsed.model != null) return;
+    const provider = parsed.provider orelse return;
+    if (defaultModelIdForProvider(provider)) |model_id| {
+        parsed.model = model_id;
+    }
+}
+
+/// Pick a default catalog model id for `provider` using only stable public models.zig APIs.
+/// Prefers the canonical provider's curated default (the model id upstream lists first for that
+/// provider in the generated catalog) and otherwise returns the first catalog entry for the
+/// provider — matching upstream `buildFallbackModel` (`providerModels.find(default) ?? providerModels[0]`).
+/// Returns null for an unknown provider with no catalog entries, leaving the foundation path intact.
+fn defaultModelIdForProvider(provider: []const u8) ?[]const u8 {
+    const canonical = models.canonicalProvider(provider) orelse provider;
+    for (models.all) |*model| {
+        if (std.mem.eql(u8, model.provider, canonical)) return model.id;
+    }
+    return null;
 }
 
 // =====================================================================
@@ -169,8 +248,35 @@ fn runInteractive(init: std.process.Init, parsed: cli.ParsedArgs) !void {
         .env = init.environ_map,
         .parsed = parsed,
     };
+    // Provider-backed `/compact` summarization runner, wired on the same provider+model condition
+    // as the prompt runner (auth is resolved lazily inside the runner). When unset (no provider/
+    // model), `/compact` falls back to the host's local message-count summary.
+    var compact_ctx = InteractiveCompactRunner{
+        .io = init.io,
+        .allocator = init.gpa,
+        .env = init.environ_map,
+        .parsed = parsed,
+    };
     if (parsed.provider != null and parsed.model != null) {
         app.runner = .{ .ctx = &runner_ctx, .run = InteractivePromptRunner.run };
+        app.compact_runner = .{ .ctx = &compact_ctx, .run = InteractiveCompactRunner.run };
+    }
+
+    // Open the persistent session store (honors --no-session) and wire the live session-op
+    // callbacks so /compact /export /name /fork /clone call the real session APIs instead of
+    // reporting "not yet wired". Mirrors the store wiring used by the print/json paths
+    // (maybeOpenStore + resolveSessionPath). When --no-session is set there is no store, so the
+    // callbacks stay unwired and those commands continue to report the honest notice.
+    var store = try maybeOpenStore(init.io, init.gpa, init.environ_map, parsed);
+    var session_ops = SessionOps{
+        .io = init.io,
+        .allocator = init.gpa,
+        .env = init.environ_map,
+        .parsed = parsed,
+        .store = if (store) |*persistent| persistent else null,
+    };
+    if (store != null) {
+        app.session_callbacks = session_ops.callbacks();
     }
 
     const reason = try app.run();
@@ -267,6 +373,51 @@ const InteractivePromptRunner = struct {
     }
 };
 
+/// Provider-backed summarization runner for the interactive `/compact` command. Bridges the TUI
+/// `CompactRunner` seam onto `agent.runPrompt`, mirroring rpc.zig's `runCompactionSummaryIfAuthenticated`:
+/// a single tool-free turn (`tool_set = .none`, `max_turns = 1`) with the dedicated summarization
+/// system prompt over the App-serialized `<conversation>` text. The TUI only wires this when a
+/// provider+model+auth are configured, so a failure to resolve auth here is unexpected and surfaces
+/// as a `/compact` error rather than silently falling back.
+const InteractiveCompactRunner = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+
+    fn run(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, conversation: []const u8, custom_instructions: ?[]const u8) anyerror![]u8 {
+        _ = custom_instructions; // already folded into `conversation` by tui.buildCompactionPromptText
+        const self: *InteractiveCompactRunner = @ptrCast(@alignCast(ctx_ptr));
+        const provider = self.parsed.provider.?;
+        const model = self.parsed.model.?;
+        const api_key = if (self.parsed.api_key) |key|
+            try allocator.dupe(u8, key)
+        else
+            try auth.resolveProviderApiKey(self.io, allocator, self.env, provider) orelse return error.ProviderAuthMissing;
+        defer allocator.free(api_key);
+
+        const shell_settings = try settings.loadShellSettings(self.io, allocator, self.env);
+        defer shell_settings.deinit(allocator);
+
+        var run_result = try agent.runPrompt(self.io, allocator, self.env, .{
+            .provider = provider,
+            .model = model,
+            .api_key = api_key,
+            .prompt = conversation,
+            .system_prompt = compaction_summarization_system_prompt,
+            .env = self.env,
+            .shell_path = shell_settings.shell_path,
+            .shell_command_prefix = shell_settings.shell_command_prefix,
+            .history = &.{},
+            .tool_set = agent.ToolSet.none,
+            .custom_tools = &.{},
+            .max_turns = 1,
+        });
+        defer run_result.deinit(allocator);
+        return allocator.dupe(u8, std.mem.trim(u8, run_result.final_text, " \t\r\n"));
+    }
+};
+
 /// Mirror of `buildPrintResponse` for the interactive loop: same provider/auth/
 /// extension setup, but routes agent streaming, tool-end, cancellation, and a
 /// permission gate through the `InteractivePromptRunner`.
@@ -290,6 +441,7 @@ fn interactiveBuildResponse(
     defer allocator.free(runtime_system_prompt);
     const shell_settings = try settings.loadShellSettings(io, allocator, env);
     defer shell_settings.deinit(allocator);
+    const auto_resize_images = try loadImageAutoResize(io, allocator, env);
 
     // Discover extension tools so the TUI can execute registered extension tools
     // (and run extension tool-call hooks) mid-conversation, mirroring the
@@ -326,6 +478,7 @@ fn interactiveBuildResponse(
         .env = env,
         .shell_path = shell_settings.shell_path,
         .shell_command_prefix = shell_settings.shell_command_prefix,
+        .auto_resize_images = auto_resize_images,
         .tool_set = toolSetFromParsed(parsed),
         .custom_tools = extension_tool_definitions,
         .custom_tool_context = if (extension_tool_definitions.len > 0) &hooks else null,
@@ -342,6 +495,109 @@ fn interactiveBuildResponse(
         .should_cancel = InteractivePromptRunner.shouldCancel,
     });
 }
+
+/// Live session-operation backend for the interactive TUI. Bridges the TUI `SessionCallbacks`
+/// seam (tui.zig) onto the real persisted-session APIs (session.zig / html_export.zig), matching
+/// the print/json store wiring (maybeOpenStore + resolveSessionPath). Holds the open store and the
+/// resolved session_dir/cwd needed to create sibling sessions for fork/clone.
+const SessionOps = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    parsed: cli.ParsedArgs,
+    store: ?*session.PersistentStore,
+
+    /// Local (no-auth) `/compact` fallback: append a message-count summary compaction entry via the
+    /// same `appendCompaction` API the RPC runtime uses for its static-summary fallback, and return
+    /// the owned summary text for the TUI to display. The provider-backed LLM summary path now runs
+    /// through `tui.CompactRunner` (InteractiveCompactRunner) and persists via `persistCompaction`;
+    /// this method is only invoked when no model/auth is configured (no CompactRunner wired).
+    fn compact(ctx: *anyopaque, allocator: std.mem.Allocator, custom_instructions: ?[]const u8) anyerror![]u8 {
+        const self: *SessionOps = @ptrCast(@alignCast(ctx));
+        const store = self.store orelse return error.NoSessionStore;
+        const message_count = store.totalMessages();
+        const summary = try std.fmt.allocPrint(
+            allocator,
+            "Local summary of {d} message(s) compacted into session context.",
+            .{message_count},
+        );
+        errdefer allocator.free(summary);
+        _ = try store.appendCompaction(self.io, allocator, summary, "", 0, custom_instructions, message_count, null);
+        return summary;
+    }
+
+    /// Persist a provider-backed `/compact` summary (produced by InteractiveCompactRunner) to the
+    /// session store, recording the provider/model meta so the persisted compaction entry mirrors
+    /// the RPC runtime's `details.local = false` shape. `message_count` is the in-memory turn count
+    /// the App summarized.
+    fn persistCompaction(ctx: *anyopaque, summary: []const u8, custom_instructions: ?[]const u8, message_count: usize) anyerror!void {
+        const self: *SessionOps = @ptrCast(@alignCast(ctx));
+        const store = self.store orelse return error.NoSessionStore;
+        const provider_meta: ?session.PersistentStore.CompactionProvider =
+            if (self.parsed.provider) |provider|
+                if (self.parsed.model) |model|
+                    .{ .provider = provider, .model = model }
+                else
+                    null
+            else
+                null;
+        _ = try store.appendCompaction(self.io, self.allocator, summary, "", 0, custom_instructions, message_count, provider_meta);
+    }
+
+    /// Export the current session to HTML via html_export (session.exportHtmlFromFile). Returns the
+    /// owned output path. `output_path` is the optional explicit target from the `/export` argument.
+    fn exportHtml(ctx: *anyopaque, allocator: std.mem.Allocator, output_path: ?[]const u8) anyerror![]u8 {
+        const self: *SessionOps = @ptrCast(@alignCast(ctx));
+        const store = self.store orelse return error.NoSessionStore;
+        return session.exportHtmlFromFile(self.io, allocator, store.path(), output_path);
+    }
+
+    /// Set the session display name (persists a sessionInfo entry, matching RPC set_name).
+    fn setName(ctx: *anyopaque, name: []const u8) anyerror!void {
+        const self: *SessionOps = @ptrCast(@alignCast(ctx));
+        const store = self.store orelse return error.NoSessionStore;
+        try store.appendSessionInfo(self.io, self.allocator, name);
+    }
+
+    /// Fork the current session into a new sibling file (session.forkFromFile duplicates the session
+    /// with a fresh id + parentSession pointer) and switch the store to it. Matches the RPC fork at
+    /// the latest position when no specific user message is selected.
+    fn fork(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!void {
+        const self: *SessionOps = @ptrCast(@alignCast(ctx));
+        try self.copyIntoSiblingSession(allocator);
+    }
+
+    /// Clone the current session: a full file-level duplicate of the session at its current state
+    /// (same mechanism as fork — session.forkFromFile copies every entry), then switch to it.
+    fn clone(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!void {
+        const self: *SessionOps = @ptrCast(@alignCast(ctx));
+        try self.copyIntoSiblingSession(allocator);
+    }
+
+    fn copyIntoSiblingSession(self: *SessionOps, allocator: std.mem.Allocator) !void {
+        const store = self.store orelse return error.NoSessionStore;
+        const cwd = try currentPathOwned(self.io, allocator);
+        defer allocator.free(cwd);
+        const session_dir = try resolveSessionDir(self.io, allocator, self.env, cwd, self.parsed.session_dir);
+        defer allocator.free(session_dir);
+        const source_path = store.path();
+        const new_path = try session.forkFromFile(self.io, allocator, source_path, session_dir, cwd);
+        defer allocator.free(new_path);
+        store.* = try session.PersistentStore.open(self.io, allocator, new_path);
+    }
+
+    fn callbacks(self: *SessionOps) tui.SessionCallbacks {
+        return .{
+            .ctx = self,
+            .compact = SessionOps.compact,
+            .persist_compaction = SessionOps.persistCompaction,
+            .export_html = SessionOps.exportHtml,
+            .set_name = SessionOps.setName,
+            .fork = SessionOps.fork,
+            .clone = SessionOps.clone,
+        };
+    }
+};
 
 pub fn writeTopLevelHelp(io: std.Io) !void {
     try writeStdout(io,
@@ -452,7 +708,7 @@ fn runTextPrintFoundation(
         }
     }
 
-    const response = try buildPrintResponse(io, allocator, env, parsed, prompt_request.content, prompt_request.image_parts, false, null, null, null, null, null, null);
+    const response = try buildPrintResponse(io, allocator, env, parsed, prompt_request.content, prompt_request.image_parts, false, null, null, null, null, null, null, null);
     defer response.deinit(allocator);
 
     if (store) |*persistent| {
@@ -471,6 +727,9 @@ fn runJsonPrintFoundation(
     prompt: []const u8,
     image_parts: []const ai_client.ChatContentPart,
 ) !void {
+    // Arm the SIGINT abort hook so an interrupted tool-capable run emits the upstream abort
+    // lifecycle (error.AgentAborted -> stopReason:"aborted", surfaced below).
+    armJsonAbortHandler();
     const command_outcome = try runTopLevelRegisteredCommand(io, allocator, env, parsed, prompt);
     defer command_outcome.deinit(allocator);
     const prompt_request = switch (command_outcome) {
@@ -531,6 +790,7 @@ fn runJsonPrintFoundation(
             handleJsonToolEnd,
             &tool_event_context,
             handleJsonAgentTextDelta,
+            .{ .context = &tool_event_context, .should_cancel = jsonAbortRequested },
         ) catch |err| {
             if (shouldRetryJsonProviderError(retry_settings, retry_attempts, err, !tool_event_context.assistant_started and streamed_final_text.written().len == 0)) {
                 retry_attempts += 1;
@@ -752,6 +1012,8 @@ fn runJsonProviderTextStream(
     image_parts: []const ai_client.ChatContentPart,
     persist_user_message: bool,
 ) !void {
+    // Arm the SIGINT abort hook so an interrupted streaming run emits the upstream abort lifecycle.
+    armJsonAbortHandler();
     var store = try maybeOpenStore(io, allocator, env, parsed);
     if (store) |*persistent| {
         if (persist_user_message and (prompt.len > 0 or image_parts.len > 0)) _ = try persistent.appendMessageWithContentParts(io, allocator, .user, prompt, image_parts);
@@ -804,6 +1066,8 @@ fn runJsonProviderTextStream(
             .api_key = api_key,
             .messages = messages_buf[0..messages_len],
             .tools = &.{},
+            .cancellation_context = &stream_context,
+            .should_cancel = jsonAbortRequested,
         }, &stream_context, handleJsonStreamTextDelta) catch |err| {
             if (shouldRetryJsonProviderError(retry_settings, retry_attempts, err, !stream_context.assistant_started and final_text.written().len == 0)) {
                 retry_attempts += 1;
@@ -922,7 +1186,20 @@ fn shouldRetryJsonProviderError(retry_settings: settings.RetrySettings, retry_at
     if (!clean_turn) return false;
     if (!retry_settings.enabled) return false;
     if (retry_attempts >= retry_settings.max_retries) return false;
-    return err == error.ProviderRequestFailed;
+    return isRetryableProviderError(err);
+}
+
+/// Cross-mode parity with rpc.zig's `isRetryableAgentError`: a provider request the server rejected
+/// as transient (429/5xx/overloaded/retryable body text -> ProviderRequestFailed) and a stream that
+/// ended before its terminal `[DONE]`/`message_stop` event (network drop / socket hang up ->
+/// ProviderStreamIncomplete) are both retryable. Structurally malformed responses
+/// (ProviderResponseInvalid) and non-transient 4xx client failures (ProviderClientError) stay
+/// non-retryable, matching the RPC classification exactly.
+fn isRetryableProviderError(err: anyerror) bool {
+    return switch (err) {
+        error.ProviderRequestFailed, error.ProviderStreamIncomplete => true,
+        else => false,
+    };
 }
 
 fn jsonRetryDelayMs(retry_settings: settings.RetrySettings, attempt: usize) usize {
@@ -1396,6 +1673,56 @@ fn buildFoundationResponse(allocator: std.mem.Allocator, parsed: cli.ParsedArgs,
     return try out.toOwnedSlice();
 }
 
+/// Resolve the `images.autoResize` setting (default true) so provider-backed print/JSON runs can
+/// thread it into the read-tool via agent.RunOptions.auto_resize_images. settings.zig owns the
+/// canonical typed loaders (loadRetrySettings/loadShellSettings) but does not expose an image
+/// loader, so this mirrors its project-over-global precedence and `images.autoResize` path read
+/// against the same settings files. A missing/invalid value falls back to true, matching
+/// settings.zig's `imageSettings` default and upstream's default-on auto-resize.
+fn loadImageAutoResize(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !bool {
+    const cwd = try currentPathOwned(io, allocator);
+    defer allocator.free(cwd);
+
+    const global_path = try settingsAgentSettingsPath(allocator, env);
+    defer allocator.free(global_path);
+    const project_path = try std.fs.path.join(allocator, &.{ cwd, ".pi/settings.json" });
+    defer allocator.free(project_path);
+
+    if (try readImageAutoResizeFromFile(io, allocator, project_path)) |value| return value;
+    if (try readImageAutoResizeFromFile(io, allocator, global_path)) |value| return value;
+    return true;
+}
+
+/// Mirror of settings.zig's `agentDir` + "settings.json": `$PI_CODING_AGENT_DIR` (tilde-expanded)
+/// or `$HOME/.pi/agent`, joined with `settings.json`.
+fn settingsAgentSettingsPath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
+    const agent_dir = if (env.get("PI_CODING_AGENT_DIR")) |value|
+        try expandMaybeTilde(allocator, env, value)
+    else
+        try std.fs.path.join(allocator, &.{ env.get("HOME") orelse ".", ".pi", "agent" });
+    defer allocator.free(agent_dir);
+    return std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+}
+
+/// Read `images.autoResize` from a single settings file. Returns null when the file is absent,
+/// unparseable, or the boolean is missing, so the caller can fall through to the next scope/default.
+fn readImageAutoResizeFromFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?bool {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer allocator.free(bytes);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const images = parsed.value.object.get("images") orelse return null;
+    if (images != .object) return null;
+    const auto_resize = images.object.get("autoResize") orelse return null;
+    return if (auto_resize == .bool) auto_resize.bool else null;
+}
+
 fn buildPrintResponse(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1410,6 +1737,7 @@ fn buildPrintResponse(
     on_tool_end: ?agent.ToolEndCallback,
     text_event_context: ?*anyopaque,
     on_text_delta: ?agent.TextDeltaCallback,
+    cancel: ?Cancellation,
 ) !agent.RunResult {
     if (parsed.provider == null or parsed.model == null) {
         return .{ .final_text = try buildFoundationResponse(allocator, parsed, prompt) };
@@ -1432,6 +1760,7 @@ fn buildPrintResponse(
     defer allocator.free(runtime_system_prompt);
     const shell_settings = try settings.loadShellSettings(io, allocator, env);
     defer shell_settings.deinit(allocator);
+    const auto_resize_images = try loadImageAutoResize(io, allocator, env);
     const prompt_content_parts = try buildPromptContentParts(allocator, prompt, image_parts);
     defer if (prompt_content_parts.len > 0) allocator.free(prompt_content_parts);
     var runtime_extensions = try discoverRuntimeExtensionPaths(io, allocator, env, parsed);
@@ -1462,6 +1791,7 @@ fn buildPrintResponse(
         .env = env,
         .shell_path = shell_settings.shell_path,
         .shell_command_prefix = shell_settings.shell_command_prefix,
+        .auto_resize_images = auto_resize_images,
         .tool_set = toolSetFromParsed(parsed),
         .custom_tools = extension_tool_definitions,
         .custom_tool_context = if (extension_tool_definitions.len > 0) &hooks else null,
@@ -1476,6 +1806,8 @@ fn buildPrintResponse(
         .after_tool_call = if (has_extension_hooks) extension_runner.Runner.afterToolCall else null,
         .text_event_context = text_event_context,
         .on_text_delta = on_text_delta,
+        .cancellation_context = if (cancel) |c| c.context else null,
+        .should_cancel = if (cancel) |c| c.should_cancel else null,
     }) catch |err| {
         try writeStderr(io, "Provider request failed: ");
         try writeStderr(io, @errorName(err));
@@ -1483,6 +1815,13 @@ fn buildPrintResponse(
         return err;
     };
 }
+
+/// Optional cancellation hook threaded into a print/JSON agent run so an interrupted turn aborts
+/// cooperatively (agent.zig polls `should_cancel` before each provider request and between turns).
+const Cancellation = struct {
+    context: *anyopaque,
+    should_cancel: agent.CancellationCallback,
+};
 
 fn toolSetFromParsed(parsed: cli.ParsedArgs) agent.ToolSet {
     if (parsed.no_tools or parsed.no_builtin_tools) return .none;
@@ -1752,7 +2091,7 @@ fn buildRuntimeSystemPrompt(
     defer if (append_prompt) |value| allocator.free(value);
 
     var date_buf: [10]u8 = undefined;
-    const current_date = try system_prompt.currentUtcDate(io, &date_buf);
+    const current_date = try system_prompt.currentLocalDate(io, allocator, env, &date_buf);
 
     const selected_tools = try selectedToolNamesFromParsed(allocator, parsed);
     defer selected_tools.deinit(allocator);
@@ -1974,12 +2313,31 @@ fn writeRawJsonObjectOrString(w: *std.Io.Writer, value: []const u8) !void {
     try writeJsonString(w, value);
 }
 
-fn writeDiagnostics(io: std.Io, parsed: cli.ParsedArgs) !void {
+/// Emit parse diagnostics to stderr, byte-for-byte matching upstream main.ts:
+/// `console.error(`${type === "error" ? "Error" : "Warning"}: ${message}`)`.
+/// Upstream's `message` is the fully interpolated sentence (e.g. the offending
+/// `--thinking` value and valid-values list, or the unknown option arg), so we
+/// render it via `cli.renderDiagnosticMessage` rather than printing the raw static
+/// `.message` template. The JSON introspection path already interpolates the same
+/// way (cli.renderDiagnosticMessageEscaped); this brings the text/stderr path to
+/// parity. Upstream colorizes via chalk; pi-zig's diagnostics path emits plain text.
+fn writeDiagnostics(io: std.Io, allocator: std.mem.Allocator, parsed: cli.ParsedArgs) !void {
     for (parsed.diagnostics[0..parsed.diagnostics_len]) |diagnostic| {
-        try writeStderr(io, if (diagnostic.kind == .@"error") "Error: " else "Warning: ");
-        try writeStderr(io, diagnostic.message);
-        try writeStderr(io, "\n");
+        var rendered: std.Io.Writer.Allocating = .init(allocator);
+        defer rendered.deinit();
+        try writeDiagnosticLine(&rendered.writer, diagnostic);
+        try writeStderr(io, rendered.written());
     }
+}
+
+/// Render a single diagnostic as the exact stderr line upstream prints, including the
+/// `Error: `/`Warning: ` prefix and trailing newline, with the message body fully
+/// interpolated via `cli.renderDiagnosticMessage`. Factored out so the byte-exact line
+/// can be asserted in a unit test without writing to the real stderr fd.
+fn writeDiagnosticLine(w: *std.Io.Writer, diagnostic: cli.Diagnostic) !void {
+    try w.writeAll(if (diagnostic.kind == .@"error") "Error: " else "Warning: ");
+    try cli.renderDiagnosticMessage(w, diagnostic);
+    try w.writeByte('\n');
 }
 
 fn hasErrorDiagnostics(parsed: cli.ParsedArgs) bool {
@@ -2061,4 +2419,96 @@ test "provider tools follow tool flags" {
     const all_tools = toolSetFromParsed(cli.parse(&.{ "--tools", "all" }));
     try std.testing.expect(all_tools.edit);
     try std.testing.expect(all_tools.ls);
+}
+
+test "JSON/print retry classifier mirrors RPC transient-error parity" {
+    // Transient provider failures and incomplete streams are retryable; structurally invalid
+    // responses, non-transient 4xx client errors, and aborts are not. This must match rpc.zig's
+    // isRetryableAgentError so RPC and JSON/print modes retry the same error set.
+    try std.testing.expect(isRetryableProviderError(error.ProviderRequestFailed));
+    try std.testing.expect(isRetryableProviderError(error.ProviderStreamIncomplete));
+    try std.testing.expect(!isRetryableProviderError(error.ProviderResponseInvalid));
+    try std.testing.expect(!isRetryableProviderError(error.ProviderClientError));
+    try std.testing.expect(!isRetryableProviderError(error.AgentAborted));
+}
+
+test "JSON/print retry gate honors settings and clean-turn state for incomplete streams" {
+    const enabled: settings.RetrySettings = .{ .enabled = true, .max_retries = 3, .base_delay_ms = 0 };
+    // A clean turn (no assistant output yet) with an incomplete stream retries, matching the
+    // cross-mode parity fix that added ProviderStreamIncomplete to the retryable set.
+    try std.testing.expect(shouldRetryJsonProviderError(enabled, 0, error.ProviderStreamIncomplete, true));
+    // Already past max attempts: stop retrying.
+    try std.testing.expect(!shouldRetryJsonProviderError(enabled, 3, error.ProviderStreamIncomplete, true));
+    // Output already streamed this turn: not a clean turn, do not retry mid-stream.
+    try std.testing.expect(!shouldRetryJsonProviderError(enabled, 0, error.ProviderStreamIncomplete, false));
+    // Retry disabled in settings: never retry.
+    const disabled: settings.RetrySettings = .{ .enabled = false, .max_retries = 3, .base_delay_ms = 0 };
+    try std.testing.expect(!shouldRetryJsonProviderError(disabled, 0, error.ProviderStreamIncomplete, true));
+    // Non-transient client error stays non-retryable even on a clean turn.
+    try std.testing.expect(!shouldRetryJsonProviderError(enabled, 0, error.ProviderClientError, true));
+}
+
+test "default model selection resolves a provider default when --model omitted" {
+    // A known provider with no --model resolves to a real catalog model (upstream buildFallbackModel
+    // parity) so the run proceeds instead of dropping to the inert foundation response.
+    var anthropic = cli.parse(&.{"--provider"});
+    anthropic.provider = "anthropic";
+    anthropic.model = null;
+    applyDefaultModelSelection(&anthropic);
+    try std.testing.expect(anthropic.model != null);
+    try std.testing.expect(models.find("anthropic", anthropic.model.?) != null);
+
+    // Case-insensitive provider names canonicalize before lookup.
+    var mixed = cli.parse(&.{});
+    mixed.provider = "OpenAI";
+    mixed.model = null;
+    applyDefaultModelSelection(&mixed);
+    try std.testing.expect(mixed.model != null);
+    try std.testing.expect(models.find("openai", mixed.model.?) != null);
+}
+
+test "default model selection leaves explicit and absent models untouched" {
+    // Explicit --model is never overwritten.
+    var explicit = cli.parse(&.{});
+    explicit.provider = "anthropic";
+    explicit.model = "claude-opus-4-7";
+    applyDefaultModelSelection(&explicit);
+    try std.testing.expectEqualStrings("claude-opus-4-7", explicit.model.?);
+
+    // No provider at all (true interactive boot) stays a no-op: model remains null.
+    var none = cli.parse(&.{});
+    none.provider = null;
+    none.model = null;
+    applyDefaultModelSelection(&none);
+    try std.testing.expect(none.model == null);
+
+    // Unknown provider with no catalog entries leaves the model null (foundation path preserved).
+    var unknown = cli.parse(&.{});
+    unknown.provider = "definitely-not-a-real-provider";
+    unknown.model = null;
+    applyDefaultModelSelection(&unknown);
+    try std.testing.expect(unknown.model == null);
+}
+
+test "diagnostic stderr line interpolates the upstream message (text path parity)" {
+    // Invalid --thinking value: the text/stderr line must carry the offending value and the
+    // valid-values list, not the raw static `.message` template ("Invalid thinking level").
+    {
+        const parsed = cli.parse(&.{ "--thinking", "maximum" });
+        var buf: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try writeDiagnosticLine(&w, parsed.diagnostics[0]);
+        try std.testing.expectEqualStrings(
+            "Warning: Invalid thinking level \"maximum\". Valid values: off, minimal, low, medium, high, xhigh\n",
+            w.buffered(),
+        );
+    }
+    // Unknown option: a hard error prefixed `Error: ` with the offending arg interpolated.
+    {
+        const parsed = cli.parse(&.{"-x"});
+        var buf: [128]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try writeDiagnosticLine(&w, parsed.diagnostics[0]);
+        try std.testing.expectEqualStrings("Error: Unknown option: -x\n", w.buffered());
+    }
 }

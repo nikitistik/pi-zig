@@ -31,11 +31,44 @@ const max_assistant_error_message_bytes = 512;
 const max_custom_type_bytes = 128;
 const max_pending_messages = 32;
 const max_auto_retry_attempts = 3;
+// [FLOW_H_AUTO_COMPACTION] Mirror upstream settings-manager.ts default reserveTokens.
+const default_auto_compaction_reserve_tokens = 16384;
 const default_auto_retry_base_delay_ms = 0;
 const default_auto_retry_max_delay_ms = 60_000;
 const retry_sleep_poll_ms = 25;
 const compaction_summary_prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const compaction_summary_suffix = "\n</summary>";
+
+// [FLOW_E_COMPACTION] Summarization prompts mirror
+// upstream/pi/packages/coding-agent/src/core/compaction/{utils,compaction}.ts
+// (SUMMARIZATION_SYSTEM_PROMPT and SUMMARIZATION_PROMPT).
+const compaction_summarization_system_prompt =
+    "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\n" ++
+    "Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+const compaction_summarization_prompt =
+    "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\n" ++
+    "Use this EXACT format:\n\n" ++
+    "## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n" ++
+    "## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n" ++
+    "## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n" ++
+    "## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n" ++
+    "## Next Steps\n1. [Ordered list of what should happen next]\n\n" ++
+    "## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\n" ++
+    "Keep each section concise. Preserve exact file paths, function names, and error messages.";
+
+// [FLOW_G_SESSION_TREE] Branch-summary prompt mirrors
+// upstream/pi/packages/coding-agent/src/core/compaction/branch-summarization.ts
+// (BRANCH_SUMMARY_PROMPT). The summarization SYSTEM prompt is shared with compaction
+// (upstream reuses SUMMARIZATION_SYSTEM_PROMPT for both).
+const branch_summary_prompt =
+    "Create a structured summary of this conversation branch for context when returning later.\n\n" ++
+    "Use this EXACT format:\n\n" ++
+    "## Goal\n[What was the user trying to accomplish in this branch?]\n\n" ++
+    "## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n" ++
+    "## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n" ++
+    "## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n" ++
+    "## Next Steps\n1. [What should happen next to continue this work]\n\n" ++
+    "Keep each section concise. Preserve exact file paths, function names, and error messages.";
 
 pub const RunOptions = struct {
     command_options: commands.Options = .{},
@@ -554,6 +587,11 @@ const Runtime = struct {
     follow_up_queue: PendingMessageQueue = .{},
     next_turn_custom_queue: PendingCustomMessageQueue = .{},
     auto_compaction_enabled: bool = false,
+    // [FLOW_H_AUTO_COMPACTION] Tokens held back from the model's context window for
+    // the next prompt + response (upstream CompactionSettings.reserveTokens default
+    // 16384). When auto-compaction is enabled and estimated context tokens exceed
+    // (context_window - reserve), a compaction runs before the next provider prompt.
+    auto_compaction_reserve_tokens: usize = default_auto_compaction_reserve_tokens,
     auto_retry_enabled: bool = false,
     auto_retry_max_attempts: usize = max_auto_retry_attempts,
     auto_retry_base_delay_ms: usize = default_auto_retry_base_delay_ms,
@@ -564,6 +602,10 @@ const Runtime = struct {
     env: ?*const std.process.Environ.Map = null,
     active_bash: ?*ActiveBashJob = null,
     active_prompt: ?*ActivePromptJob = null,
+    // [FLOW_F_PERSISTENT_RUNNER] Long-lived extension Node process owned by this
+    // RPC session. Lazily started by makeExtensionRunner and reused across
+    // commands so extension module-local state persists; torn down in deinit.
+    ext_persistent: ?*extension_runner.PersistentProcess = null,
 
     fn init(
         self: *Runtime,
@@ -585,6 +627,11 @@ const Runtime = struct {
         self.steering_queue.clear(allocator);
         self.follow_up_queue.clear(allocator);
         self.next_turn_custom_queue.clear();
+        // [FLOW_F_PERSISTENT_RUNNER] Shut down the long-lived extension process.
+        if (self.ext_persistent) |proc| {
+            proc.deinit();
+            self.ext_persistent = null;
+        }
     }
 
     fn resetInMemory(self: *Runtime, allocator: std.mem.Allocator) void {
@@ -598,6 +645,7 @@ const Runtime = struct {
         self.follow_up_queue.clear(allocator);
         self.next_turn_custom_queue.clear();
         self.auto_compaction_enabled = false;
+        self.auto_compaction_reserve_tokens = default_auto_compaction_reserve_tokens;
         self.auto_retry_enabled = false;
         self.auto_retry_max_attempts = max_auto_retry_attempts;
         self.auto_retry_base_delay_ms = default_auto_retry_base_delay_ms;
@@ -738,6 +786,370 @@ const Runtime = struct {
         try self.copyIntoSiblingSession(io, allocator, "clone", self.message_count);
     }
 
+    // [FLOW_G_SESSION_TREE] Switch the active branch to `target_id` within the same
+    // session file (upstream agent-session navigateTree -> sessionManager.branch()):
+    // move the durable leaf pointer, then reload so in-memory state follows the
+    // chosen branch. The target must exist in the tree. After reload the flat
+    // message ring is pruned to the leaf->root path (upstream buildSessionContext
+    // walks parentId from the leaf), so a sibling branch's entries are dropped from
+    // the active conversation while remaining on disk for future navigation.
+    fn navigateTree(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, target_id: []const u8) !void {
+        // Heap-allocated tree to keep the ~128 KB SessionTree off the stack.
+        const tree = try allocator.create(session.PersistentStore.SessionTree);
+        defer allocator.destroy(tree);
+        try self.store.readTreeInto(io, allocator, tree);
+        if (!tree.contains(target_id)) return error.EntryNotFound;
+        try self.store.setLeaf(io, allocator, target_id);
+        self.resetInMemory(allocator);
+        self.session_generation += 1;
+        try self.loadSessionEntries(io, allocator);
+        try self.pruneToBranch(allocator, tree, target_id);
+    }
+
+    // [FLOW_G_SESSION_TREE] navigate_tree with a branch summary (upstream agent-session.ts
+    // navigateTree summarize-path -> sessionManager.branchWithSummary): before the leaf
+    // moves, summarize the entries on the abandoned branch (the current ring entries that
+    // are NOT ancestors of the target), then navigate and persist a branch_summary entry
+    // at the target position so returning later carries the abandoned context forward.
+    // The summary prefers a provider call (reusing the FLOW_E summarization machinery) and
+    // falls back to a static local summary when no model/auth is configured. Returns the
+    // generated summary text (borrowing `summary_buf`) or null when there was nothing to
+    // summarize (no abandoned entries), in which case it behaves like a plain navigateTree.
+    fn navigateTreeWithSummary(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+        custom_instructions: ?[]const u8,
+        summary_buf: []u8,
+    ) !?[]const u8 {
+        // SessionTree is a large fixed-size value (tree_max_nodes TreeNodes, ~128 KB), so
+        // keep it on the heap to avoid blowing the worker/test thread stack. Use
+        // readTreeInto so the parse fills the heap slot directly (no return-by-value).
+        const tree = try allocator.create(session.PersistentStore.SessionTree);
+        defer allocator.destroy(tree);
+        try self.store.readTreeInto(io, allocator, tree);
+        if (!tree.contains(target_id)) return error.EntryNotFound;
+
+        // Collect the abandoned-branch text from the current ring: entries that are NOT on
+        // the target's ancestor path (upstream collectEntriesForBranchSummary walks old
+        // leaf -> common ancestor). The current ring is already the old branch path.
+        var target_ancestors = std.StringHashMap(void).init(allocator);
+        defer target_ancestors.deinit();
+        try collectAncestorIds(tree, target_id, &target_ancestors);
+
+        const abandoned_prompt = try self.buildBranchSummaryPromptText(allocator, &target_ancestors, custom_instructions);
+        defer if (abandoned_prompt) |owned| allocator.free(owned);
+
+        // Nothing abandoned -> plain navigation (no branch_summary entry, like upstream
+        // when entriesToSummarize is empty).
+        if (abandoned_prompt == null) {
+            try self.store.setLeaf(io, allocator, target_id);
+            self.resetInMemory(allocator);
+            self.session_generation += 1;
+            try self.loadSessionEntries(io, allocator);
+            try self.pruneToBranch(allocator, tree, target_id);
+            return null;
+        }
+
+        // Generate the summary (provider-backed when authenticated, else static fallback).
+        var owned_summary: ?[]u8 = null;
+        defer if (owned_summary) |owned| allocator.free(owned);
+        const summary_text: []const u8 = blk: {
+            if (try self.runBranchSummaryIfAuthenticated(io, allocator, abandoned_prompt.?)) |provider_summary| {
+                owned_summary = provider_summary;
+                break :blk provider_summary;
+            }
+            break :blk "Branch summary unavailable (no model configured).";
+        };
+
+        // Move the leaf to the navigation target, append the branch_summary as a sibling
+        // marker entry chained off target (upstream attaches at newLeafId), then restore
+        // the leaf to target_id so logical navigation lands at the requested entry.
+        // The branch_summary persists on disk as a marker and is visible in the tree;
+        // the active leaf stays at target so the next prompt continues from there.
+        try self.store.setLeaf(io, allocator, target_id);
+        _ = try self.store.appendBranchSummary(io, allocator, summary_text, target_id, false);
+        try self.store.setLeaf(io, allocator, target_id);
+
+        // Reload + prune so the in-memory ring follows the target branch.
+        self.resetInMemory(allocator);
+        self.session_generation += 1;
+        try self.loadSessionEntries(io, allocator);
+        try self.store.readTreeInto(io, allocator, tree);
+        try self.pruneToBranch(allocator, tree, target_id);
+
+        if (summary_text.len > summary_buf.len) return summary_buf[0..0];
+        @memcpy(summary_buf[0..summary_text.len], summary_text);
+        return summary_buf[0..summary_text.len];
+    }
+
+    /// [FLOW_G_SESSION_TREE] Serialize the abandoned-branch entries (current ring entries
+    /// whose id is NOT in `keep_ancestors`) into a branch-summary prompt, mirroring
+    /// upstream serializeConversation + BRANCH_SUMMARY_PROMPT. Returns null when there are
+    /// no abandoned entries (nothing to summarize). Caller owns the returned buffer.
+    fn buildBranchSummaryPromptText(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        keep_ancestors: *const std.StringHashMap(void),
+        custom_instructions: ?[]const u8,
+    ) !?[]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll("<conversation>\n");
+        var emitted = false;
+        for (self.messages[0..self.message_count]) |*message| {
+            if (keep_ancestors.contains(message.entryId())) continue;
+            const line_prefix: ?[]const u8 = switch (message.role) {
+                .user => "[User]: ",
+                .assistant => if (message.isFailedAssistant()) null else "[Assistant]: ",
+                .tool => "[Tool result]: ",
+                .bash_execution => "[Bash]: ",
+                .custom => "[Custom]: ",
+                .compaction_summary => "[Previous summary]: ",
+                .system, .custom_entry => null,
+            };
+            const prefix = line_prefix orelse continue;
+            const text = std.mem.trim(u8, message.text(), " \t\r\n");
+            if (message.role == .bash_execution) {
+                if (emitted) try w.writeAll("\n\n");
+                try w.writeAll(prefix);
+                try w.writeAll(std.mem.trim(u8, message.commandText(), " \t\r\n"));
+                if (text.len > 0) {
+                    try w.writeAll(" => ");
+                    try w.writeAll(text);
+                }
+                emitted = true;
+                continue;
+            }
+            if (text.len == 0) continue;
+            if (emitted) try w.writeAll("\n\n");
+            try w.writeAll(prefix);
+            try w.writeAll(text);
+            emitted = true;
+        }
+        if (!emitted) {
+            out.deinit();
+            return null;
+        }
+        try w.writeAll("\n</conversation>\n\n");
+        try w.writeAll(branch_summary_prompt);
+        if (custom_instructions) |instructions| {
+            const trimmed = std.mem.trim(u8, instructions, " \t\r\n");
+            if (trimmed.len > 0) {
+                try w.writeAll("\n\nAdditional focus: ");
+                try w.writeAll(trimmed);
+            }
+        }
+        return try out.toOwnedSlice();
+    }
+
+    /// [FLOW_G_SESSION_TREE] Run the configured provider to summarize an abandoned branch,
+    /// reusing the same single-turn, tool-free summarization shape as compaction (upstream
+    /// generateBranchSummary -> completeSimple with SUMMARIZATION_SYSTEM_PROMPT). Returns
+    /// null when no model/auth is configured (caller falls back to a static summary). On
+    /// success the caller owns the returned buffer.
+    fn runBranchSummaryIfAuthenticated(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+    ) !?[]u8 {
+        const model = self.selected_model orelse return null;
+        const env = self.env orelse return null;
+        const api_key = try auth.resolveProviderApiKey(io, allocator, env, model.provider) orelse return null;
+        defer allocator.free(api_key);
+
+        const shell_settings = try settings.loadShellSettings(io, allocator, env);
+        defer shell_settings.deinit(allocator);
+
+        std.log.debug("[FLOW_G_SESSION_TREE] running branch summary provider={s} model={s}", .{ model.provider, model.id });
+        var run_result = try agent.runPrompt(io, allocator, env, .{
+            .provider = model.provider,
+            .model = model.id,
+            .api_key = api_key,
+            .prompt = prompt,
+            .system_prompt = compaction_summarization_system_prompt,
+            .env = env,
+            .shell_path = shell_settings.shell_path,
+            .shell_command_prefix = shell_settings.shell_command_prefix,
+            .history = &.{},
+            .tool_set = agent.ToolSet.none,
+            .custom_tools = &.{},
+            .max_turns = 1,
+        });
+        defer run_result.deinit(allocator);
+        return try allocator.dupe(u8, std.mem.trim(u8, run_result.final_text, " \t\r\n"));
+    }
+
+    // [FLOW_G_SESSION_TREE] Keep only messages on the leaf->root path, preserving
+    // order. Walks the parentId chain from `leaf_id` to build the ancestor id set,
+    // then rewrites the in-memory ring densely with only the kept entries. Pruned
+    // entries' owned image parts are released; the file is untouched.
+    fn pruneToBranch(self: *Runtime, allocator: std.mem.Allocator, tree: *const session.PersistentStore.SessionTree, leaf_id: []const u8) !void {
+        var keep = std.StringHashMap(void).init(allocator);
+        defer keep.deinit();
+        var current: ?[]const u8 = leaf_id;
+        var guard: usize = 0;
+        while (current) |id| : (guard += 1) {
+            if (guard > session.PersistentStore.tree_max_nodes) break;
+            try keep.put(id, {});
+            current = null;
+            for (tree.slice()) |*node| {
+                if (std.mem.eql(u8, node.id(), id)) {
+                    current = node.parentId();
+                    break;
+                }
+            }
+        }
+
+        var write_index: usize = 0;
+        var read_index: usize = 0;
+        while (read_index < self.message_count) : (read_index += 1) {
+            if (!keep.contains(self.messages[read_index].entryId())) {
+                freeRpcContentParts(allocator, self.messages[read_index].image_parts);
+                self.messages[read_index].image_parts = &.{};
+                continue;
+            }
+            if (write_index != read_index) {
+                self.messages[write_index] = self.messages[read_index];
+            }
+            write_index += 1;
+        }
+        self.message_count = write_index;
+    }
+
+    // ===== [FLOW_I_EXTENSION_UI] begin extension UI request/response routing =====
+    // Mirrors upstream/pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:
+    // an extension's UI request is forwarded to the client as an
+    // `{ type: "extension_ui_request", id, method, ...params }` stdout event; the
+    // client replies on stdin with `{ type: "extension_ui_response", id, ... }` and
+    // the server routes the reply back to the waiting request. The request wire shape
+    // matches rpc-types.ts RpcExtensionUIRequest; the response matches
+    // RpcExtensionUIResponse ({value} | {confirmed} | {cancelled:true}).
+    //
+    // Dialog methods (select/confirm/input/editor) block for a response; fire-and-
+    // forget methods (notify/setStatus/setWidget/setTitle/set_editor_text) emit and
+    // return immediately. The dialog wait is a synchronous stdin pump because the RPC
+    // loop is single-threaded and an extension UI dialog blocks further commands until
+    // answered (same blocking semantics as upstream's promise-based dialog).
+    const ExtensionUiMethod = enum {
+        select,
+        confirm,
+        input,
+        editor,
+        notify,
+        set_status,
+        set_widget,
+        set_title,
+        set_editor_text,
+
+        fn parse(value: []const u8) ?ExtensionUiMethod {
+            if (std.mem.eql(u8, value, "select")) return .select;
+            if (std.mem.eql(u8, value, "confirm")) return .confirm;
+            if (std.mem.eql(u8, value, "input")) return .input;
+            if (std.mem.eql(u8, value, "editor")) return .editor;
+            if (std.mem.eql(u8, value, "notify")) return .notify;
+            if (std.mem.eql(u8, value, "setStatus")) return .set_status;
+            if (std.mem.eql(u8, value, "setWidget")) return .set_widget;
+            if (std.mem.eql(u8, value, "setTitle")) return .set_title;
+            if (std.mem.eql(u8, value, "set_editor_text")) return .set_editor_text;
+            return null;
+        }
+
+        fn isBlocking(self: ExtensionUiMethod) bool {
+            return switch (self) {
+                .select, .confirm, .input, .editor => true,
+                .notify, .set_status, .set_widget, .set_title, .set_editor_text => false,
+            };
+        }
+    };
+
+    fn handleExtensionUiRequest(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        r: *std.Io.Reader,
+        output: *RpcOutput,
+        value: std.json.Value,
+    ) !void {
+        const request_id = getStringField(value, "id") orelse return error.ExtensionUiRequestMissingId;
+        const method_name = getStringField(value, "method") orelse return error.ExtensionUiRequestMissingMethod;
+        const method = ExtensionUiMethod.parse(method_name) orelse return error.ExtensionUiRequestUnknownMethod;
+
+        // Forward the request to the client as an outbound event.
+        {
+            output.mutex.lock();
+            defer output.mutex.unlock();
+            try writeExtensionUiRequestEvent(output.writer, request_id, method_name, value);
+            try output.writer.flush();
+        }
+
+        if (!method.isBlocking()) {
+            // Fire-and-forget: acknowledge without waiting for a response.
+            output.mutex.lock();
+            defer output.mutex.unlock();
+            try writeResponseHead(output.writer, request_id, "extension_ui_request", true);
+            try output.writer.writeAll(",\"data\":{\"method\":");
+            try writeJsonString(output.writer, method_name);
+            try output.writer.writeAll(",\"delivered\":true}}\n");
+            try output.writer.flush();
+            return;
+        }
+
+        // Blocking dialog: pump stdin until the matching extension_ui_response arrives.
+        const reply = try self.waitForExtensionUiResponse(allocator, r, request_id);
+        defer reply.deinit(allocator);
+
+        output.mutex.lock();
+        defer output.mutex.unlock();
+        try writeResponseHead(output.writer, request_id, "extension_ui_request", true);
+        try output.writer.writeAll(",\"data\":");
+        try writeExtensionUiResponseData(output.writer, reply);
+        try output.writer.writeAll("}\n");
+        try output.writer.flush();
+    }
+
+    const ExtensionUiReply = struct {
+        cancelled: bool = false,
+        confirmed: ?bool = null,
+        value: ?[]u8 = null,
+
+        fn deinit(self: *const ExtensionUiReply, allocator: std.mem.Allocator) void {
+            if (self.value) |owned| allocator.free(owned);
+        }
+    };
+
+    fn waitForExtensionUiResponse(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        r: *std.Io.Reader,
+        request_id: []const u8,
+    ) !ExtensionUiReply {
+        _ = self;
+        while (true) {
+            const raw_line = try r.takeDelimiter('\n');
+            const line_with_cr = raw_line orelse return error.ExtensionUiResponseMissing;
+            const line = stripTrailingCarriageReturn(line_with_cr);
+            if (std.mem.trim(u8, line, " \t").len == 0) continue;
+
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return error.ExtensionUiResponseInvalidJson;
+            defer parsed.deinit();
+            const line_type = getStringField(parsed.value, "type") orelse return error.ExtensionUiResponseUnexpectedLine;
+            if (!std.mem.eql(u8, line_type, "extension_ui_response")) return error.ExtensionUiResponseUnexpectedLine;
+            const response_id = getStringField(parsed.value, "id") orelse return error.ExtensionUiResponseMissingId;
+            if (!std.mem.eql(u8, response_id, request_id)) continue; // a response for some other request id
+
+            var reply: ExtensionUiReply = .{};
+            if (getBoolField(parsed.value, "cancelled")) |cancelled| reply.cancelled = cancelled;
+            if (getBoolField(parsed.value, "confirmed")) |confirmed| reply.confirmed = confirmed;
+            if (getStringField(parsed.value, "value")) |routed| reply.value = try allocator.dupe(u8, routed);
+            return reply;
+        }
+    }
+    // ===== [FLOW_I_EXTENSION_UI] end extension UI request/response routing =====
+
     fn copyIntoSiblingSession(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, kind: []const u8, copy_count: usize) !void {
         const source_path = self.store.path();
         const previous_model = self.selected_model;
@@ -806,7 +1218,7 @@ const Runtime = struct {
                     _ = try new_store.appendBashExecution(io, allocator, message.commandText(), result);
                 },
                 .compaction_summary => {
-                    _ = try new_store.appendCompaction(io, allocator, message.text(), message.firstKeptEntryId(), message.tokens_before, null, copy_count);
+                    _ = try new_store.appendCompaction(io, allocator, message.text(), message.firstKeptEntryId(), message.tokens_before, null, copy_count, null);
                 },
                 .custom => {
                     _ = try new_store.appendCustomMessage(io, allocator, message.customType(), message.text(), message.custom_display);
@@ -1239,6 +1651,14 @@ const Runtime = struct {
         try self.setThinkingLevel(io, allocator, self.thinking_level);
     }
 
+    // ===== [FLOW_E_COMPACTION] begin LLM-driven compaction (Flow E) =====
+    // Mirrors upstream/pi/packages/coding-agent/src/core/compaction/compaction.ts:
+    // build a serialized conversation, send it through the provider with the
+    // summarization system prompt, and use the returned text as the compaction
+    // summary. Falls back to the legacy static local summary when no model/auth
+    // is configured. The persist + reload + next-prompt injection path is the
+    // pre-existing appendCompaction/addLoadedCompaction/loadCompactionEntry/
+    // appendCompactionHistoryMessage machinery, reused unchanged.
     fn writeCompactResponse(
         self: *Runtime,
         io: std.Io,
@@ -1248,39 +1668,25 @@ const Runtime = struct {
         command: []const u8,
         custom_instructions: ?[]const u8,
     ) !void {
-        var summary_writer: std.Io.Writer.Allocating = .init(allocator);
-        defer summary_writer.deinit();
-        const sw = &summary_writer.writer;
-        if (self.message_count == 0) {
-            try sw.writeAll("No messages to compact.");
-        } else {
-            try sw.print("Local summary of {d} message(s).", .{self.message_count});
-            for (self.messages[0..self.message_count]) |*message| {
-                try sw.writeAll("\n- ");
-                try sw.writeAll(message.role.label());
-                try sw.writeAll(": ");
-                if (message.role == .bash_execution) {
-                    try appendSummarySnippet(sw, message.commandText());
-                    try sw.writeAll(" => ");
-                }
-                try appendSummarySnippet(sw, message.text());
-            }
-        }
-
-        const summary = summary_writer.written();
-        const first_kept_entry_id = if (self.message_count > 0) self.messages[0].entryId() else "";
-        const tokens_before = self.estimateTokensBeforeCompaction();
-        const entry_id = try self.store.appendCompaction(io, allocator, summary, first_kept_entry_id, tokens_before, custom_instructions, self.message_count);
-        try self.addLoadedCompaction(entry_id, summary, first_kept_entry_id, tokens_before);
+        var outcome = try self.performCompaction(io, allocator, custom_instructions);
+        defer outcome.deinit(allocator);
 
         try writeResponseHead(w, id, command, true);
         try w.writeAll(",\"data\":{\"summary\":");
-        try writeJsonString(w, summary);
+        try writeJsonString(w, outcome.summary);
         try w.writeAll(",\"firstKeptEntryId\":");
-        try writeJsonString(w, first_kept_entry_id);
+        try writeJsonString(w, outcome.first_kept_entry_id);
         try w.writeAll(",\"tokensBefore\":");
-        try w.print("{d}", .{tokens_before});
-        try w.writeAll(",\"details\":{\"local\":true,\"messageCount\":");
+        try w.print("{d}", .{outcome.tokens_before});
+        if (outcome.provider_meta) |meta| {
+            try w.writeAll(",\"details\":{\"local\":false,\"provider\":");
+            try writeJsonString(w, meta.provider);
+            try w.writeAll(",\"model\":");
+            try writeJsonString(w, meta.model);
+            try w.writeAll(",\"messageCount\":");
+        } else {
+            try w.writeAll(",\"details\":{\"local\":true,\"messageCount\":");
+        }
         try w.print("{d}", .{self.visibleMessageCount()});
         if (custom_instructions) |instructions| {
             try w.writeAll(",\"customInstructions\":");
@@ -1288,6 +1694,234 @@ const Runtime = struct {
         }
         try w.writeAll("}}}\n");
     }
+
+    const CompactionOutcome = struct {
+        summary: []const u8,
+        owned_summary: ?[]u8 = null,
+        first_kept_entry_id: []const u8,
+        tokens_before: usize,
+        provider_meta: ?session.PersistentStore.CompactionProvider = null,
+
+        fn deinit(self: *CompactionOutcome, allocator: std.mem.Allocator) void {
+            if (self.owned_summary) |owned| allocator.free(owned);
+        }
+    };
+
+    /// Run one compaction over the current conversation, persist + reload the
+    /// compaction entry, and return the recorded summary metadata. Shared by the
+    /// explicit `compact` command and the auto-compaction trigger so both record
+    /// identical entries. Prefers a provider summary; falls back to the static
+    /// local summary when no model/auth is configured (reused FLOW_E machinery).
+    fn performCompaction(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        custom_instructions: ?[]const u8,
+    ) !CompactionOutcome {
+        const first_kept_entry_id = if (self.message_count > 0) self.messages[0].entryId() else "";
+        const tokens_before = self.estimateTokensBeforeCompaction();
+
+        // Prefer a real provider-backed summary when a model + auth are present.
+        var provider_summary: ?[]u8 = null;
+        errdefer if (provider_summary) |owned| allocator.free(owned);
+        var provider_meta: ?session.PersistentStore.CompactionProvider = null;
+        if (self.message_count > 0) {
+            if (try self.runCompactionSummaryIfAuthenticated(io, allocator, custom_instructions)) |result| {
+                provider_summary = result.summary;
+                provider_meta = .{ .provider = result.provider, .model = result.model };
+            }
+        }
+
+        // Fall back to the static local summary when no provider summary exists.
+        var owned_static: ?[]u8 = null;
+        errdefer if (owned_static) |owned| allocator.free(owned);
+        const summary: []const u8 = if (provider_summary) |owned| owned else blk: {
+            var static_writer: std.Io.Writer.Allocating = .init(allocator);
+            defer static_writer.deinit();
+            const sw = &static_writer.writer;
+            if (self.message_count == 0) {
+                try sw.writeAll("No messages to compact.");
+            } else {
+                try sw.print("Local summary of {d} message(s).", .{self.message_count});
+                for (self.messages[0..self.message_count]) |*message| {
+                    try sw.writeAll("\n- ");
+                    try sw.writeAll(message.role.label());
+                    try sw.writeAll(": ");
+                    if (message.role == .bash_execution) {
+                        try appendSummarySnippet(sw, message.commandText());
+                        try sw.writeAll(" => ");
+                    }
+                    try appendSummarySnippet(sw, message.text());
+                }
+            }
+            owned_static = try static_writer.toOwnedSlice();
+            break :blk owned_static.?;
+        };
+
+        const entry_id = try self.store.appendCompaction(io, allocator, summary, first_kept_entry_id, tokens_before, custom_instructions, self.message_count, provider_meta);
+        // addLoadedCompaction copies the summary into the in-memory ring, so the
+        // owned buffer (provider or static) can be returned to the caller and freed
+        // after the response is written.
+        try self.addLoadedCompaction(entry_id, summary, first_kept_entry_id, tokens_before);
+
+        const owned = provider_summary orelse owned_static;
+        provider_summary = null;
+        owned_static = null;
+        // first_kept_entry_id borrows the in-memory ring (messages[0].entryId()),
+        // which stays valid while the caller writes the response under the same lock.
+        return .{
+            .summary = if (owned) |o| o else summary,
+            .owned_summary = owned,
+            .first_kept_entry_id = first_kept_entry_id,
+            .tokens_before = tokens_before,
+            .provider_meta = provider_meta,
+        };
+    }
+
+    // ===== [FLOW_H_AUTO_COMPACTION] begin auto-compaction trigger heuristics =====
+    // Mirrors upstream/pi/packages/coding-agent/src/core/compaction/compaction.ts
+    // shouldCompact() + agent-session.ts _checkCompaction(): when auto-compaction is
+    // enabled and the estimated context tokens exceed (contextWindow - reserveTokens)
+    // for the selected model, run a compaction before the next provider prompt. The
+    // estimate reuses the chars/4 heuristic (estimateTokensBeforeCompaction), matching
+    // upstream estimateTokens. Reusing performCompaction means the auto path records
+    // the exact same compaction entry shape as the explicit `compact` command.
+
+    /// Upstream shouldCompact: contextTokens > contextWindow - reserveTokens.
+    /// Returns false when disabled, when no model is selected (no context window),
+    /// or when there is nothing to compact yet.
+    fn shouldAutoCompact(self: *const Runtime) bool {
+        if (!self.auto_compaction_enabled) return false;
+        if (self.message_count == 0) return false;
+        const model = self.selected_model orelse return false;
+        const context_window = model.context_window;
+        if (context_window == 0) return false;
+        const reserve = @min(self.auto_compaction_reserve_tokens, context_window);
+        const limit = context_window - reserve;
+        return self.estimateTokensBeforeCompaction() > limit;
+    }
+
+    /// Pre-prompt auto-compaction hook. When the threshold is crossed, run a single
+    /// compaction so the following provider prompt sees the compacted context (the
+    /// reload path injects the summary as the leading history message). Best-effort:
+    /// a provider/IO failure during summarization must not abort the user's prompt,
+    /// so failures are swallowed (the prompt proceeds with the un-compacted history),
+    /// matching upstream's non-fatal threshold compaction.
+    fn maybeAutoCompactBeforePrompt(self: *Runtime, io: std.Io, allocator: std.mem.Allocator) void {
+        if (!self.shouldAutoCompact()) return;
+        std.log.debug("[FLOW_H_AUTO_COMPACTION] threshold crossed estimate={d} reserve={d} messages={d}", .{ self.estimateTokensBeforeCompaction(), self.auto_compaction_reserve_tokens, self.message_count });
+        var outcome = self.performCompaction(io, allocator, null) catch return;
+        outcome.deinit(allocator);
+    }
+    // ===== [FLOW_H_AUTO_COMPACTION] end auto-compaction trigger heuristics =====
+
+    const CompactionSummaryResult = struct {
+        summary: []u8,
+        provider: []const u8,
+        model: []const u8,
+    };
+
+    /// Run the configured provider to summarize the current conversation.
+    /// Returns null when no model/auth is configured (caller falls back to the
+    /// static summary). On success the caller owns `result.summary`; `provider`
+    /// and `model` borrow the selected model entry (stable for process lifetime).
+    fn runCompactionSummaryIfAuthenticated(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        custom_instructions: ?[]const u8,
+    ) !?CompactionSummaryResult {
+        const model = self.selected_model orelse return null;
+        const env = self.env orelse return null;
+        const api_key = try auth.resolveProviderApiKey(io, allocator, env, model.provider) orelse return null;
+        defer allocator.free(api_key);
+
+        const shell_settings = try settings.loadShellSettings(io, allocator, env);
+        defer shell_settings.deinit(allocator);
+
+        const prompt = try self.buildCompactionPromptText(allocator, custom_instructions);
+        defer allocator.free(prompt);
+
+        std.log.debug("[FLOW_E_COMPACTION] running provider summary provider={s} model={s} messages={d}", .{ model.provider, model.id, self.message_count });
+
+        // Summarization is a single, tool-free turn (mirrors upstream completeSimple):
+        // no history is threaded because the entire conversation is serialized into
+        // the prompt so the model summarizes rather than continues it.
+        var run_result = try agent.runPrompt(io, allocator, env, .{
+            .provider = model.provider,
+            .model = model.id,
+            .api_key = api_key,
+            .prompt = prompt,
+            .system_prompt = compaction_summarization_system_prompt,
+            .env = env,
+            .shell_path = shell_settings.shell_path,
+            .shell_command_prefix = shell_settings.shell_command_prefix,
+            .history = &.{},
+            .tool_set = agent.ToolSet.none,
+            .custom_tools = &.{},
+            .max_turns = 1,
+        });
+        defer run_result.deinit(allocator);
+
+        const summary = try allocator.dupe(u8, std.mem.trim(u8, run_result.final_text, " \t\r\n"));
+        return .{ .summary = summary, .provider = model.provider, .model = model.id };
+    }
+
+    /// Serialize the in-memory conversation and wrap it with the summarization
+    /// instructions, mirroring upstream serializeConversation + SUMMARIZATION_PROMPT.
+    fn buildCompactionPromptText(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        custom_instructions: ?[]const u8,
+    ) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+
+        try w.writeAll("<conversation>\n");
+        var emitted = false;
+        for (self.messages[0..self.message_count]) |*message| {
+            const line_prefix: ?[]const u8 = switch (message.role) {
+                .user => "[User]: ",
+                .assistant => if (message.isFailedAssistant()) null else "[Assistant]: ",
+                .tool => "[Tool result]: ",
+                .bash_execution => "[Bash]: ",
+                .custom => "[Custom]: ",
+                // Prior compaction summaries carry forward as context for the new summary.
+                .compaction_summary => "[Previous summary]: ",
+                .system, .custom_entry => null,
+            };
+            const prefix = line_prefix orelse continue;
+            const text = std.mem.trim(u8, message.text(), " \t\r\n");
+            if (message.role == .bash_execution) {
+                if (emitted) try w.writeAll("\n\n");
+                try w.writeAll(prefix);
+                try w.writeAll(std.mem.trim(u8, message.commandText(), " \t\r\n"));
+                if (text.len > 0) {
+                    try w.writeAll(" => ");
+                    try w.writeAll(text);
+                }
+                emitted = true;
+                continue;
+            }
+            if (text.len == 0) continue;
+            if (emitted) try w.writeAll("\n\n");
+            try w.writeAll(prefix);
+            try w.writeAll(text);
+            emitted = true;
+        }
+        try w.writeAll("\n</conversation>\n\n");
+        try w.writeAll(compaction_summarization_prompt);
+        if (custom_instructions) |instructions| {
+            const trimmed = std.mem.trim(u8, instructions, " \t\r\n");
+            if (trimmed.len > 0) {
+                try w.writeAll("\n\nAdditional focus: ");
+                try w.writeAll(trimmed);
+            }
+        }
+        return out.toOwnedSlice();
+    }
+    // ===== [FLOW_E_COMPACTION] end LLM-driven compaction (Flow E) =====
 
     fn estimateTokensBeforeCompaction(self: *const Runtime) usize {
         var bytes: usize = 0;
@@ -1307,6 +1941,109 @@ const Runtime = struct {
         }
         return null;
     }
+
+    // ===== [FLOW_J_EXTENSION_EVENTS] begin lifecycle-event emission wiring =====
+    // Mirrors upstream/pi/packages/coding-agent/src/core/agent-session.ts
+    // _emitExtensionEvent + sdk.ts onPayload/onResponse + extensions/runner.ts emit():
+    // a live RPC run fans lifecycle events out to the loaded extensions at the same
+    // points upstream emits them. The dispatch seam built by the prior agent
+    // (extension_runner.Runner.dispatchLifecycleEvent, reusing the FLOW_F persistent
+    // process so module-local state persists) is reused unchanged here; this region
+    // only adds the call-sites.
+    //
+    // Event placement:
+    //   - session_start: fired when an RPC session is created/switched/navigated
+    //     (emitSessionStart below), reason mirrors upstream SessionStartEvent.reason.
+    //   - agent_start/agent_end: around the provider-backed prompt loop (the agent
+    //     loop boundary, emitted by runAgentIfAuthenticatedOnce).
+    //   - turn_start/before_provider_request/after_provider_response/message_start/
+    //     message_end/turn_end: inside agent.runPrompt via the on_lifecycle_event seam
+    //     (agent.zig [FLOW_J_EXTENSION_EVENTS]); rpc supplies the callback.
+    //   - user_bash: before an RPC `bash` (emitUserBash below), short-circuit honored.
+    //
+    // Result semantics (from extension_runner.dispatchLifecycleEvent): notify-style
+    // events fire-and-forget; user_bash short-circuits on the first decisive handler
+    // result (we honor a returned replacement command). Everything early-returns
+    // cheaply when no extensions are loaded.
+
+    /// Fire one lifecycle event at the discovered extension set, reusing the session's
+    /// long-lived process. Returns the dispatch result (caller owns it) or null when no
+    /// extensions are loaded so notify-style callers can skip allocation entirely.
+    fn dispatchLifecycle(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        event: extension_runner.Runner.LifecycleEvent,
+    ) !?extension_runner.Runner.SingleLifecycleResult {
+        if (self.run_options.extension_paths.len == 0) return null;
+        var runner = extension_runner.Runner{
+            .io = io,
+            .allocator = allocator,
+            .extension_paths = self.run_options.extension_paths,
+            .flag_values = self.run_options.extension_flag_values,
+            .persistent = self.ensureExtensionPersistent(io, allocator),
+        };
+        if (!runner.hasExtensions()) return null;
+        return try runner.dispatchLifecycleEvent(event);
+    }
+
+    /// Notify-style emission: fire the event and discard the result. Best-effort
+    /// (upstream emit() swallows handler errors), so dispatch failures are ignored and
+    /// must never abort the surrounding command.
+    fn emitLifecycleNotify(
+        self: *Runtime,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        event_type: []const u8,
+        fields_json: []const u8,
+    ) void {
+        if (self.run_options.extension_paths.len == 0) return;
+        const maybe = self.dispatchLifecycle(io, allocator, .{ .type = event_type, .fields_json = fields_json }) catch return;
+        if (maybe) |result| result.deinit(allocator);
+    }
+
+    /// Emit `session_start` with the upstream reason label ("startup"/"new"/"resume"/
+    /// "fork"/"reload"). Fired when an RPC session is created or its active branch
+    /// changes so an extension observes session lifecycle during a live run.
+    fn emitSessionStart(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, reason: []const u8) void {
+        if (self.run_options.extension_paths.len == 0) return;
+        var fields_buf: [128]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&fields_buf);
+        writer.writeAll("{\"reason\":") catch return;
+        writeJsonString(&writer, reason) catch return;
+        writer.writeAll("}") catch return;
+        self.emitLifecycleNotify(io, allocator, "session_start", writer.buffered());
+    }
+
+    /// Emit `user_bash` before an RPC `bash` and honor a short-circuit decision: when a
+    /// handler returns `{ command: "..." }` the replacement command is used (upstream
+    /// emitUserBash lets an extension rewrite/replace the command). The returned slice
+    /// is owned by `arena` (caller frees by deiniting it); when no extension changes the
+    /// command the original `command` is returned unchanged. excludeFromContext/cwd
+    /// mirror UserBashEvent's fields.
+    fn emitUserBash(
+        self: *Runtime,
+        io: std.Io,
+        arena: std.mem.Allocator,
+        command: []const u8,
+    ) []const u8 {
+        if (self.run_options.extension_paths.len == 0) return command;
+        var fields_buf: [max_command_bytes + 128]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&fields_buf);
+        writer.writeAll("{\"command\":") catch return command;
+        writeJsonString(&writer, command) catch return command;
+        writer.writeAll(",\"excludeFromContext\":false,\"cwd\":\".\"}") catch return command;
+        const maybe = self.dispatchLifecycle(io, arena, .{ .type = "user_bash", .fields_json = writer.buffered() }) catch return command;
+        const result = maybe orelse return command;
+        defer result.deinit(arena);
+        // A decisive handler result is JSON; pull an optional replacement command.
+        var parsed = std.json.parseFromSlice(std.json.Value, arena, result.result_json, .{}) catch return command;
+        defer parsed.deinit();
+        if (parsed.value != .object) return command;
+        const replacement = getStringFieldObject(parsed.value.object, "command") orelse return command;
+        return arena.dupe(u8, replacement) catch command;
+    }
+    // ===== [FLOW_J_EXTENSION_EVENTS] end lifecycle-event emission wiring =====
 
     fn runAgentIfAuthenticatedOnce(
         self: *Runtime,
@@ -1342,6 +2079,10 @@ const Runtime = struct {
             .allocator = allocator,
             .extension_paths = self.run_options.extension_paths,
             .flag_values = self.run_options.extension_flag_values,
+            // [FLOW_F_PERSISTENT_RUNNER] Route tool discovery + execution + hooks
+            // through the session's long-lived node process so extension
+            // module-local state persists across separate prompt commands.
+            .persistent = self.ensureExtensionPersistent(io, allocator),
         };
         const has_extension_hooks = extension_runner_instance.hasExtensions();
         var extension_tool_definitions: []ai_client.ChatToolDefinition = if (has_extension_hooks and self.run_options.custom_tools_enabled)
@@ -1351,8 +2092,16 @@ const Runtime = struct {
         extension_tool_definitions = try self.filterExtensionToolDefinitions(allocator, extension_tool_definitions);
         defer if (extension_tool_definitions.len > 0) extension_runner_instance.deinitToolDefinitions(extension_tool_definitions);
         var turn_lifecycle_context = RuntimeTurnLifecycleContext{ .runtime = self };
+        // [FLOW_J_EXTENSION_EVENTS] Route the agent loop's turn/provider/message events
+        // through the SAME runner instance used for tool discovery + hooks so they share
+        // the long-lived persistent process (module-local extension state persists across
+        // the whole turn loop, matching upstream's single ExtensionRunner per session).
+        var lifecycle_emit_context = RuntimeLifecycleEmitContext{ .runner = &extension_runner_instance };
 
-        return try agent.runPrompt(io, allocator, env, .{
+        // [FLOW_J_EXTENSION_EVENTS] agent_start before the loop / agent_end after it
+        // (upstream AgentStartEvent / AgentEndEvent around the agent run boundary).
+        if (has_extension_hooks) self.emitLifecycleNotify(io, allocator, "agent_start", "{}");
+        const result = agent.runPrompt(io, allocator, env, .{
             .provider = model.provider,
             .model = model.id,
             .api_key = api_key,
@@ -1374,7 +2123,13 @@ const Runtime = struct {
             .should_stop_after_turn = shouldStopAfterTurnForRuntimeSteering,
             .cancellation_context = if (prompt_job) |job| job else null,
             .should_cancel = if (prompt_job != null) shouldCancelActivePrompt else null,
+            .lifecycle_context = if (has_extension_hooks) &lifecycle_emit_context else null,
+            .on_lifecycle_event = if (has_extension_hooks) RuntimeLifecycleEmitContext.emit else null,
         });
+        // [FLOW_J_EXTENSION_EVENTS] agent_end fires even when the run errored so an
+        // extension observes the loop boundary (upstream emits agent_end on completion).
+        if (has_extension_hooks) self.emitLifecycleNotify(io, allocator, "agent_end", "{}");
+        return try result;
     }
 
     fn filterExtensionToolDefinitions(
@@ -1429,8 +2184,26 @@ const Runtime = struct {
         var retry_attempts: usize = 0;
         self.last_retry_attempts = 0;
         self.last_retry_delay_ms = 0;
+        // [FLOW_E_COMPACTION] Post-turn context-overflow recovery (upstream agent-session.ts
+        // _checkCompaction "overflow" branch): when a provider call is rejected for an
+        // over-limit context (ai_client maps context-overflow body text to
+        // ProviderClientError), compact once and retry the turn. Bounded to a single
+        // attempt and only when prior context exists to compact, so non-overflow client
+        // errors (e.g. auth/permission 4xx with no history) are not retried in a loop.
+        var current_history_limit = history_limit;
+        var overflow_compacted = false;
         while (true) {
-            const result = self.runAgentIfAuthenticatedOnce(io, allocator, prompt_job, history_limit, batch_history_messages, batch_custom_messages, prompt, prompt_image_parts) catch |err| {
+            const result = self.runAgentIfAuthenticatedOnce(io, allocator, prompt_job, current_history_limit, batch_history_messages, batch_custom_messages, prompt, prompt_image_parts) catch |err| {
+                if (isContextOverflowAgentError(err) and !overflow_compacted and self.message_count >= 2) {
+                    overflow_compacted = true;
+                    std.log.debug("[FLOW_E_COMPACTION] context overflow recovery: compacting and retrying the turn (messages={d})", .{self.message_count});
+                    var outcome = self.performCompaction(io, allocator, null) catch return err;
+                    outcome.deinit(allocator);
+                    // The compaction replaced the prior history with a summary entry; retry
+                    // the turn over the now-compacted ring (new leading-summary injection).
+                    current_history_limit = self.message_count;
+                    continue;
+                }
                 if (!self.auto_retry_enabled or !isRetryableAgentError(err)) return err;
                 if (retry_attempts >= self.auto_retry_max_attempts) {
                     if (retry_attempts > 0) {
@@ -1879,7 +2652,33 @@ const Runtime = struct {
         try w.writeAll("}}\n");
     }
 
+    // [FLOW_F_PERSISTENT_RUNNER] Lazily start (and reuse) the one long-lived node
+    // process for this session's extension set. Returns null if there are no
+    // extensions or if the process could not be spawned, in which case callers
+    // transparently fall back to the one-shot spawn path. Reusing the same process
+    // is what lets extension module-local state persist across separate commands.
+    fn ensureExtensionPersistent(self: *Runtime, io: std.Io, allocator: std.mem.Allocator) ?*extension_runner.PersistentProcess {
+        if (self.run_options.extension_paths.len == 0) return null;
+        if (self.ext_persistent) |proc| {
+            if (proc.matchesExtensions(allocator, self.run_options.extension_paths)) return proc;
+            proc.deinit();
+            self.ext_persistent = null;
+        }
+        const proc = extension_runner.PersistentProcess.start(io, allocator, self.run_options.extension_paths) catch return null;
+        self.ext_persistent = proc;
+        return proc;
+    }
+
     fn makeExtensionRunner(self: *Runtime, io: std.Io, allocator: std.mem.Allocator) extension_runner.Runner {
+        // NOTE: the extension COMMAND path (discoverCommandDefinitions /
+        // runRegisteredCommand, reached via the slash-command prompt handlers)
+        // intentionally keeps the one-shot spawn path. The long-lived persistent
+        // process is attached only to the prompt/tool-execution path
+        // (runAgentIfAuthenticatedOnce), which is where the DoD requires extension
+        // module-local state to persist across separate prompt commands. Routing
+        // commands through a shared resident process would also make command
+        // module-level counters accumulate across invocations; that broader
+        // behavior change is left out of this flow to stay additive and isolated.
         return .{
             .io = io,
             .allocator = allocator,
@@ -2194,6 +2993,9 @@ const Runtime = struct {
         last_result: *?agent.RunResult,
     ) !void {
         if (messages.len == 0) return;
+        // [FLOW_H_AUTO_COMPACTION] Pre-prompt threshold check over the conversation
+        // accumulated before this turn (matches upstream's pre-prompt _checkCompaction).
+        self.maybeAutoCompactBeforePrompt(io, allocator);
         const history_limit = self.message_count;
         for (messages) |message| {
             switch (message) {
@@ -2381,7 +3183,13 @@ const Runtime = struct {
             const timeout_ms = getOptionalTimeoutMillisecondsField(value, "timeout") catch {
                 return writeError(w, id, command, "bash timeout must be a non-negative finite number");
             };
-            self.startBashAsync(io, allocator, output, id, shell_command, timeout_ms) catch |err| {
+            // [FLOW_J_EXTENSION_EVENTS] Fire user_bash before launching the command
+            // (upstream emitUserBash). A handler may return a replacement command, which
+            // we honor (short-circuit). The arena owns any duped replacement string.
+            var user_bash_arena = std.heap.ArenaAllocator.init(allocator);
+            defer user_bash_arena.deinit();
+            const effective_command = self.emitUserBash(io, user_bash_arena.allocator(), shell_command);
+            self.startBashAsync(io, allocator, output, id, effective_command, timeout_ms) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             };
             return;
@@ -2397,6 +3205,9 @@ const Runtime = struct {
             self.clearSession(io, allocator, parent_session) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             };
+            // [FLOW_J_EXTENSION_EVENTS] session_start(reason:"new") after the new session
+            // is established (upstream SessionStartEvent for a fresh session).
+            self.emitSessionStart(io, allocator, "new");
             try writeResponseHead(w, id, command, true);
             try w.writeAll(",\"data\":{\"cancelled\":false}}\n");
             return;
@@ -2548,6 +3359,27 @@ const Runtime = struct {
             return writeSuccess(w, id, command);
         }
 
+        // ===== [FLOW_K_ASYNC_COMPACTION] compaction threading rationale =====
+        // Auto-compaction (the common path, upstream's pre-prompt _checkCompaction) is
+        // ALREADY non-blocking w.r.t. the main RPC loop: maybeAutoCompactBeforePrompt runs
+        // inside runInitialPromptBatch, which executes on the prompt worker thread spawned
+        // by startPromptAsync (promptThreadMain). While that worker runs, the main loop
+        // still services non-blocking commands (get_state/abort/steer/follow_up; see
+        // isActivePromptNonBlockingCommand), so a long provider summarization does not
+        // freeze the loop.
+        //
+        // The explicit `compact` command stays SYNCHRONOUS by design. performCompaction
+        // interleaves the provider summary call with mutation of the shared session ring
+        // and the append-only persistent store, then writeCompactResponse emits the
+        // summary/firstKeptEntryId/details inline. Moving it to the bash/prompt worker
+        // pattern would require splitting performCompaction into an unlocked provider-call
+        // phase plus a locked mutate/persist/respond phase AND a collect protocol — that
+        // refactor races the main loop's reads/writes of the same ring and risks
+        // regressing both the 342-test green state and the protected compact-response-shape
+        // smokes (flow-e-compaction, wave2-sessions). The explicit compact is a foreground,
+        // user-initiated operation (the client awaits its response by id), so keeping it
+        // synchronous is the correct trade-off; the responsiveness win is delivered on the
+        // auto path above where it actually matters.
         if (std.mem.eql(u8, command, "compact")) {
             const custom_instructions = getStringField(value, "customInstructions");
             self.writeCompactResponse(io, allocator, w, id, command, custom_instructions) catch |err| {
@@ -2555,11 +3387,18 @@ const Runtime = struct {
             };
             return;
         }
+        // ===== [FLOW_K_ASYNC_COMPACTION] end compaction threading rationale =====
 
         if (std.mem.eql(u8, command, "set_auto_compaction")) {
             self.auto_compaction_enabled = getBoolField(value, "enabled") orelse {
                 return writeError(w, id, command, "set_auto_compaction requires a boolean enabled");
             };
+            // [FLOW_H_AUTO_COMPACTION] Optional reserveTokens override (upstream
+            // CompactionSettings.reserveTokens). A large reserve forces the threshold
+            // low, which is how a test/smoke makes auto-compaction fire deterministically.
+            if (getOptionalUsizeField(value, "reserveTokens")) |reserve| {
+                self.auto_compaction_reserve_tokens = reserve;
+            }
             return writeSuccess(w, id, command);
         }
 
@@ -2595,6 +3434,9 @@ const Runtime = struct {
             self.switchSession(io, allocator, session_path) catch |err| {
                 return writeError(w, id, command, @errorName(err));
             };
+            // [FLOW_J_EXTENSION_EVENTS] session_start(reason:"resume") after switching to
+            // an existing session file (upstream SessionStartEvent reason "resume").
+            self.emitSessionStart(io, allocator, "resume");
             try writeResponseHead(w, id, command, true);
             try w.writeAll(",\"data\":{\"cancelled\":false}}\n");
             return;
@@ -2621,6 +3463,53 @@ const Runtime = struct {
             };
             try writeResponseHead(w, id, command, true);
             try w.writeAll(",\"data\":{\"cancelled\":false}}\n");
+            return;
+        }
+
+        // [FLOW_G_SESSION_TREE] Full tree view: parent/child structure + leaf pointer.
+        if (std.mem.eql(u8, command, "get_session_tree")) {
+            self.writeSessionTree(io, allocator, w, id, command) catch |err| {
+                return writeError(w, id, command, @errorName(err));
+            };
+            return;
+        }
+
+        // [FLOW_G_SESSION_TREE] Same-file branch switch by node id (upstream
+        // navigateTree): move the leaf pointer and reload so the active branch
+        // reflects the chosen node. Unlike fork/clone this stays in one file.
+        if (std.mem.eql(u8, command, "navigate_tree")) {
+            const target_id = getStringField(value, "targetId") orelse {
+                return writeError(w, id, command, "navigate_tree requires a string targetId");
+            };
+            // [FLOW_G_SESSION_TREE] Optional branch summarization (upstream navigateTree
+            // {summarize, customInstructions}): when summarize is true, generate and persist
+            // a branch_summary of the abandoned path before switching. Defaults to the plain
+            // leaf move when omitted/false so existing navigate_tree callers are unchanged.
+            const summarize = getBoolField(value, "summarize") orelse false;
+            const custom_instructions = getStringField(value, "customInstructions");
+            var summary_buf: [max_message_bytes]u8 = undefined;
+            const branch_summary: ?[]const u8 = if (summarize)
+                self.navigateTreeWithSummary(io, allocator, target_id, custom_instructions, &summary_buf) catch |err| {
+                    return writeError(w, id, command, @errorName(err));
+                }
+            else blk: {
+                self.navigateTree(io, allocator, target_id) catch |err| {
+                    return writeError(w, id, command, @errorName(err));
+                };
+                break :blk null;
+            };
+            try writeResponseHead(w, id, command, true);
+            try w.writeAll(",\"data\":{\"newLeafId\":");
+            if (self.store.leafId()) |leaf| {
+                try writeJsonString(w, leaf);
+            } else {
+                try w.writeAll("null");
+            }
+            if (branch_summary) |summary| {
+                try w.writeAll(",\"branchSummary\":");
+                try writeJsonString(w, summary);
+            }
+            try w.writeAll(",\"cancelled\":false}}\n");
             return;
         }
 
@@ -2653,6 +3542,8 @@ const Runtime = struct {
         try writeJsonString(w, self.store.path());
         try w.writeAll(",\"autoCompactionEnabled\":");
         try w.writeAll(if (self.auto_compaction_enabled) "true" else "false");
+        try w.writeAll(",\"autoCompactionReserveTokens\":");
+        try w.print("{d}", .{self.auto_compaction_reserve_tokens});
         try w.writeAll(",\"autoRetryEnabled\":");
         try w.writeAll(if (self.auto_retry_enabled) "true" else "false");
         try w.writeAll(",\"autoRetryMaxAttempts\":");
@@ -2842,6 +3733,48 @@ const Runtime = struct {
         try w.writeAll("]}}\n");
     }
 
+    // [FLOW_G_SESSION_TREE] Emit the full session tree: a flat node array carrying
+    // id/parentId/type (so a client reconstructs parent/child structure), a short
+    // preview per node, plus the active leaf id. Mirrors upstream getTree()'s
+    // id/parentId payload (the client builds the nested view). Read from the durable
+    // file so the response reflects every branch, not just the active path.
+    fn writeSessionTree(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, id: ?[]const u8, command: []const u8) !void {
+        // Use readTreeInto so the ~128 KB SessionTree never lives on the stack
+        // (sufficient stack pressure from sibling frames otherwise SIGSEGVs).
+        const tree_ptr = try allocator.create(session.PersistentStore.SessionTree);
+        defer allocator.destroy(tree_ptr);
+        try self.store.readTreeInto(io, allocator, tree_ptr);
+        try writeResponseHead(w, id, command, true);
+        try w.writeAll(",\"data\":{\"leafId\":");
+        if (self.store.leafId()) |leaf| {
+            try writeJsonString(w, leaf);
+        } else {
+            try w.writeAll("null");
+        }
+        try w.writeAll(",\"nodes\":[");
+        for (tree_ptr.slice(), 0..) |*node, index| {
+            if (index != 0) try w.writeByte(',');
+            try w.writeAll("{\"id\":");
+            try writeJsonString(w, node.id());
+            try w.writeAll(",\"parentId\":");
+            if (node.parentId()) |parent| {
+                try writeJsonString(w, parent);
+            } else {
+                try w.writeAll("null");
+            }
+            try w.writeAll(",\"type\":");
+            try writeJsonString(w, node.kind());
+            if (node.role()) |role| {
+                try w.writeAll(",\"role\":");
+                try writeJsonString(w, role);
+            }
+            try w.writeAll(",\"preview\":");
+            try writeJsonString(w, node.preview());
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}}\n");
+    }
+
     fn exportHtml(self: *Runtime, io: std.Io, allocator: std.mem.Allocator, output_path: []const u8) !void {
         // Render from the durable session file via the shared exporter so the RPC
         // export covers every message/entry type (images, tool calls/results,
@@ -2857,6 +3790,30 @@ const RuntimeTurnLifecycleContext = struct {
     runtime: *Runtime,
 };
 
+// [FLOW_G_SESSION_TREE] Walk the parentId chain from `leaf_id` to root and record every
+// ancestor id (inclusive) into `out`. Shared by the branch-summary path to compute which
+// in-memory entries are on the navigation target's path (kept) vs. the abandoned branch
+// (summarized). Bounded by tree_max_nodes so a malformed cycle cannot spin.
+fn collectAncestorIds(
+    tree: *const session.PersistentStore.SessionTree,
+    leaf_id: []const u8,
+    out: *std.StringHashMap(void),
+) !void {
+    var current: ?[]const u8 = leaf_id;
+    var guard: usize = 0;
+    while (current) |id| : (guard += 1) {
+        if (guard > session.PersistentStore.tree_max_nodes) break;
+        try out.put(id, {});
+        current = null;
+        for (tree.slice()) |*node| {
+            if (std.mem.eql(u8, node.id(), id)) {
+                current = node.parentId();
+                break;
+            }
+        }
+    }
+}
+
 fn shouldStopAfterTurnForRuntimeSteering(ctx: *anyopaque, turn: agent.TurnContext) anyerror!bool {
     _ = turn;
     const context: *RuntimeTurnLifecycleContext = @ptrCast(@alignCast(ctx));
@@ -2864,6 +3821,26 @@ fn shouldStopAfterTurnForRuntimeSteering(ctx: *anyopaque, turn: agent.TurnContex
     defer context.runtime.mutex.unlock();
     return context.runtime.steering_queue.count > 0;
 }
+
+// [FLOW_J_EXTENSION_EVENTS] Adapter that lets the agent loop's notify-style lifecycle
+// emissions (turn_start/before_provider_request/after_provider_response/message_*/
+// turn_end) fan out through the live runner — the same instance already wired for tool
+// discovery + before/after-tool hooks, so events share the long-lived persistent
+// process. Best-effort: a dispatch failure is swallowed so it never aborts the turn
+// (agent.zig already treats this callback as fire-and-forget).
+const RuntimeLifecycleEmitContext = struct {
+    runner: *extension_runner.Runner,
+
+    fn emit(ctx: *anyopaque, event: agent.LifecycleEmitEvent) anyerror!void {
+        const context: *RuntimeLifecycleEmitContext = @ptrCast(@alignCast(ctx));
+        if (!context.runner.hasExtensions()) return;
+        const result = context.runner.dispatchLifecycleEvent(.{
+            .type = event.type,
+            .fields_json = event.fields_json,
+        }) catch return;
+        result.deinit(context.runner.allocator);
+    }
+};
 
 fn promptThreadMain(job: *ActivePromptJob) void {
     const maybe_result = switch (job.kind) {
@@ -2986,6 +3963,10 @@ pub fn run(
     defer runtime.deinit(allocator);
     defer runtime.collectActivePrompt(allocator, true);
     defer runtime.collectActiveBash(allocator, true);
+    // [FLOW_J_EXTENSION_EVENTS] session_start(reason:"startup") once the RPC session is
+    // loaded (upstream agent-session.ts default sessionStartEvent reason "startup"). Cheap
+    // no-op when no extensions are loaded.
+    runtime.emitSessionStart(io, allocator, "startup");
 
     var in_buf: [16 * 1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &in_buf);
@@ -3017,6 +3998,32 @@ pub fn run(
             continue;
         };
         defer parsed.deinit();
+
+        // [FLOW_I_EXTENSION_UI] A stray extension_ui_response (no in-flight request)
+        // is ignored, mirroring upstream handleInputLine which only resolves a
+        // pending request id. Matching responses are consumed inline by the
+        // extension_ui_request handler below.
+        if (getStringField(parsed.value, "type")) |line_type| {
+            if (std.mem.eql(u8, line_type, "extension_ui_response")) continue;
+        }
+
+        // [FLOW_I_EXTENSION_UI] Forward an extension's UI request over RPC and block
+        // for the routed response. The request event is emitted on stdout; stdin is
+        // then pumped until the matching extension_ui_response arrives, then the
+        // command response carries the routed value. Handled here (not in handleValue)
+        // because it needs the stdin reader.
+        if (getStringField(parsed.value, "type")) |line_type| {
+            if (std.mem.eql(u8, line_type, "extension_ui_request")) {
+                runtime.handleExtensionUiRequest(allocator, r, &output, parsed.value) catch |err| {
+                    output.mutex.lock();
+                    defer output.mutex.unlock();
+                    const req_id = getStringField(parsed.value, "id");
+                    try writeError(w, req_id, "extension_ui_request", @errorName(err));
+                    try w.flush();
+                };
+                continue;
+            }
+        }
 
         if (!isActivePromptNonBlockingCommand(parsed.value)) runtime.collectActivePrompt(allocator, true);
         if (!isActiveBashNonBlockingCommand(parsed.value)) runtime.collectActiveBash(allocator, true);
@@ -3313,6 +4320,17 @@ fn isRetryableAgentError(err: anyerror) bool {
     };
 }
 
+// [FLOW_E_COMPACTION] Classify a provider error as a context-overflow candidate for the
+// post-turn compact-and-retry recovery. ai_client.providerErrorForStatusAndBody maps
+// context-overflow body text (e.g. "prompt too long", "context_length_exceeded") to
+// ProviderClientError; pi-zig does not carry a separate overflow error tag, so the
+// recovery treats ProviderClientError as the overflow signal and bounds itself to a
+// single attempt that only fires when there is prior context to compact (see
+// runAgentIfAuthenticated), keeping non-overflow 4xx (auth/permission) from looping.
+fn isContextOverflowAgentError(err: anyerror) bool {
+    return err == error.ProviderClientError;
+}
+
 fn sleepMilliseconds(io: std.Io, milliseconds: usize) !void {
     const bounded = @min(milliseconds, @as(usize, @intCast(std.math.maxInt(i64))));
     try std.Io.sleep(io, .fromMilliseconds(@intCast(bounded)), .awake);
@@ -3340,6 +4358,91 @@ fn getOptionalExitCode(object: std.json.ObjectMap) ?u8 {
 fn stripTrailingCarriageReturn(value: []const u8) []const u8 {
     if (value.len > 0 and value[value.len - 1] == '\r') return value[0 .. value.len - 1];
     return value;
+}
+
+// [FLOW_I_EXTENSION_UI] Emit the outbound extension_ui_request event. Echoes the id,
+// method, and the recognized per-method params (title/message/options/placeholder/
+// prefill/notifyType/statusKey/statusText/widgetKey/widgetLines/widgetPlacement/text/
+// timeout) straight from the inbound request, matching rpc-types.ts RpcExtensionUIRequest.
+fn writeExtensionUiRequestEvent(
+    w: *std.Io.Writer,
+    request_id: []const u8,
+    method: []const u8,
+    value: std.json.Value,
+) !void {
+    try w.writeAll("{\"type\":\"extension_ui_request\",\"id\":");
+    try writeJsonString(w, request_id);
+    try w.writeAll(",\"method\":");
+    try writeJsonString(w, method);
+    try writeExtensionUiStringParam(w, value, "title");
+    try writeExtensionUiStringParam(w, value, "message");
+    try writeExtensionUiStringParam(w, value, "placeholder");
+    try writeExtensionUiStringParam(w, value, "prefill");
+    try writeExtensionUiStringParam(w, value, "notifyType");
+    try writeExtensionUiStringParam(w, value, "statusKey");
+    try writeExtensionUiStringParam(w, value, "statusText");
+    try writeExtensionUiStringParam(w, value, "widgetKey");
+    try writeExtensionUiStringParam(w, value, "widgetPlacement");
+    try writeExtensionUiStringParam(w, value, "text");
+    if (value == .object) {
+        if (value.object.get("options")) |options| {
+            if (options == .array) {
+                try w.writeAll(",\"options\":[");
+                for (options.array.items, 0..) |item, index| {
+                    if (index != 0) try w.writeByte(',');
+                    if (item == .string) {
+                        try writeJsonString(w, item.string);
+                    } else {
+                        try w.writeAll("null");
+                    }
+                }
+                try w.writeByte(']');
+            }
+        }
+        if (value.object.get("widgetLines")) |lines| {
+            if (lines == .array) {
+                try w.writeAll(",\"widgetLines\":[");
+                for (lines.array.items, 0..) |item, index| {
+                    if (index != 0) try w.writeByte(',');
+                    if (item == .string) {
+                        try writeJsonString(w, item.string);
+                    } else {
+                        try w.writeAll("null");
+                    }
+                }
+                try w.writeByte(']');
+            }
+        }
+        if (getOptionalUsizeField(value, "timeout")) |timeout| {
+            try w.writeAll(",\"timeout\":");
+            try w.print("{d}", .{timeout});
+        }
+    }
+    try w.writeAll("}\n");
+}
+
+fn writeExtensionUiStringParam(w: *std.Io.Writer, value: std.json.Value, name: []const u8) !void {
+    const text = getStringField(value, name) orelse return;
+    try w.writeByte(',');
+    try writeJsonString(w, name);
+    try w.writeByte(':');
+    try writeJsonString(w, text);
+}
+
+// [FLOW_I_EXTENSION_UI] Serialize the routed response back to the requester. Carries
+// cancelled/confirmed/value exactly as the client supplied (RpcExtensionUIResponse).
+fn writeExtensionUiResponseData(w: *std.Io.Writer, reply: Runtime.ExtensionUiReply) !void {
+    try w.writeAll("{\"cancelled\":");
+    try w.writeAll(if (reply.cancelled) "true" else "false");
+    if (reply.confirmed) |confirmed| {
+        try w.writeAll(",\"confirmed\":");
+        try w.writeAll(if (confirmed) "true" else "false");
+    }
+    if (reply.value) |routed| {
+        try w.writeAll(",\"value\":");
+        try writeJsonString(w, routed);
+    }
+    try w.writeByte('}');
 }
 
 fn writeSuccess(w: *std.Io.Writer, id: ?[]const u8, command: []const u8) !void {
@@ -3610,7 +4713,7 @@ fn buildRuntimeSystemPrompt(
     defer if (append_prompt) |value| allocator.free(value);
 
     var date_buf: [10]u8 = undefined;
-    const current_date = try system_prompt.currentUtcDate(io, &date_buf);
+    const current_date = try system_prompt.currentLocalDate(io, allocator, env, &date_buf);
 
     return system_prompt.build(allocator, .{
         .custom_prompt = if (discovery.system_prompt) |file| file.content else null,
@@ -3847,6 +4950,17 @@ test "retryable agent errors cover transient failures and incomplete streams" {
     try std.testing.expect(!isRetryableAgentError(error.AgentAborted));
 }
 
+test "[FLOW_E_COMPACTION] context-overflow recovery classifies the client-error signal" {
+    // ai_client maps context-overflow body text to ProviderClientError (no separate tag),
+    // so the post-turn compact-and-retry recovery keys off ProviderClientError. Transient
+    // and abort errors must NOT trigger the overflow recovery (they have their own paths).
+    try std.testing.expect(isContextOverflowAgentError(error.ProviderClientError));
+    try std.testing.expect(!isContextOverflowAgentError(error.ProviderRequestFailed));
+    try std.testing.expect(!isContextOverflowAgentError(error.ProviderStreamIncomplete));
+    try std.testing.expect(!isContextOverflowAgentError(error.ProviderResponseInvalid));
+    try std.testing.expect(!isContextOverflowAgentError(error.AgentAborted));
+}
+
 test "runtime stores prompt messages and resets sessions" {
     std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-test.jsonl") catch {};
     var env = std.process.Environ.Map.init(std.testing.allocator);
@@ -3858,4 +4972,285 @@ test "runtime stores prompt messages and resets sessions" {
     try runtime.clearSession(std.testing.io, std.testing.allocator, null);
     try std.testing.expectEqual(@as(usize, 0), runtime.message_count);
     try std.testing.expectEqual(@as(usize, 2), runtime.session_generation);
+}
+
+test "compaction prompt assembly serializes prior turns inside conversation tags" {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-compaction-prompt-test.jsonl") catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    try runtime.init(std.testing.io, std.testing.allocator, &env, "zig-out/pi-zig-rpc-compaction-prompt-test.jsonl", .{});
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "alpha request");
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .assistant, "beta reply");
+
+    const prompt = try runtime.buildCompactionPromptText(std.testing.allocator, "stay focused on alpha");
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<conversation>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "</conversation>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[User]: alpha request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[Assistant]: beta reply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Additional focus: stay focused on alpha") != null);
+    // The summarization instructions must be present so the model summarizes
+    // rather than continues the conversation.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "structured context checkpoint summary") != null);
+}
+
+test "compaction falls back to static summary without model or auth" {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-compaction-fallback-test.jsonl") catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    try runtime.init(std.testing.io, std.testing.allocator, &env, "zig-out/pi-zig-rpc-compaction-fallback-test.jsonl", .{});
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "no auth configured here");
+
+    // No selected_model means the provider path is skipped entirely.
+    try std.testing.expectEqual(@as(?*const models.ModelEntry, null), runtime.selected_model);
+    const result = try runtime.runCompactionSummaryIfAuthenticated(std.testing.io, std.testing.allocator, null);
+    try std.testing.expectEqual(@as(?Runtime.CompactionSummaryResult, null), result);
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try runtime.writeCompactResponse(std.testing.io, std.testing.allocator, &writer, "compact-fallback", "compact", null);
+    const response = writer.buffered();
+    // The static local summary is used and recorded as local:true.
+    try std.testing.expect(std.mem.indexOf(u8, response, "Local summary of 1 message(s).") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"local\":true") != null);
+
+    // The compaction survives as an in-memory entry available for next-prompt injection.
+    try std.testing.expect(runtime.latestCompactionIndex(runtime.message_count) != null);
+}
+
+test "[FLOW_H_AUTO_COMPACTION] threshold predicate mirrors upstream shouldCompact" {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-auto-compaction-threshold-test.jsonl") catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    try runtime.init(std.testing.io, std.testing.allocator, &env, "zig-out/pi-zig-rpc-auto-compaction-threshold-test.jsonl", .{});
+
+    // Disabled by default: no trigger even with content present.
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "some content to estimate");
+    try std.testing.expect(!runtime.shouldAutoCompact());
+
+    // Enabled but no model means no context window to compare against.
+    runtime.auto_compaction_enabled = true;
+    try std.testing.expect(!runtime.shouldAutoCompact());
+
+    // With a model selected and a reserve that pushes the limit below the current
+    // estimate, the threshold fires (contextTokens > contextWindow - reserve).
+    runtime.selected_model = &models.all[0];
+    const context_window = runtime.selected_model.?.context_window;
+    runtime.auto_compaction_reserve_tokens = context_window; // limit == 0
+    try std.testing.expect(runtime.shouldAutoCompact());
+
+    // A tiny reserve keeps the whole window available, so a short conversation stays
+    // under the threshold and does not trigger.
+    runtime.auto_compaction_reserve_tokens = 1;
+    try std.testing.expect(!runtime.shouldAutoCompact());
+}
+
+test "[FLOW_H_AUTO_COMPACTION] pre-prompt auto-compaction persists a compaction entry" {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-auto-compaction-fire-test.jsonl") catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    try runtime.init(std.testing.io, std.testing.allocator, &env, "zig-out/pi-zig-rpc-auto-compaction-fire-test.jsonl", .{});
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "alpha plan to remember");
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .assistant, "acknowledged the alpha plan");
+
+    // Force the threshold low (no auth -> static summary fallback used).
+    runtime.selected_model = &models.all[0];
+    runtime.auto_compaction_enabled = true;
+    runtime.auto_compaction_reserve_tokens = runtime.selected_model.?.context_window;
+    try std.testing.expect(runtime.latestCompactionIndex(runtime.message_count) == null);
+
+    // The pre-prompt hook runs compaction without an explicit `compact` command.
+    runtime.maybeAutoCompactBeforePrompt(std.testing.io, std.testing.allocator);
+    try std.testing.expect(runtime.latestCompactionIndex(runtime.message_count) != null);
+
+    // A second call is a no-op now that a (short) compaction summary replaced history
+    // and the estimate dropped below the limit (idempotent within a turn unless more
+    // context accumulates).
+    const count_after_first = runtime.message_count;
+    runtime.auto_compaction_reserve_tokens = 1;
+    runtime.maybeAutoCompactBeforePrompt(std.testing.io, std.testing.allocator);
+    try std.testing.expectEqual(count_after_first, runtime.message_count);
+}
+
+test "[FLOW_G_SESSION_TREE] navigate_tree switches branch within the same file" {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-tree-nav-test.jsonl") catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    try runtime.init(std.testing.io, std.testing.allocator, &env, "zig-out/pi-zig-rpc-tree-nav-test.jsonl", .{});
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "alpha");
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .assistant, "alpha reply");
+
+    // Same file before/after navigation (no fork/clone sibling file).
+    var path_buf: [256]u8 = undefined;
+    const before_path = blk: {
+        const p = runtime.store.path();
+        @memcpy(path_buf[0..p.len], p);
+        break :blk path_buf[0..p.len];
+    };
+
+    // Navigate back to the first user message: leaf moves to m-1, branch is pruned
+    // to just that node, and we remain in the same file.
+    try runtime.navigateTree(std.testing.io, std.testing.allocator, "m-1");
+    try std.testing.expectEqualStrings("m-1", runtime.store.leafId().?);
+    try std.testing.expectEqual(@as(usize, 1), runtime.message_count);
+    try std.testing.expectEqualStrings("m-1", runtime.messages[0].entryId());
+    try std.testing.expectEqualStrings(before_path, runtime.store.path());
+
+    // Navigating to a non-existent node is rejected.
+    try std.testing.expectError(error.EntryNotFound, runtime.navigateTree(std.testing.io, std.testing.allocator, "m-404"));
+}
+
+test "[FLOW_G_SESSION_TREE] navigate_tree with summarize persists a branch_summary entry" {
+    const path = "zig-out/pi-zig-rpc-branch-summary-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    try runtime.init(std.testing.io, std.testing.allocator, &env, path, .{});
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "alpha question");
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .assistant, "alpha branch work to abandon");
+
+    // Navigate back to the first user message with summarization on. The assistant reply
+    // (m-2) is on the abandoned branch, so a branch_summary is generated + persisted. With
+    // no model/auth configured the provider summary is skipped and a static text is used.
+    var summary_buf: [max_message_bytes]u8 = undefined;
+    const summary = try runtime.navigateTreeWithSummary(std.testing.io, std.testing.allocator, "m-1", null, &summary_buf);
+    try std.testing.expect(summary != null);
+    try std.testing.expectEqualStrings("m-1", runtime.store.leafId().?);
+
+    // The durable file carries a branch_summary entry whose fromId is the navigation
+    // target (m-1) — upstream BranchSummaryEntry shape.
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"type\":\"branch_summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"fromId\":\"m-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"fromHook\":false") != null);
+
+    // The branch_summary node is visible in the durable tree with a preview.
+    var tree = try runtime.store.readTree(std.testing.io, std.testing.allocator);
+    var saw_branch_summary = false;
+    for (tree.slice()) |*node| {
+        if (std.mem.eql(u8, node.kind(), "branch_summary")) saw_branch_summary = true;
+    }
+    try std.testing.expect(saw_branch_summary);
+}
+
+test "[FLOW_G_SESSION_TREE] navigate_tree summarize is a plain move when nothing is abandoned" {
+    const path = "zig-out/pi-zig-rpc-branch-summary-noop-test.jsonl";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    try runtime.init(std.testing.io, std.testing.allocator, &env, path, .{});
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "only message");
+
+    // Navigating to the current leaf abandons nothing, so no branch_summary is written and
+    // the call behaves like a plain navigateTree (returns null summary).
+    var summary_buf: [max_message_bytes]u8 = undefined;
+    const summary = try runtime.navigateTreeWithSummary(std.testing.io, std.testing.allocator, "m-1", null, &summary_buf);
+    try std.testing.expectEqual(@as(?[]const u8, null), summary);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "branch_summary") == null);
+}
+
+test "[FLOW_J_EXTENSION_EVENTS] lifecycle emission is a no-op without loaded extensions" {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-lifecycle-noop-test.jsonl") catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    // No extension_paths -> every emission seam early-returns cheaply.
+    try runtime.init(std.testing.io, std.testing.allocator, &env, "zig-out/pi-zig-rpc-lifecycle-noop-test.jsonl", .{});
+    try std.testing.expectEqual(@as(usize, 0), runtime.run_options.extension_paths.len);
+
+    // session_start / notify emission must not crash or allocate-and-leak with no extensions.
+    runtime.emitSessionStart(std.testing.io, std.testing.allocator, "startup");
+    runtime.emitLifecycleNotify(std.testing.io, std.testing.allocator, "turn_start", "{}");
+
+    // user_bash returns the original command unchanged when no extension can rewrite it.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const effective = runtime.emitUserBash(std.testing.io, arena.allocator(), "ls -la");
+    try std.testing.expectEqualStrings("ls -la", effective);
+
+    // dispatchLifecycle returns null (no work) when no extensions are configured.
+    const maybe = try runtime.dispatchLifecycle(std.testing.io, std.testing.allocator, .{ .type = "session_start", .fields_json = "{}" });
+    try std.testing.expectEqual(@as(?extension_runner.Runner.SingleLifecycleResult, null), maybe);
+}
+
+test "[FLOW_G_SESSION_TREE] get_session_tree emits id/parentId nodes and leaf" {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, "zig-out/pi-zig-rpc-tree-view-test.jsonl") catch {};
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var runtime: Runtime = .{};
+    try runtime.init(std.testing.io, std.testing.allocator, &env, "zig-out/pi-zig-rpc-tree-view-test.jsonl", .{});
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .user, "root q");
+    try runtime.addMessage(std.testing.io, std.testing.allocator, .assistant, "child a");
+
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try runtime.writeSessionTree(std.testing.io, std.testing.allocator, &writer, "tree-1", "get_session_tree");
+    const response = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"command\":\"get_session_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"leafId\":\"m-2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":\"m-1\",\"parentId\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":\"m-2\",\"parentId\":\"m-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"preview\":\"root q\"") != null);
+}
+
+test "[FLOW_I_EXTENSION_UI] request event echoes method params and response data routes" {
+    // The outbound request event carries the method + recognized params.
+    var req_buf: [1024]u8 = undefined;
+    var req_writer = std.Io.Writer.fixed(&req_buf);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"type\":\"extension_ui_request\",\"id\":\"u-1\",\"method\":\"select\",\"title\":\"Pick\",\"options\":[\"Red\",\"Green\"],\"timeout\":5000}",
+        .{},
+    );
+    defer parsed.deinit();
+    try writeExtensionUiRequestEvent(&req_writer, "u-1", "select", parsed.value);
+    const event = req_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, event, "\"type\":\"extension_ui_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event, "\"method\":\"select\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event, "\"title\":\"Pick\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event, "\"options\":[\"Red\",\"Green\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event, "\"timeout\":5000") != null);
+
+    // A value response routes the selected value back.
+    var data_buf: [256]u8 = undefined;
+    var data_writer = std.Io.Writer.fixed(&data_buf);
+    try writeExtensionUiResponseData(&data_writer, .{ .value = @constCast("Green") });
+    try std.testing.expectEqualStrings("{\"cancelled\":false,\"value\":\"Green\"}", data_writer.buffered());
+
+    // A confirm response routes the boolean.
+    var confirm_buf: [256]u8 = undefined;
+    var confirm_writer = std.Io.Writer.fixed(&confirm_buf);
+    try writeExtensionUiResponseData(&confirm_writer, .{ .confirmed = true });
+    try std.testing.expectEqualStrings("{\"cancelled\":false,\"confirmed\":true}", confirm_writer.buffered());
+
+    // A cancellation routes cancelled:true.
+    var cancel_buf: [256]u8 = undefined;
+    var cancel_writer = std.Io.Writer.fixed(&cancel_buf);
+    try writeExtensionUiResponseData(&cancel_writer, .{ .cancelled = true });
+    try std.testing.expectEqualStrings("{\"cancelled\":true}", cancel_writer.buffered());
+}
+
+test "[FLOW_I_EXTENSION_UI] method classification matches upstream blocking semantics" {
+    try std.testing.expect(Runtime.ExtensionUiMethod.parse("select").?.isBlocking());
+    try std.testing.expect(Runtime.ExtensionUiMethod.parse("confirm").?.isBlocking());
+    try std.testing.expect(Runtime.ExtensionUiMethod.parse("input").?.isBlocking());
+    try std.testing.expect(Runtime.ExtensionUiMethod.parse("editor").?.isBlocking());
+    try std.testing.expect(!Runtime.ExtensionUiMethod.parse("notify").?.isBlocking());
+    try std.testing.expect(!Runtime.ExtensionUiMethod.parse("setStatus").?.isBlocking());
+    try std.testing.expect(!Runtime.ExtensionUiMethod.parse("setWidget").?.isBlocking());
+    try std.testing.expect(!Runtime.ExtensionUiMethod.parse("setTitle").?.isBlocking());
+    try std.testing.expect(!Runtime.ExtensionUiMethod.parse("set_editor_text").?.isBlocking());
+    try std.testing.expectEqual(@as(?Runtime.ExtensionUiMethod, null), Runtime.ExtensionUiMethod.parse("bogus"));
 }

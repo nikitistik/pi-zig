@@ -10,6 +10,13 @@ pub const upstream_provider_count = generated.upstream_provider_count;
 
 const thinking_order = [_]types.ThinkingLevel{ .off, .minimal, .low, .medium, .high, .xhigh };
 
+/// Scratch buffer big enough to hold the longest interpolated resolver warning
+/// (custom-model fallback embeds the pattern + provider names verbatim). Sized to
+/// comfortably exceed any realistic CLI `--model`/`--provider` value so the
+/// `bufPrint` calls below never truncate; resolution is allocation-free.
+const warning_buf_len = 1024;
+const WarningBuf = [warning_buf_len]u8;
+
 const ParsedPattern = struct {
     model: ?*const ModelEntry = null,
     thinking_level: ?types.ThinkingLevel = null,
@@ -54,7 +61,8 @@ pub fn writeResolvedCliJson(io: std.Io, cli_provider: ?[]const u8, cli_model: []
         return;
     } else null;
 
-    if (resolveCli(provider, cli_model)) |resolved| {
+    var warning_scratch: WarningBuf = undefined;
+    if (resolveCli(provider, cli_model, &warning_scratch)) |resolved| {
         try w.writeAll("{\"model\":");
         try writeResolvedModelJson(w, resolved);
         try w.writeAll(",\"thinkingLevel\":");
@@ -168,7 +176,11 @@ const ResolvedCliModel = struct {
     custom_model: bool = false,
 };
 
-fn resolveCli(cli_provider: ?[]const u8, cli_model: []const u8) ?ResolvedCliModel {
+/// Resolve a model from CLI flags, mirroring upstream `resolveCliModel`.
+/// Any interpolated warning string is written into `warning_scratch` (a caller-owned
+/// buffer); the returned `warning` slice borrows from it, so the buffer must outlive
+/// the result. Resolution itself performs no heap allocation.
+fn resolveCli(cli_provider: ?[]const u8, cli_model: []const u8, warning_scratch: *WarningBuf) ?ResolvedCliModel {
     var provider = cli_provider;
     var pattern = cli_model;
     var inferred_provider = false;
@@ -198,9 +210,9 @@ fn resolveCli(cli_provider: ?[]const u8, cli_model: []const u8) ?ResolvedCliMode
     }
 
     const parsed = if (provider) |provider_name|
-        parseModelPatternInProvider(pattern, provider_name, false)
+        parseModelPatternInProvider(pattern, provider_name, false, warning_scratch)
     else
-        parseModelPatternInSlice(pattern, all, false);
+        parseModelPatternInSlice(pattern, all, false, warning_scratch);
 
     if (parsed.model) |model| {
         return .{ .base_model = model, .thinking_level = parsed.thinking_level, .warning = parsed.warning };
@@ -210,7 +222,7 @@ fn resolveCli(cli_provider: ?[]const u8, cli_model: []const u8) ?ResolvedCliMode
         if (findExactModelReference(cli_model)) |exact| {
             return .{ .base_model = exact };
         }
-        const fallback = parseModelPatternInSlice(cli_model, all, false);
+        const fallback = parseModelPatternInSlice(cli_model, all, false, warning_scratch);
         if (fallback.model) |model| {
             return .{ .base_model = model, .thinking_level = fallback.thinking_level, .warning = fallback.warning };
         }
@@ -218,10 +230,26 @@ fn resolveCli(cli_provider: ?[]const u8, cli_model: []const u8) ?ResolvedCliMode
 
     if (provider) |provider_name| {
         if (baseModelForCustomProviderModel(provider_name)) |base| {
+            // Mirror upstream resolveCliModel's interpolated fallback warning:
+            //   `Model "<pattern>" not found for provider "<provider>". Using custom model id.`
+            // When the inner pattern parse already produced a warning (invalid
+            // thinking level), upstream prepends it to the fallback warning.
+            const fallback_warning = if (parsed.warning) |inner|
+                std.fmt.bufPrint(
+                    warning_scratch,
+                    "{s} Model \"{s}\" not found for provider \"{s}\". Using custom model id.",
+                    .{ inner, pattern, provider_name },
+                ) catch null
+            else
+                std.fmt.bufPrint(
+                    warning_scratch,
+                    "Model \"{s}\" not found for provider \"{s}\". Using custom model id.",
+                    .{ pattern, provider_name },
+                ) catch null;
             return .{
                 .base_model = base,
                 .override_id = pattern,
-                .warning = "Model not found for provider. Using custom model id.",
+                .warning = fallback_warning,
                 .custom_model = true,
             };
         }
@@ -230,7 +258,30 @@ fn resolveCli(cli_provider: ?[]const u8, cli_model: []const u8) ?ResolvedCliMode
     return null;
 }
 
-fn parseModelPatternInProvider(pattern: []const u8, provider: []const u8, allow_invalid_thinking_level_fallback: bool) ParsedPattern {
+/// Result of resolving a single scope pattern (e.g. one entry of `--models`).
+pub const ScopedModelResult = struct {
+    model: ?*const ModelEntry = null,
+    thinking_level: ?types.ThinkingLevel = null,
+    warning: ?[]const u8 = null,
+};
+
+/// Resolve a single scope pattern against the full model catalog, mirroring the
+/// non-glob branch of upstream `resolveModelScope` + `parseModelPattern` (scope
+/// mode: `allowInvalidThinkingLevelFallback` defaults to true, so an invalid
+/// `:suffix` warns and falls back to the prefix rather than failing).
+///
+/// `warning_scratch` backs any interpolated invalid-thinking-level warning; the
+/// returned `warning` borrows from it and must not outlive the buffer. Glob
+/// patterns (`*`/`?`/`[`) are intentionally NOT handled here — the upstream glob
+/// branch yields a *set* of models via minimatch, which the future `--models`
+/// wiring will own separately; this single-result helper covers the fuzzy/exact
+/// pattern path that the resolver edge-case tests exercise.
+pub fn resolveScopePattern(pattern: []const u8, warning_scratch: *WarningBuf) ScopedModelResult {
+    const parsed = parseModelPatternInSlice(pattern, all, true, warning_scratch);
+    return .{ .model = parsed.model, .thinking_level = parsed.thinking_level, .warning = parsed.warning };
+}
+
+fn parseModelPatternInProvider(pattern: []const u8, provider: []const u8, allow_invalid_thinking_level_fallback: bool, warning_scratch: ?*WarningBuf) ParsedPattern {
     var candidates: [512]*const ModelEntry = undefined;
     var len: usize = 0;
     for (all) |*model| {
@@ -239,10 +290,10 @@ fn parseModelPatternInProvider(pattern: []const u8, provider: []const u8, allow_
         candidates[len] = model;
         len += 1;
     }
-    return parseModelPatternInPointerSlice(pattern, candidates[0..len], allow_invalid_thinking_level_fallback);
+    return parseModelPatternInPointerSlice(pattern, candidates[0..len], allow_invalid_thinking_level_fallback, warning_scratch);
 }
 
-fn parseModelPatternInSlice(pattern: []const u8, candidates: []const ModelEntry, allow_invalid_thinking_level_fallback: bool) ParsedPattern {
+fn parseModelPatternInSlice(pattern: []const u8, candidates: []const ModelEntry, allow_invalid_thinking_level_fallback: bool, warning_scratch: ?*WarningBuf) ParsedPattern {
     var pointers: [1024]*const ModelEntry = undefined;
     var len: usize = 0;
     for (candidates) |*model| {
@@ -250,13 +301,20 @@ fn parseModelPatternInSlice(pattern: []const u8, candidates: []const ModelEntry,
         pointers[len] = model;
         len += 1;
     }
-    return parseModelPatternInPointerSlice(pattern, pointers[0..len], allow_invalid_thinking_level_fallback);
+    return parseModelPatternInPointerSlice(pattern, pointers[0..len], allow_invalid_thinking_level_fallback, warning_scratch);
 }
 
+/// Mirror upstream `parseModelPattern`: try the full pattern as a model, else split
+/// on the last colon. A valid thinking-level suffix recurses on the prefix and
+/// attaches the level; an invalid suffix either fails (strict CLI mode,
+/// `allow_invalid_thinking_level_fallback=false`) or warns and recurses on the
+/// prefix (scope mode). The interpolated invalid-level warning borrows from
+/// `warning_scratch` when provided.
 fn parseModelPatternInPointerSlice(
     pattern: []const u8,
     candidates: []const *const ModelEntry,
     allow_invalid_thinking_level_fallback: bool,
+    warning_scratch: ?*WarningBuf,
 ) ParsedPattern {
     if (tryMatchModelInPointerSlice(pattern, candidates)) |model| {
         return .{ .model = model };
@@ -267,8 +325,10 @@ fn parseModelPatternInPointerSlice(
     const suffix = pattern[colon_index + 1 ..];
 
     if (types.ThinkingLevel.parse(suffix)) |level| {
-        const parsed = parseModelPatternInPointerSlice(prefix, candidates, allow_invalid_thinking_level_fallback);
+        const parsed = parseModelPatternInPointerSlice(prefix, candidates, allow_invalid_thinking_level_fallback, warning_scratch);
         if (parsed.model) |_| {
+            // Only attach the parsed thinking level when the inner recursion had no
+            // warning, matching upstream (a warning takes precedence over a level).
             if (parsed.warning == null) {
                 return .{ .model = parsed.model, .thinking_level = level };
             }
@@ -277,9 +337,17 @@ fn parseModelPatternInPointerSlice(
     }
 
     if (!allow_invalid_thinking_level_fallback) return .{};
-    const parsed = parseModelPatternInPointerSlice(prefix, candidates, allow_invalid_thinking_level_fallback);
+    const parsed = parseModelPatternInPointerSlice(prefix, candidates, allow_invalid_thinking_level_fallback, warning_scratch);
     if (parsed.model) |_| {
-        return .{ .model = parsed.model, .warning = "Invalid thinking level in model pattern. Using default instead." };
+        const warning = if (warning_scratch) |scratch|
+            std.fmt.bufPrint(
+                scratch,
+                "Invalid thinking level \"{s}\" in pattern \"{s}\". Using default instead.",
+                .{ suffix, pattern },
+            ) catch "Invalid thinking level in model pattern. Using default instead."
+        else
+            "Invalid thinking level in model pattern. Using default instead.";
+        return .{ .model = parsed.model, .warning = warning };
     }
     return parsed;
 }
@@ -655,18 +723,170 @@ test "anthropic haiku model is available with thinking metadata" {
 }
 
 test "model resolver handles provider prefixes and thinking suffixes" {
-    const direct = resolveCli(null, "anthropic/claude-haiku-4-5").?;
+    var scratch: WarningBuf = undefined;
+    const direct = resolveCli(null, "anthropic/claude-haiku-4-5", &scratch).?;
     try std.testing.expectEqualStrings("anthropic", direct.base_model.provider);
     try std.testing.expectEqualStrings("claude-haiku-4-5", direct.base_model.id);
 
-    const fuzzy = resolveCli("anthropic", "haiku:high").?;
+    const fuzzy = resolveCli("anthropic", "haiku:high", &scratch).?;
     try std.testing.expectEqual(types.ThinkingLevel.high, fuzzy.thinking_level.?);
     try std.testing.expect(containsIgnoreCase(fuzzy.base_model.id, "haiku"));
 }
 
 test "model resolver builds provider-scoped custom model fallback" {
-    const custom = resolveCli("anthropic", "custom-model").?;
+    var scratch: WarningBuf = undefined;
+    const custom = resolveCli("anthropic", "custom-model", &scratch).?;
     try std.testing.expect(custom.custom_model);
     try std.testing.expectEqualStrings("custom-model", custom.override_id.?);
     try std.testing.expectEqualStrings("anthropic", custom.base_model.provider);
+    // Upstream interpolates the pattern + provider into the fallback warning.
+    try std.testing.expectEqualStrings(
+        "Model \"custom-model\" not found for provider \"anthropic\". Using custom model id.",
+        custom.warning.?,
+    );
+}
+
+test "model resolver infers provider from slash and prefers provider/model split" {
+    var scratch: WarningBuf = undefined;
+    // "<provider>/<pattern>" with no --provider: the slash prefix is a known
+    // provider, so resolution scopes to it (upstream resolveCliModel slash path).
+    const inferred = resolveCli(null, "anthropic/haiku", &scratch).?;
+    try std.testing.expectEqualStrings("anthropic", inferred.base_model.provider);
+    try std.testing.expect(containsIgnoreCase(inferred.base_model.id, "haiku"));
+    try std.testing.expect(inferred.warning == null);
+}
+
+test "model resolver strips redundant provider prefix when both provider and model given" {
+    var scratch: WarningBuf = undefined;
+    // --provider anthropic --model anthropic/claude-haiku-4-5: upstream strips the
+    // duplicated "<provider>/" prefix rather than treating it as a custom id.
+    const resolved = resolveCli("anthropic", "anthropic/claude-haiku-4-5", &scratch).?;
+    try std.testing.expectEqualStrings("anthropic", resolved.base_model.provider);
+    try std.testing.expectEqualStrings("claude-haiku-4-5", resolved.base_model.id);
+    try std.testing.expect(!resolved.custom_model);
+}
+
+test "model resolver does not strip invalid :suffix as thinking level in strict CLI mode" {
+    var scratch: WarningBuf = undefined;
+    // Strict mode (allowInvalidThinkingLevelFallback=false): a model whose id ends
+    // in a colon suffix that is NOT a thinking level must resolve as a raw id, not
+    // get the suffix stripped. Build a synthetic candidate set to assert this
+    // precisely against the documented OpenRouter ":exacto" behavior.
+    const openrouter_colon = [_]ModelEntry{
+        makeTestModel("openrouter", "qwen/qwen3-coder:exacto", "Qwen3 Coder Exacto"),
+        makeTestModel("openai", "gpt-4o", "GPT-4o"),
+    };
+    // Exact match on the colon id (strict mode) keeps the suffix.
+    const parsed = parseModelPatternInSlice("qwen/qwen3-coder:exacto", &openrouter_colon, false, &scratch);
+    try std.testing.expectEqualStrings("qwen/qwen3-coder:exacto", parsed.model.?.id);
+    try std.testing.expect(parsed.thinking_level == null);
+    try std.testing.expect(parsed.warning == null);
+
+    // A valid thinking suffix after the colon id is still parsed off in strict mode.
+    const with_level = parseModelPatternInSlice("qwen/qwen3-coder:exacto:high", &openrouter_colon, false, &scratch);
+    try std.testing.expectEqualStrings("qwen/qwen3-coder:exacto", with_level.model.?.id);
+    try std.testing.expectEqual(types.ThinkingLevel.high, with_level.thinking_level.?);
+
+    // An invalid suffix in strict mode fails (no model) rather than stripping it.
+    const invalid_strict = parseModelPatternInSlice("gpt-4o:bogus", &openrouter_colon, false, &scratch);
+    try std.testing.expect(invalid_strict.model == null);
+}
+
+test "scope-mode parseModelPattern warns and falls back on invalid thinking level" {
+    var scratch: WarningBuf = undefined;
+    const candidates = [_]ModelEntry{
+        makeTestModel("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5"),
+        makeTestModel("openai", "gpt-4o", "GPT-4o"),
+    };
+    // "sonnet:random" -> matches sonnet, no thinking level, interpolated warning.
+    const random = parseModelPatternInSlice("sonnet:random", &candidates, true, &scratch);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", random.model.?.id);
+    try std.testing.expect(random.thinking_level == null);
+    try std.testing.expectEqualStrings(
+        "Invalid thinking level \"random\" in pattern \"sonnet:random\". Using default instead.",
+        random.warning.?,
+    );
+
+    // "sonnet:" (empty suffix) -> not a valid level, warns, falls back to "sonnet".
+    const trailing_colon = parseModelPatternInSlice("sonnet:", &candidates, true, &scratch);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", trailing_colon.model.?.id);
+    try std.testing.expect(std.mem.indexOf(u8, trailing_colon.warning.?, "Invalid thinking level") != null);
+
+    // Double-invalid suffix still resolves the model with a warning.
+    const double = parseModelPatternInSlice("sonnet:high:random", &candidates, true, &scratch);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", double.model.?.id);
+    try std.testing.expect(std.mem.indexOf(u8, double.warning.?, "Invalid thinking level") != null);
+}
+
+test "scope pattern resolver matches catalog models and parses thinking levels" {
+    var scratch: WarningBuf = undefined;
+    const haiku = resolveScopePattern("haiku:low", &scratch);
+    try std.testing.expect(haiku.model != null);
+    try std.testing.expect(containsIgnoreCase(haiku.model.?.id, "haiku"));
+    try std.testing.expectEqual(types.ThinkingLevel.low, haiku.thinking_level.?);
+
+    const none = resolveScopePattern("definitely-not-a-real-model-xyz", &scratch);
+    try std.testing.expect(none.model == null);
+}
+
+test "tryMatchModel prefers aliases over dated versions then sorts highest" {
+    // Two dated versions + one alias; the alias wins (upstream isAlias branch).
+    const candidates = [_]ModelEntry{
+        makeTestModel("anthropic", "claude-sonnet-4-5-20250101", "Claude Sonnet 4.5"),
+        makeTestModel("anthropic", "claude-sonnet-4-5-20250929", "Claude Sonnet 4.5"),
+        makeTestModel("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5 (latest)"),
+    };
+    var pointers: [3]*const ModelEntry = undefined;
+    for (&candidates, 0..) |*m, i| pointers[i] = m;
+    const matched = tryMatchModelInPointerSlice("sonnet", &pointers).?;
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", matched.id);
+
+    // With only dated versions, the highest-sorting date wins.
+    var dated_only: [2]*const ModelEntry = .{ &candidates[0], &candidates[1] };
+    const latest_dated = tryMatchModelInPointerSlice("sonnet", &dated_only).?;
+    try std.testing.expectEqualStrings("claude-sonnet-4-5-20250929", latest_dated.id);
+}
+
+test "cycling order walks the catalog and wraps around" {
+    // next() advances by one index and wraps; nextThinkingLevel cycles supported
+    // levels for a reasoning model and returns null for a non-reasoning one.
+    const first = &all[0];
+    const second = next(first);
+    try std.testing.expectEqual(@as(usize, 1), indexOf(second).?);
+    const last = &all[all.len - 1];
+    try std.testing.expectEqual(@as(usize, 0), indexOf(next(last)).?);
+
+    const haiku = find("anthropic", "claude-haiku-4-5").?;
+    // Haiku supports thinking but not xhigh; cycling from high must skip xhigh and
+    // wrap to off (the lowest supported level), never landing on the disabled one.
+    const after_high = nextThinkingLevel(haiku, .high).?;
+    try std.testing.expect(after_high != .xhigh);
+}
+
+/// Build a throwaway ModelEntry for resolver unit tests. Only the fields the
+/// resolver/cycling logic reads (provider, id, name) are meaningful; the rest get
+/// neutral defaults so tests stay isolated from the generated catalog.
+fn makeTestModel(provider: []const u8, id: []const u8, name: []const u8) ModelEntry {
+    return .{
+        .id = id,
+        .name = name,
+        .api = "anthropic-messages",
+        .provider = provider,
+        .base_url = "https://example.test",
+        .reasoning = false,
+        .input_text = true,
+        .input_image = false,
+        .cost_input = 0,
+        .cost_output = 0,
+        .cost_cache_read = 0,
+        .cost_cache_write = 0,
+        .context_window = 0,
+        .max_tokens = 0,
+        .thinking_off_disabled = false,
+        .thinking_minimal_disabled = false,
+        .thinking_low_disabled = false,
+        .thinking_medium_disabled = false,
+        .thinking_high_disabled = false,
+        .thinking_xhigh_supported = false,
+    };
 }

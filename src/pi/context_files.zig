@@ -323,3 +323,66 @@ test "context file parent traversal stops at filesystem root" {
     try std.testing.expect(parentDir("/") == null);
     try std.testing.expectEqualStrings("/tmp", parentDir("/tmp/pi").?);
 }
+
+test "loadContextFileFromDir prefers AGENTS.md over CLAUDE.md (upstream candidate order)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const dir = "zig-out/pi-zig-ctx-candidates";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+
+    // Both present -> AGENTS.md wins (it is first in the candidate list).
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/AGENTS.md", .data = "agents wins" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/CLAUDE.md", .data = "claude loses" });
+    {
+        const file = (try loadContextFileFromDir(io, allocator, dir, "project")).?;
+        defer file.deinit(allocator);
+        try std.testing.expectEqualStrings("agents wins", file.content);
+        try std.testing.expect(std.mem.endsWith(u8, file.path, "/AGENTS.md"));
+    }
+
+    // Only CLAUDE.md present -> it is discovered.
+    try std.Io.Dir.cwd().deleteFile(io, dir ++ "/AGENTS.md");
+    {
+        const file = (try loadContextFileFromDir(io, allocator, dir, "project")).?;
+        defer file.deinit(allocator);
+        try std.testing.expectEqualStrings("claude loses", file.content);
+    }
+
+    // None present -> null.
+    try std.Io.Dir.cwd().deleteFile(io, dir ++ "/CLAUDE.md");
+    try std.testing.expect((try loadContextFileFromDir(io, allocator, dir, "project")) == null);
+}
+
+test "loadFirstPromptFile resolves project .pi/SYSTEM.md before agent dir" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const cwd = "zig-out/pi-zig-prompt-precedence-cwd";
+    const agent_dir = "zig-out/pi-zig-prompt-precedence-agent";
+    std.Io.Dir.cwd().deleteTree(io, cwd) catch {};
+    std.Io.Dir.cwd().deleteTree(io, agent_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, cwd) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, agent_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, cwd ++ "/.pi");
+    try std.Io.Dir.cwd().createDirPath(io, agent_dir);
+
+    // Both define SYSTEM.md -> the project copy under .pi/ wins.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cwd ++ "/.pi/SYSTEM.md", .data = "project system" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = agent_dir ++ "/SYSTEM.md", .data = "agent system" });
+    {
+        const file = (try loadFirstPromptFile(io, allocator, cwd, agent_dir, "SYSTEM.md", "system")).?;
+        defer file.deinit(allocator);
+        try std.testing.expectEqualStrings("project system", file.content);
+    }
+
+    // Remove the project copy -> falls back to the agent dir copy.
+    try std.Io.Dir.cwd().deleteFile(io, cwd ++ "/.pi/SYSTEM.md");
+    {
+        const file = (try loadFirstPromptFile(io, allocator, cwd, agent_dir, "SYSTEM.md", "system")).?;
+        defer file.deinit(allocator);
+        try std.testing.expectEqualStrings("agent system", file.content);
+    }
+}

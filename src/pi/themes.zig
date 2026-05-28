@@ -53,14 +53,34 @@ const ThemeEntry = struct {
     }
 };
 
+// Mirrors upstream ResourceCollision (core/diagnostics.ts): the shadowed
+// duplicate's resource type/name plus the winner and loser source paths.
+const ThemeCollision = struct {
+    resource_type: []const u8 = "theme",
+    name: []u8,
+    winner_path: []u8,
+    loser_path: []u8,
+
+    fn deinit(self: ThemeCollision, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.winner_path);
+        allocator.free(self.loser_path);
+    }
+};
+
 const Diagnostic = struct {
     severity: []const u8 = "warning",
     message: []u8,
     path: ?[]u8 = null,
+    // Upstream diagnostics carry a `type` discriminant ("warning"|"error"|
+    // "collision"); when this is set the diagnostic is a name-collision and also
+    // serializes a `collision` object matching dedupeThemes.
+    collision: ?ThemeCollision = null,
 
     fn deinit(self: Diagnostic, allocator: std.mem.Allocator) void {
         allocator.free(self.message);
         if (self.path) |path| allocator.free(path);
+        if (self.collision) |collision| collision.deinit(allocator);
     }
 };
 
@@ -94,6 +114,35 @@ const Registry = struct {
         });
     }
 
+    // Emit an upstream-shaped `collision` diagnostic for a theme name that is
+    // shadowed by an already-registered (higher-precedence) theme. Mirrors
+    // resource-loader.ts dedupeThemes: message `name "<name>" collision`, the
+    // diagnostic `path` is the loser's source path, and winner/loser source
+    // paths fall back to "<builtin>" when a theme has no file path.
+    fn addCollisionDiagnostic(self: *Registry, name: []const u8, loser_path: ?[]const u8) !void {
+        const winner_path = self.themePathForName(name) orelse "<builtin>";
+        const message = try std.fmt.allocPrint(self.allocator, "name \"{s}\" collision", .{name});
+        errdefer self.allocator.free(message);
+        const loser = loser_path orelse "<builtin>";
+        try self.diagnostics.append(self.allocator, .{
+            .severity = "collision",
+            .message = message,
+            .path = if (loser_path) |p| try self.allocator.dupe(u8, p) else null,
+            .collision = .{
+                .name = try self.allocator.dupe(u8, name),
+                .winner_path = try self.allocator.dupe(u8, winner_path),
+                .loser_path = try self.allocator.dupe(u8, loser),
+            },
+        });
+    }
+
+    fn themePathForName(self: *const Registry, name: []const u8) ?[]const u8 {
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.path;
+        }
+        return null;
+    }
+
     fn addBytes(self: *Registry, name_hint: []const u8, source: []const u8, path: ?[]const u8, bytes: []const u8, builtin: ?[]const u8) !void {
         const name = themeNameFromBytes(self.allocator, name_hint, bytes) catch |err| {
             const message = try std.fmt.allocPrint(self.allocator, "failed to load theme: {s}", .{@errorName(err)});
@@ -104,6 +153,7 @@ const Registry = struct {
         errdefer self.allocator.free(name);
 
         if (self.seen.contains(name)) {
+            try self.addCollisionDiagnostic(name, path);
             self.allocator.free(name);
             return;
         }
@@ -287,33 +337,47 @@ fn buildRegistry(io: std.Io, allocator: std.mem.Allocator, env: *const std.proce
     const agent_dir = try agentDir(allocator, env);
     defer allocator.free(agent_dir);
 
+    // Built-in themes are added first: upstream resolves names against the
+    // built-in map before any custom theme (config.ts loadThemeJson / theme.ts
+    // getAvailableThemesWithPaths), so a user theme named "dark"/"light" cannot
+    // shadow a built-in. First-wins dedup then gives built-ins highest priority.
+    try registry.addBuiltins();
+
     if (!options.no_themes) {
+        const project_base = try std.fs.path.join(allocator, &.{ cwd, ".pi" });
+        defer allocator.free(project_base);
+        const user_settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+        defer allocator.free(user_settings_path);
+
+        // Discovered themes follow the package-manager precedence ranking
+        // (resourcePrecedenceRank): project settings (rank 0) -> project auto
+        // (rank 1) -> user settings (rank 2) -> user auto (rank 3) -> packages
+        // (rank 4). First-wins dedup makes the highest-precedence theme win a
+        // name collision, matching upstream's resolved theme list.
+        try addThemeSettings(io, allocator, env, &registry, ".pi/settings.json", project_base, "project");
+
         const project_themes = try std.fs.path.join(allocator, &.{ cwd, ".pi", "themes" });
         defer allocator.free(project_themes);
         try registry.addDefaultDir(io, "project", project_themes);
+
+        try addThemeSettings(io, allocator, env, &registry, user_settings_path, agent_dir, "user");
 
         const user_themes = try std.fs.path.join(allocator, &.{ agent_dir, "themes" });
         defer allocator.free(user_themes);
         try registry.addDefaultDir(io, "user", user_themes);
 
-        const project_base = try std.fs.path.join(allocator, &.{ cwd, ".pi" });
-        defer allocator.free(project_base);
-        try addThemeSettings(io, allocator, env, &registry, ".pi/settings.json", project_base, "project");
         try addPackageThemesFromSettings(io, allocator, env, &registry, ".pi/settings.json", project_base);
-
-        const user_settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
-        defer allocator.free(user_settings_path);
-        try addThemeSettings(io, allocator, env, &registry, user_settings_path, agent_dir, "user");
         try addPackageThemesFromSettings(io, allocator, env, &registry, user_settings_path, agent_dir);
     }
 
+    // Temporary (--theme) paths are appended last, matching upstream's
+    // additionalThemePaths being merged after resolved + package themes.
     for (options.paths[0..options.paths_len]) |raw_path| {
         const resolved = try resolvePathWithBase(allocator, env, cwd, raw_path);
         defer allocator.free(resolved);
         try registry.addPath(io, "temporary", resolved);
     }
 
-    try registry.addBuiltins();
     return registry;
 }
 
@@ -671,7 +735,12 @@ fn writeThemeEntryJson(w: *std.Io.Writer, entry: ThemeEntry) !void {
 }
 
 fn writeDiagnosticJson(w: *std.Io.Writer, diagnostic: Diagnostic) !void {
+    // `severity` is retained for backward compatibility; `type` is the upstream
+    // ResourceDiagnostic discriminant ("warning"|"error"|"collision") and equals
+    // severity here. Collisions additionally serialize a `collision` object.
     try w.writeAll("{\"severity\":");
+    try writeJsonString(w, diagnostic.severity);
+    try w.writeAll(",\"type\":");
     try writeJsonString(w, diagnostic.severity);
     try w.writeAll(",\"message\":");
     try writeJsonString(w, diagnostic.message);
@@ -680,6 +749,17 @@ fn writeDiagnosticJson(w: *std.Io.Writer, diagnostic: Diagnostic) !void {
         try writeJsonString(w, path);
     } else {
         try w.writeAll("null");
+    }
+    if (diagnostic.collision) |collision| {
+        try w.writeAll(",\"collision\":{\"resourceType\":");
+        try writeJsonString(w, collision.resource_type);
+        try w.writeAll(",\"name\":");
+        try writeJsonString(w, collision.name);
+        try w.writeAll(",\"winnerPath\":");
+        try writeJsonString(w, collision.winner_path);
+        try w.writeAll(",\"loserPath\":");
+        try writeJsonString(w, collision.loser_path);
+        try w.writeByte('}');
     }
     try w.writeByte('}');
 }
@@ -1186,4 +1266,176 @@ test "theme export resolves recursive vars and ansi colors" {
     try std.testing.expectEqualStrings("#abcdef", (try resolveColorValue(std.testing.allocator, export_object.get("pageBg").?, vars)).string);
     try std.testing.expectEqual(@as(u8, 24), (try resolveColorValue(std.testing.allocator, export_object.get("cardBg").?, vars)).number);
     try std.testing.expectEqual(ResolvedColor.empty, try resolveColorValue(std.testing.allocator, export_object.get("infoBg").?, vars));
+}
+
+// Build a minimal valid theme JSON (all required colors present) for tests.
+fn writeMinimalThemeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, name: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("{{\"name\":\"{s}\",\"colors\":{{", .{name});
+    for (required_color_keys, 0..) |key, index| {
+        if (index != 0) try out.writer.writeByte(',');
+        try out.writer.print("\"{s}\":\"#000000\"", .{key});
+    }
+    try out.writer.writeAll("}}");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.written() });
+}
+
+fn themeSourceInRegistry(registry: *const Registry, name: []const u8) ?[]const u8 {
+    for (registry.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.source;
+    }
+    return null;
+}
+
+test "buildRegistry keeps built-in dark/light non-overridable and lists them" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const theme_dir = "zig-out/pi-zig-theme-precedence";
+    std.Io.Dir.cwd().deleteTree(io, theme_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, theme_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, theme_dir);
+
+    // A custom theme that tries to shadow the built-in "dark" must lose, and a
+    // uniquely-named custom theme must be discovered.
+    try writeMinimalThemeFile(io, allocator, theme_dir ++ "/dark.json", "dark");
+    try writeMinimalThemeFile(io, allocator, theme_dir ++ "/ocean.json", "ocean");
+
+    // Isolate user/agent theme discovery to an empty temp dir.
+    const agent_dir = "zig-out/pi-zig-theme-precedence-agent";
+    std.Io.Dir.cwd().deleteTree(io, agent_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, agent_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, agent_dir);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var options = Options{};
+    options.addPath(theme_dir);
+
+    var registry = try buildRegistry(io, allocator, &env, options);
+    defer registry.deinit();
+
+    // Built-in "dark" wins over the custom dark.json (upstream resolves
+    // built-ins first); "light" built-in is present; the unique custom theme
+    // is discovered as a temporary source.
+    try std.testing.expectEqualStrings("builtin", themeSourceInRegistry(&registry, "dark").?);
+    try std.testing.expectEqualStrings("builtin", themeSourceInRegistry(&registry, "light").?);
+    try std.testing.expectEqualStrings("temporary", themeSourceInRegistry(&registry, "ocean").?);
+
+    // The custom dark.json that lost to the built-in must surface a collision
+    // diagnostic naming the shadowed theme; the built-in winner is unchanged.
+    const collision = collisionDiagnosticForName(&registry, "dark") orelse return error.MissingCollisionDiagnostic;
+    try std.testing.expectEqualStrings("collision", collision.severity);
+    try std.testing.expectEqualStrings("name \"dark\" collision", collision.message);
+    try std.testing.expect(collision.collision != null);
+    try std.testing.expectEqualStrings("theme", collision.collision.?.resource_type);
+    try std.testing.expectEqualStrings("dark", collision.collision.?.name);
+    // pi-zig built-in themes carry their upstream source path (unlike upstream,
+    // whose built-ins have sourcePath === undefined -> "<builtin>"), so the
+    // winner path here is that embedded built-in path. The loser is the
+    // discovered custom file under the temp theme dir.
+    try std.testing.expect(std.mem.indexOf(u8, collision.collision.?.winner_path, "theme/dark.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collision.collision.?.loser_path, theme_dir) != null);
+}
+
+fn collisionDiagnosticForName(registry: *const Registry, name: []const u8) ?Diagnostic {
+    for (registry.diagnostics.items) |diagnostic| {
+        const collision = diagnostic.collision orelse continue;
+        if (std.mem.eql(u8, collision.name, name)) return diagnostic;
+    }
+    return null;
+}
+
+test "theme dedup emits a collision diagnostic for two same-named custom themes and keeps the first" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const dir_a = "zig-out/pi-zig-theme-collision-a";
+    const dir_b = "zig-out/pi-zig-theme-collision-b";
+    for ([_][]const u8{ dir_a, dir_b }) |dir| {
+        std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+    }
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dir_a) catch {};
+        std.Io.Dir.cwd().deleteTree(io, dir_b) catch {};
+    }
+
+    // Two custom themes that both declare the name "twin".
+    try writeMinimalThemeFile(io, allocator, dir_a ++ "/twin.json", "twin");
+    try writeMinimalThemeFile(io, allocator, dir_b ++ "/twin.json", "twin");
+
+    const agent_dir = "zig-out/pi-zig-theme-collision-agent";
+    std.Io.Dir.cwd().deleteTree(io, agent_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, agent_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, agent_dir);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    // dir_a is added first, so its "twin" wins; dir_b is the loser.
+    var options = Options{};
+    options.addPath(dir_a);
+    options.addPath(dir_b);
+
+    var registry = try buildRegistry(io, allocator, &env, options);
+    defer registry.deinit();
+
+    // Winner unchanged: exactly one "twin" entry, sourced from dir_a.
+    var twin_count: usize = 0;
+    var winner_path: []const u8 = "";
+    for (registry.entries.items) |entry| {
+        if (!std.mem.eql(u8, entry.name, "twin")) continue;
+        twin_count += 1;
+        if (entry.path) |p| winner_path = p;
+    }
+    try std.testing.expectEqual(@as(usize, 1), twin_count);
+    try std.testing.expect(std.mem.indexOf(u8, winner_path, dir_a) != null);
+
+    const collision = collisionDiagnosticForName(&registry, "twin") orelse return error.MissingCollisionDiagnostic;
+    try std.testing.expectEqualStrings("name \"twin\" collision", collision.message);
+    try std.testing.expect(collision.collision != null);
+    try std.testing.expectEqualStrings("theme", collision.collision.?.resource_type);
+    try std.testing.expect(std.mem.indexOf(u8, collision.collision.?.winner_path, dir_a) != null);
+    try std.testing.expect(std.mem.indexOf(u8, collision.collision.?.loser_path, dir_b) != null);
+}
+
+test "buildRegistry re-discovers a theme added between calls (reload round-trip)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const theme_dir = "zig-out/pi-zig-theme-reload";
+    std.Io.Dir.cwd().deleteTree(io, theme_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, theme_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, theme_dir);
+
+    const agent_dir = "zig-out/pi-zig-theme-reload-agent";
+    std.Io.Dir.cwd().deleteTree(io, agent_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, agent_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, agent_dir);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var options = Options{};
+    options.addPath(theme_dir);
+
+    {
+        var registry = try buildRegistry(io, allocator, &env, options);
+        defer registry.deinit();
+        try std.testing.expect(themeSourceInRegistry(&registry, "sunrise") == null);
+    }
+
+    try writeMinimalThemeFile(io, allocator, theme_dir ++ "/sunrise.json", "sunrise");
+
+    {
+        var registry = try buildRegistry(io, allocator, &env, options);
+        defer registry.deinit();
+        try std.testing.expectEqualStrings("temporary", themeSourceInRegistry(&registry, "sunrise").?);
+    }
 }

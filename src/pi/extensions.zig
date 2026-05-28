@@ -185,6 +185,33 @@ pub fn discoverRuntimePaths(
     return .{ .paths = try paths.toOwnedSlice(allocator) };
 }
 
+/// Dispatch a single lifecycle event to every discovered, runnable extension and return the
+/// applied result/observation/actions. This is a one-shot convenience seam over the extension
+/// runner for the discovered extension set; long-lived RPC sessions reuse a persistent runner
+/// directly (see extension_runner.PersistentProcess) and call dispatchLifecycleEvent on it.
+///
+/// REMAINING (not owned here): wiring these emissions into the agent/RPC loop (rpc.zig,
+/// agent.zig) so events like session_start/turn_start/before_provider_request/user_bash fire at
+/// the right points in a live run. This helper makes the discovered-extension dispatch reachable;
+/// the call sites in the run loop are owned by those files and are documented as open.
+pub fn dispatchLifecycleEvent(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    runtime_options: RuntimeDiscoveryOptions,
+    event: extension_runner.Runner.LifecycleEvent,
+) !extension_runner.Runner.SingleLifecycleResult {
+    var runtime_paths = try discoverRuntimePaths(io, allocator, env, runtime_options);
+    defer runtime_paths.deinit(allocator);
+
+    var runner = extension_runner.Runner{
+        .io = io,
+        .allocator = allocator,
+        .extension_paths = runtime_paths.paths,
+    };
+    return runner.dispatchLifecycleEvent(event);
+}
+
 fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Options {
     var options = Options{};
     var index: usize = 0;
@@ -943,4 +970,38 @@ fn lessThanString(_: void, left: []const u8, right: []const u8) bool {
 test "wildcard extension pattern matches basename" {
     try std.testing.expect(wildcardMatch("alpha.ts", "*.ts"));
     try std.testing.expect(!wildcardMatch("alpha.js", "*.ts"));
+}
+
+test "dispatchLifecycleEvent fans an event out to an explicitly-discovered extension" {
+    const allocator = std.testing.allocator;
+    const fixture_dir = "zig-out/pi-zig-extensions-lifecycle-dispatch-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, fixture_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture_dir);
+    const rel_path = fixture_dir ++ "/session-start.mjs";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = rel_path, .data =
+        \\export default function(pi) {
+        \\  pi.on("session_start", (event) => ({ started: true, reason: event.reason }));
+        \\}
+    });
+    // Resolve to an absolute path so discovery does not depend on the test process CWD.
+    const abs_path = try std.fs.path.resolve(allocator, &.{rel_path});
+    defer allocator.free(abs_path);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    const outcome = try dispatchLifecycleEvent(
+        std.testing.io,
+        allocator,
+        &env,
+        .{ .no_extensions = true, .explicit_paths = &.{abs_path} },
+        .{ .type = "session_start", .fields_json = "{\"reason\":\"startup\"}" },
+    );
+    defer outcome.deinit(allocator);
+
+    var result = try std.json.parseFromSlice(std.json.Value, allocator, outcome.result_json, .{});
+    defer result.deinit();
+    try std.testing.expect(result.value == .object);
+    try std.testing.expect(result.value.object.get("started").?.bool);
+    try std.testing.expectEqualStrings("startup", result.value.object.get("reason").?.string);
 }

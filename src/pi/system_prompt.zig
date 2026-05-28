@@ -102,7 +102,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Env
     defer allocator.free(package_dir);
 
     var date_buf: [10]u8 = undefined;
-    const prompt_date = options.date orelse try currentUtcDate(io, &date_buf);
+    const prompt_date = options.date orelse try currentLocalDate(io, allocator, env, &date_buf);
 
     var discovery = try context_files.discover(io, allocator, env, .{ .no_context_files = options.no_context_files });
     defer discovery.deinit();
@@ -512,6 +512,29 @@ fn findPackageDirFromAncestor(io: std.Io, allocator: std.mem.Allocator, cwd: []c
 
 pub fn currentUtcDate(io: std.Io, buf: []u8) ![]const u8 {
     const timestamp = std.Io.Clock.real.now(io).toSeconds();
+    return renderDateFromSeconds(timestamp, buf);
+}
+
+/// Render today's date (YYYY-MM-DD) using the LOCAL time zone, matching
+/// upstream system-prompt.ts which builds the date metadata from
+/// `new Date().getFullYear()/getMonth()/getDate()` (all local-time accessors).
+///
+/// The local UTC offset is read from the OS time-zone database via std.Tz
+/// (/etc/localtime, or the file named by $TZ). If that lookup fails for any
+/// reason — no TZ database, parse error, allocation failure — this falls back
+/// to UTC (the previous pi-zig behavior), so the build/runtime is never
+/// destabilized by environments without a usable tz file. The `--date` override
+/// path (handled by the caller) still takes precedence over this entirely.
+pub fn currentLocalDate(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, buf: []u8) ![]const u8 {
+    const timestamp = std.Io.Clock.real.now(io).toSeconds();
+    const offset = localUtcOffsetSeconds(io, allocator, env, timestamp) orelse 0;
+    // Apply the offset to the UTC epoch seconds, then render the resulting
+    // local wall-clock Y/M/D (same conversion JS performs for getFullYear/etc).
+    const local = timestamp + offset;
+    return renderDateFromSeconds(local, buf);
+}
+
+fn renderDateFromSeconds(timestamp: i64, buf: []u8) ![]const u8 {
     const secs: u64 = if (timestamp < 0) 0 else @intCast(timestamp);
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
@@ -524,6 +547,47 @@ pub fn currentUtcDate(io: std.Io, buf: []u8) ![]const u8 {
         @as(u8, month_day.day_index) + 1,
     });
     return writer.buffered();
+}
+
+/// Resolve the local UTC offset (in seconds) effective at `now_utc_secs` from
+/// the OS time-zone database. Returns null if no usable tz file is found or it
+/// cannot be parsed, in which case callers treat the offset as 0 (UTC).
+fn localUtcOffsetSeconds(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, now_utc_secs: i64) ?i32 {
+    const tz_path = localTimezonePath(env);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, tz_path, allocator, .limited(64 * 1024)) catch return null;
+    defer allocator.free(bytes);
+
+    var reader = std.Io.Reader.fixed(bytes);
+    var tz = std.Tz.parse(allocator, &reader) catch return null;
+    defer tz.deinit();
+    if (tz.timetypes.len == 0) return null;
+
+    // Transitions are in ascending timestamp order (RFC 8536). The active
+    // offset is the timetype of the last transition whose ts <= now; before the
+    // first transition, fall back to the first timetype.
+    var offset: i32 = tz.timetypes[0].offset;
+    for (tz.transitions) |transition| {
+        if (transition.ts <= now_utc_secs) {
+            offset = transition.timetype.offset;
+        } else {
+            break;
+        }
+    }
+    return offset;
+}
+
+/// The OS local time-zone file: honor $TZ when it points at a tz file
+/// (optionally with the conventional leading ':'), otherwise /etc/localtime.
+/// A bare $TZ like "UTC" with no path separator is ignored (no file to read);
+/// the UTC fallback then applies, which is the correct result for "UTC" anyway.
+fn localTimezonePath(env: *const std.process.Environ.Map) []const u8 {
+    if (env.get("TZ")) |tz| {
+        const value = if (tz.len > 0 and tz[0] == ':') tz[1..] else tz;
+        if (std.mem.indexOfScalar(u8, value, '/') != null) {
+            return value;
+        }
+    }
+    return "/etc/localtime";
 }
 
 fn currentPathOwned(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
@@ -667,4 +731,135 @@ test "system prompt builder deduplicates guidelines" {
     });
     defer std.testing.allocator.free(prompt);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, prompt, "- Use dynamic_tool for summaries."));
+}
+
+test "system prompt orders project context, skills, then date/cwd and filters hidden skills" {
+    const files = [_]context_files.TextFile{.{
+        .path = @constCast("/repo/AGENTS.md"),
+        .content = @constCast("Project rules."),
+        .scope = "project",
+    }};
+    const skills = [_]Skill{
+        .{ .name = "visible-skill", .description = "shown skill", .file_path = "/repo/.pi/skills/v/SKILL.md" },
+        .{ .name = "hidden-skill", .description = "auto-only", .file_path = "/repo/.pi/skills/h/SKILL.md", .disable_model_invocation = true },
+    };
+    const prompt = try build(std.testing.allocator, .{
+        .selected_tools = &.{"read"},
+        .cwd = "/repo",
+        .package_dir = "/pi",
+        .date = "2026-05-26",
+        .context_files = &files,
+        .skills = &skills,
+    });
+    defer std.testing.allocator.free(prompt);
+
+    const ctx_at = std.mem.indexOf(u8, prompt, "<project_context>").?;
+    const skills_at = std.mem.indexOf(u8, prompt, "<available_skills>").?;
+    const date_at = std.mem.indexOf(u8, prompt, "Current date: 2026-05-26").?;
+    // Ordering: project context -> skills -> date/cwd (matches buildSystemPrompt).
+    try std.testing.expect(ctx_at < skills_at);
+    try std.testing.expect(skills_at < date_at);
+    // disable_model_invocation skills are excluded from the prompt.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "visible-skill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "hidden-skill") == null);
+    // Skills only render when the read tool is selected: without it, omitted.
+    const no_read = try build(std.testing.allocator, .{
+        .selected_tools = &.{"bash"},
+        .cwd = "/repo",
+        .package_dir = "/pi",
+        .date = "2026-05-26",
+        .skills = &skills,
+    });
+    defer std.testing.allocator.free(no_read);
+    try std.testing.expect(std.mem.indexOf(u8, no_read, "<available_skills>") == null);
+}
+
+test "renderDateFromSeconds renders UTC wall clock and offset application rolls the day" {
+    // 2026-05-28 23:30:00 UTC.
+    const base: i64 = 1780011000;
+    var buf: [10]u8 = undefined;
+    try std.testing.expectEqualStrings("2026-05-28", try renderDateFromSeconds(base, &buf));
+
+    // A +07:00 local offset (Asia/Ho_Chi_Minh) pushes 23:30Z to 06:30 the next
+    // local day, exactly as upstream new Date().getDate() would report locally.
+    const local = base + 7 * 3600;
+    try std.testing.expectEqualStrings("2026-05-29", try renderDateFromSeconds(local, &buf));
+
+    // Negative timestamps clamp to the epoch (defensive, matches prior behavior).
+    try std.testing.expectEqualStrings("1970-01-01", try renderDateFromSeconds(-1, &buf));
+}
+
+// Build a minimal valid TZif v1 with a single fixed UTC offset (no transitions),
+// so std.Tz.parse yields exactly that offset for any timestamp.
+fn writeFixedOffsetTzif(io: std.Io, path: []const u8, offset_seconds: i32) !void {
+    var bytes: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&bytes);
+    try w.writeAll("TZif");
+    try w.writeByte(0); // version 0 (legacy)
+    try w.splatByteAll(0, 15); // reserved
+    // counts: isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
+    try w.writeInt(u32, 0, .big);
+    try w.writeInt(u32, 0, .big);
+    try w.writeInt(u32, 0, .big);
+    try w.writeInt(u32, 0, .big); // timecnt = 0
+    try w.writeInt(u32, 1, .big); // typecnt = 1
+    try w.writeInt(u32, 1, .big); // charcnt = 1
+    // one timetype: utoff (i32) + isdst (u8) + desigidx (u8)
+    try w.writeInt(i32, offset_seconds, .big);
+    try w.writeByte(0);
+    try w.writeByte(0);
+    // designations: one NUL byte
+    try w.writeByte(0);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.buffered() });
+}
+
+test "currentLocalDate resolves the local offset from a TZ-pointed tz file" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const dir = "zig-out/pi-zig-localdate-tz";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+
+    const tz_file = dir ++ "/Fixed+14";
+    // +14:00 is the largest real offset (Pacific/Kiritimati); it maximizes the
+    // chance the local date differs from UTC near a day boundary.
+    try writeFixedOffsetTzif(io, tz_file, 14 * 3600);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("TZ", tz_file);
+
+    // The offset helper must read the TZ-pointed file and return +14h.
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    try std.testing.expectEqual(@as(?i32, 14 * 3600), localUtcOffsetSeconds(io, allocator, &env, now));
+
+    // currentLocalDate must equal renderDateFromSeconds(now + offset): i.e. the
+    // local wall-clock date, which is what upstream's new Date() local accessors
+    // produce.
+    var local_buf: [10]u8 = undefined;
+    var expected_buf: [10]u8 = undefined;
+    const got = try currentLocalDate(io, allocator, &env, &local_buf);
+    const expected = try renderDateFromSeconds(now + 14 * 3600, &expected_buf);
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "currentLocalDate falls back to UTC when no usable tz file exists" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    // A bare zone name with no path separator is ignored; if /etc/localtime is
+    // also absent the offset is 0 and the date equals the UTC date. We assert
+    // the offset helper degrades to null for a non-file TZ value.
+    try env.put("TZ", "Bogus/With/Slashes/but-missing-file");
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    try std.testing.expectEqual(@as(?i32, null), localUtcOffsetSeconds(io, allocator, &env, now));
+
+    // currentLocalDate still succeeds (UTC fallback) and never errors.
+    var buf: [10]u8 = undefined;
+    const date = try currentLocalDate(io, allocator, &env, &buf);
+    try std.testing.expectEqual(@as(usize, 10), date.len);
 }

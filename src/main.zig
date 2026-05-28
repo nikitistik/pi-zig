@@ -101,8 +101,26 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "rpc")) {
         const session_file = if (args.len >= 3) args[2] else pi.session.default_session_file;
+        // Parse flags AFTER the positional session-file so the packaged manifest's
+        // ["bin/pi-zig","rpc","<session>",...flags] launch threads --extension /
+        // --no-extensions / --extension-flag / --tools / --no-tools / --no-builtin-tools
+        // through to the RPC runtime exactly like the canonical `--mode rpc --session`
+        // form does. Without this, extensions silently never loaded under the
+        // packaged Prin7r launch shape (release/prin7r-app.manifest.json).
+        const flag_args = if (args.len >= 4) args[3..] else args[0..0];
+        const parsed = pi.cli.parse(flag_args);
+        var runtime_extensions = try pi.extensions.discoverRuntimePaths(init.io, init.gpa, init.environ_map, .{
+            .no_extensions = parsed.no_extensions,
+            .explicit_paths = parsed.extensions[0..parsed.extensions_len],
+        });
+        defer runtime_extensions.deinit(init.gpa);
+        var command_options = commandOptionsFromInit(init);
+        command_options.extension_paths = runtime_extensions.paths;
         return pi.rpc.run(init.io, init.gpa, init.environ_map, session_file, .{
-            .command_options = commandOptionsFromInit(init),
+            .command_options = command_options,
+            .extension_paths = runtime_extensions.paths,
+            .custom_tools_enabled = !parsed.no_tools,
+            .tool_allowlist = parsed.tools,
         });
     }
 
