@@ -1,0 +1,1962 @@
+{
+  "generatedAt": "2026-05-28T11:04:58.008Z",
+  "project": "pi-zig",
+  "projectPath": "/Users/keer/projects/pi-zig",
+  "nullticketsApi": "http://127.0.0.1:7700",
+  "pipelineId": "c0beb29a-12f2-4df2-8b2f-7882d6fc9182",
+  "pipelineName": "pi-zig-parity",
+  "pipelineDefinition": {
+    "initial": "backlog",
+    "states": {
+      "backlog": {
+        "agent_role": "pi-zig-parity-worker",
+        "description": "Ready to be claimed."
+      },
+      "in_progress": {
+        "agent_role": "pi-zig-parity-worker",
+        "description": "Active implementation."
+      },
+      "review": {
+        "agent_role": "pi-zig-parity-reviewer",
+        "description": "Awaiting verification."
+      },
+      "blocked": {
+        "agent_role": "pi-zig-parity-worker",
+        "description": "Waiting on a dependency or external input."
+      },
+      "done": {
+        "terminal": true,
+        "description": "Implemented + tested + verified vs upstream."
+      },
+      "cancelled": {
+        "terminal": true,
+        "description": "Out of scope or superseded."
+      }
+    },
+    "transitions": [
+      {
+        "from": "backlog",
+        "to": "in_progress",
+        "trigger": "start"
+      },
+      {
+        "from": "in_progress",
+        "to": "review",
+        "trigger": "submit"
+      },
+      {
+        "from": "review",
+        "to": "done",
+        "trigger": "approve"
+      },
+      {
+        "from": "review",
+        "to": "in_progress",
+        "trigger": "changes_requested"
+      },
+      {
+        "from": "in_progress",
+        "to": "blocked",
+        "trigger": "block"
+      },
+      {
+        "from": "blocked",
+        "to": "in_progress",
+        "trigger": "unblock"
+      },
+      {
+        "from": "backlog",
+        "to": "cancelled",
+        "trigger": "cancel"
+      },
+      {
+        "from": "in_progress",
+        "to": "cancelled",
+        "trigger": "cancel"
+      },
+      {
+        "from": "review",
+        "to": "cancelled",
+        "trigger": "cancel"
+      },
+      {
+        "from": "blocked",
+        "to": "cancelled",
+        "trigger": "cancel"
+      }
+    ]
+  },
+  "epics": [
+    {
+      "code": "A",
+      "title": "A — Agent-session runtime",
+      "taskId": "c0a49cb6-1b68-4688-8428-88a3cdde78c0",
+      "sliceParity": "25-30%",
+      "gapReport": "docs/research/gap-01-agent-session.md"
+    },
+    {
+      "code": "B",
+      "title": "B — Auth / HTTP / Settings",
+      "taskId": "ab66abfd-92d0-4fb5-af00-3b8a78460a77",
+      "sliceParity": "45%",
+      "gapReport": "docs/research/gap-02-auth-http-settings.md"
+    },
+    {
+      "code": "C",
+      "title": "C — Messages / Compaction",
+      "taskId": "03b72578-e035-4d92-bcc8-1a4b7f8dd438",
+      "sliceParity": "47%",
+      "gapReport": "docs/research/gap-03-messages-compaction.md"
+    },
+    {
+      "code": "D",
+      "title": "D — Modes / CLI / Main",
+      "taskId": "90ff8564-3ab0-44b1-9123-9961624d4237",
+      "sliceParity": "63%",
+      "gapReport": "docs/research/gap-05-modes-cli-main.md"
+    },
+    {
+      "code": "E",
+      "title": "E — Interactive TUI",
+      "taskId": "cdbe88c7-b07d-4c97-ade7-29998ffe95ab",
+      "sliceParity": "10%",
+      "gapReport": "docs/research/gap-06-interactive-tui.md"
+    },
+    {
+      "code": "F",
+      "title": "F — Agent package library",
+      "taskId": "40aa728d-a5d8-4f01-8644-3e3ec2efa4d0",
+      "sliceParity": "55%",
+      "gapReport": "docs/research/gap-07-agent-package.md"
+    },
+    {
+      "code": "G",
+      "title": "G — AI providers",
+      "taskId": "8d191eee-9f69-41c5-adcd-0e723d432b68",
+      "sliceParity": "40-50%",
+      "gapReport": "docs/research/gap-08-ai-providers.md"
+    },
+    {
+      "code": "H",
+      "title": "H — AI core",
+      "taskId": "48103b91-e3e4-4b11-925e-fb18ef1ff7af",
+      "sliceParity": "43%",
+      "gapReport": "docs/research/gap-09-ai-core.md"
+    },
+    {
+      "code": "I",
+      "title": "I — Tools / Extensions / Resources",
+      "taskId": "c6e56e34-752d-41b7-a331-07e20d8f0f3d",
+      "sliceParity": "47%",
+      "gapReport": "docs/research/gap-04-tools-extensions-resources.md"
+    },
+    {
+      "code": "J",
+      "title": "J — TUI primitives",
+      "taskId": "47f9465b-1e69-40a0-803a-df71b0f4fc05",
+      "sliceParity": "20%",
+      "gapReport": "docs/research/gap-10-tui-primitives.md"
+    }
+  ],
+  "subtasks": [
+    {
+      "code": "A1",
+      "epic": "A",
+      "taskId": "8a4a7099-dd1d-45a3-9cc2-45ff1cd68b74",
+      "title": "Port event-bus.ts → event_bus.zig",
+      "context": "Upstream packages/coding-agent/src/core/event-bus.ts (33 LoC) provides a typed pub/sub bus used by every emitted lifecycle event. pi-zig has NO equivalent module.",
+      "definitionOfDone": "New src/pi/event_bus.zig with subscribe/publish + per-event handler lists; unit tests cover ordering, multiple subscribers, removal mid-dispatch; wired into agent.zig + rpc.zig.",
+      "requirements": [
+        "No stubs",
+        "Type-safe per-event payload",
+        "Re-entrant dispatch supported",
+        "Zig 0.16 idioms"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/event-bus.ts:1-33",
+      "pizigTarget": "NEW src/pi/event_bus.zig",
+      "complexity": "Low",
+      "priority": 90
+    },
+    {
+      "code": "A2",
+      "epic": "A",
+      "taskId": "fdf93be5-8609-4a1c-83fb-5a95573a588f",
+      "title": "Port telemetry.ts → telemetry.zig",
+      "context": "Upstream telemetry.ts (13 LoC) exports a minimal telemetry sink interface that other modules call. pi-zig has no equivalent.",
+      "definitionOfDone": "src/pi/telemetry.zig with structured event emission; optional OTLP forwarding path stubbed cleanly (skip without endpoint); unit tests.",
+      "requirements": [
+        "Honest skip when no endpoint",
+        "No PII"
+      ],
+      "dependencies": [
+        "A1"
+      ],
+      "upstream": "packages/coding-agent/src/core/telemetry.ts:1-13",
+      "pizigTarget": "NEW src/pi/telemetry.zig",
+      "complexity": "Low",
+      "priority": 60
+    },
+    {
+      "code": "A3",
+      "epic": "A",
+      "taskId": "4c2eabf9-c980-46d8-aa6d-eef7211f070f",
+      "title": "Port timings.ts → timings.zig",
+      "context": "Upstream timings.ts (31 LoC) records spans + durations for prompt/turn/tool execution. pi-zig has no equivalent.",
+      "definitionOfDone": "src/pi/timings.zig with start/stop span API; emitted into event_bus; unit tests cover nested spans.",
+      "requirements": [
+        "Monotonic clock",
+        "Nested span support"
+      ],
+      "dependencies": [
+        "A1"
+      ],
+      "upstream": "packages/coding-agent/src/core/timings.ts:1-31",
+      "pizigTarget": "NEW src/pi/timings.zig",
+      "complexity": "Low",
+      "priority": 60
+    },
+    {
+      "code": "A4",
+      "epic": "A",
+      "taskId": "27eae147-1a17-44d1-bd26-7cc661fd3aab",
+      "title": "Port exec.ts → exec.zig",
+      "context": "Upstream exec.ts (107 LoC) is the cross-platform process exec helper used by tools and the agent harness. pi-zig calls std.process.run directly in scattered sites.",
+      "definitionOfDone": "src/pi/exec.zig with consolidated exec API (env, cwd, stdin, timeout, signal); callers refactored where it removes duplication.",
+      "requirements": [
+        "Cooperative cancellation",
+        "stdout+stderr capture"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/exec.ts:1-107",
+      "pizigTarget": "NEW src/pi/exec.zig",
+      "complexity": "Medium",
+      "priority": 70
+    },
+    {
+      "code": "A5",
+      "epic": "A",
+      "taskId": "0ad4d87b-b42a-42ba-9a00-1004c3cdf9df",
+      "title": "Full FooterDataProvider (watcher + worktrees + reftable + extension statuses + provider badge)",
+      "context": "Upstream footer-data-provider.ts (354 LoC) feeds the live footer: git branch with reftable + worktree awareness, watched extension health badges, provider/model + thinking-level + token usage + cost. pi-zig's current `resolveGitBranch` (tui.zig) is a one-shot stub that runs `git symbolic-ref` once.",
+      "definitionOfDone": "src/pi/footer_data.zig that exposes a FooterData struct mirroring upstream's fields; fs.watch on .git/HEAD + worktrees + extension manifests; subscriber API for tui_footer.zig; unit tests + smoke driving a real worktree switch.",
+      "requirements": [
+        "fs.watch / poll fallback",
+        "Reactive update",
+        "Per-token costs from Usage"
+      ],
+      "dependencies": [
+        "A1",
+        "H1"
+      ],
+      "upstream": "packages/coding-agent/src/core/footer-data-provider.ts:1-354",
+      "pizigTarget": "NEW src/pi/footer_data.zig",
+      "complexity": "High",
+      "priority": 80
+    },
+    {
+      "code": "A6",
+      "epic": "A",
+      "taskId": "03f97f98-6669-49db-9d0b-408af141f8fb",
+      "title": "Wire all missing AgentSessionEvent dispatches",
+      "context": "Upstream emits 29+ AgentSessionEvents; pi-zig advertises them in upstream.zig but DOES NOT actually dispatch ~17 of them (session_before_compact, session_compact, session_before_tree, session_tree, session_before_fork, session_before_switch, queue_update, compaction_start/end, session_info_changed, thinking_level_changed, model_select, thinking_level_select, message_update, tool_execution_*, before_agent_start, resources_discover, context, input).",
+      "definitionOfDone": "Each missing event has a concrete dispatch site in rpc.zig/agent.zig with the upstream payload shape; extensions receive them via the existing FLOW_J seam; per-event smoke proves the extension handler observes the event.",
+      "requirements": [
+        "No fire-and-forget where upstream chains values (must honor returned transforms)",
+        "Test each event independently"
+      ],
+      "dependencies": [
+        "A1",
+        "I3"
+      ],
+      "upstream": "packages/coding-agent/src/core/agent-session.ts (event emit sites)",
+      "pizigTarget": "src/pi/rpc.zig + src/pi/agent.zig FLOW_J regions",
+      "complexity": "High",
+      "priority": 95
+    },
+    {
+      "code": "A7",
+      "epic": "A",
+      "taskId": "b3c5bdc9-567f-4516-a926-1a62d513cf6b",
+      "title": "importFromJsonl / exportToJsonl / reload",
+      "context": "Upstream session-manager exposes importFromJsonl, exportToJsonl, reload(); none exist in pi-zig.",
+      "definitionOfDone": "src/pi/session.zig gains the three functions with byte-exact JSONL round-trip; unit tests cover empty/malformed/header-only sessions.",
+      "requirements": [
+        "Round-trip equality",
+        "Atomic file replace"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/session-manager.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Medium",
+      "priority": 70
+    },
+    {
+      "code": "A8",
+      "epic": "A",
+      "taskId": "b6955f80-2570-49d0-9ece-dfdd2b6da907",
+      "title": "createAgentSessionServices / FromServices / Runtime factory pattern",
+      "context": "Upstream uses a 3-layer factory: createAgentSessionServices (wire services), createAgentSessionFromServices (compose), createAgentSessionRuntime (drive). pi-zig builds Runtime once at process start; cannot tear down and rebuild mid-process.",
+      "definitionOfDone": "Refactor agent.zig + rpc.zig so a Runtime can be (re)constructed from a Services struct; in-process swap supported; unit test exercises two sequential lifetimes.",
+      "requirements": [
+        "No leaks on swap",
+        "Outstanding work cancelled cleanly"
+      ],
+      "dependencies": [
+        "A1"
+      ],
+      "upstream": "packages/coding-agent/src/core/agent-session-services.ts + agent-session-runtime.ts",
+      "pizigTarget": "src/pi/agent.zig + src/pi/rpc.zig",
+      "complexity": "High",
+      "priority": 50
+    },
+    {
+      "code": "A9",
+      "epic": "A",
+      "taskId": "f016c696-3c4f-4c0c-8742-c4854adef97d",
+      "title": "getAttributionHeaders (OpenRouter / Cloudflare / opencode)",
+      "context": "Upstream attaches HTTP attribution headers (HTTP-Referer, X-Title, opencode session id) on provider requests. pi-zig sends none.",
+      "definitionOfDone": "ai_client.zig adds attribution-header construction gated by provider id; smoke asserts headers on outgoing requests.",
+      "requirements": [
+        "No PII",
+        "Per-provider exact header names"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/providers/* (search getAttributionHeaders)",
+      "pizigTarget": "src/pi/ai_client.zig",
+      "complexity": "Low",
+      "priority": 60
+    },
+    {
+      "code": "A10",
+      "epic": "A",
+      "taskId": "537a0900-9baa-49e1-870b-5bfb1c5af83a",
+      "title": "excludeFromContext (!! prefix), scoped-models cycling, setRebindSession, withSession, nextTurn custom messages, before_agent_start system-prompt override, dynamic image filtering",
+      "context": "Cluster of session-control features missing entirely. excludeFromContext lets a user message with `!!` prefix run a bash without entering the LLM context; scoped-models cycles a curated subset; setRebindSession swaps the bound session; withSession() wraps a callback in a session; before_agent_start hook can replace the system prompt per turn; blockImages dynamically strips images from outgoing messages.",
+      "definitionOfDone": "Each sub-feature has a code path + unit test + integration smoke; documented in docs/parity.md per-feature row.",
+      "requirements": [
+        "No silent failures",
+        "Per-feature smoke against fake provider"
+      ],
+      "dependencies": [
+        "A6"
+      ],
+      "upstream": "packages/coding-agent/src/core/agent-session.ts",
+      "pizigTarget": "src/pi/rpc.zig + src/pi/agent.zig",
+      "complexity": "High",
+      "priority": 70
+    },
+    {
+      "code": "B1",
+      "epic": "B",
+      "taskId": "902433ab-d7cd-4fbc-9ca0-b230d2f4736a",
+      "title": "AuthStorage class abstraction + runtime --api-key override + models.json fallback",
+      "context": "Upstream AuthStorage class exposes get/set/list with runtime --api-key override and models.json fallback for custom providers. pi-zig's auth.zig has flat function helpers and only 3 of 6 upstream source arms in status output; no runtime --api-key override.",
+      "definitionOfDone": "src/pi/auth_storage.zig with full AuthStorage API + `--api-key` override + models.json fallback resolver; status output covers all 6 source arms; unit tests for each source.",
+      "requirements": [
+        "Thread-safe",
+        "No secrets in logs"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/auth-storage.ts",
+      "pizigTarget": "NEW src/pi/auth_storage.zig",
+      "complexity": "High",
+      "priority": 85
+    },
+    {
+      "code": "B2",
+      "epic": "B",
+      "taskId": "d655c2df-3754-4121-b732-054f1b7bccd0",
+      "title": "Interactive OAuth login: PKCE + device-code + local callback HTTP server",
+      "context": "pi-zig's interactive login (auth.zig:1431-1447) always returns InteractiveLoginUnavailable. Upstream supports PKCE for Anthropic, device-code for OpenAI Codex + GitHub Copilot, local callback HTTP server, manual-paste fallback.",
+      "definitionOfDone": "src/pi/auth_login.zig with PKCE generator, callback server, device-code polling for each of the 3 OAuth providers; live-cred opt-in smokes (skip cleanly without creds); never print secrets.",
+      "requirements": [
+        "No secrets logged",
+        "Browser open via std.process"
+      ],
+      "dependencies": [
+        "B1"
+      ],
+      "upstream": "packages/ai/src/utils/oauth/* + packages/coding-agent/src/core/auth-guidance.ts",
+      "pizigTarget": "NEW src/pi/auth_login.zig",
+      "complexity": "High",
+      "priority": 80
+    },
+    {
+      "code": "B3",
+      "epic": "B",
+      "taskId": "25c267fe-60d7-4e34-b90d-0c9708fe124a",
+      "title": "Cross-process file lock for auth.json + chmod 0o600",
+      "context": "Concurrent pi-zig instances can clobber freshly minted OAuth tokens. Upstream uses flock. pi-zig has none. File mode is default (group-readable on most setups).",
+      "definitionOfDone": "auth.json reads/writes wrapped in OS-appropriate advisory lock; chmod 0o600 on write; unit test triggers two concurrent writes and verifies last-writer-wins atomic.",
+      "requirements": [
+        "Lock timeout configurable",
+        "macOS + Linux"
+      ],
+      "dependencies": [
+        "B1"
+      ],
+      "upstream": "packages/coding-agent/src/core/auth-storage.ts (writeAuthStorage)",
+      "pizigTarget": "src/pi/auth.zig",
+      "complexity": "Medium",
+      "priority": 90
+    },
+    {
+      "code": "B4",
+      "epic": "B",
+      "taskId": "889f6add-db3f-49a2-bd3c-af6bdf96cca8",
+      "title": "configureHttpDispatcher with runtime httpIdleTimeoutMs effect",
+      "context": "pi-zig parses httpIdleTimeoutMs from settings and shows it but it has ZERO runtime effect on actual HTTP traffic. Upstream's http-dispatcher applies it.",
+      "definitionOfDone": "src/pi/http_dispatcher.zig that wraps std.http.Client with idle-timeout enforcement; setting changes propagate live; smoke proves a slow server times out at the configured value.",
+      "requirements": [
+        "Configurable per-request override",
+        "Honor \"disabled\" → 0"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/http-dispatcher.ts",
+      "pizigTarget": "NEW src/pi/http_dispatcher.zig",
+      "complexity": "Medium",
+      "priority": 75
+    },
+    {
+      "code": "B5",
+      "epic": "B",
+      "taskId": "a6fadefe-126b-4be1-9219-46d55fea7874",
+      "title": "session-cwd.ts: persist cwd into session header, missing-cwd check",
+      "context": "Upstream session-cwd.ts persists project cwd into the session JSONL header and exposes a missing-cwd check. pi-zig writes `\"cwd\":\".\"` (hardcoded) so the precondition is destroyed.",
+      "definitionOfDone": "Session header carries the real absolute cwd; missing-cwd check refuses to load when target cwd is gone; unit + smoke.",
+      "requirements": [
+        "Absolute path",
+        "Symlink-stable"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/session-cwd.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Low",
+      "priority": 80
+    },
+    {
+      "code": "B6",
+      "epic": "B",
+      "taskId": "bf72887e-79a1-447d-8967-a181323eabeb",
+      "title": "output-guard.ts: stdout takeover + ENOBUFS-retry backpressure pump",
+      "context": "Upstream output-guard.ts owns the stdout takeover for JSON/RPC modes and applies ENOBUFS-retry backpressure on writes. pi-zig has no such layer.",
+      "definitionOfDone": "src/pi/output_guard.zig with write pump + ENOBUFS retry + flush guarantees; rpc.zig and JSON mode routed through it; unit test with a fake non-blocking pipe.",
+      "requirements": [
+        "No write reordering",
+        "EOF safe"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/output-guard.ts",
+      "pizigTarget": "NEW src/pi/output_guard.zig",
+      "complexity": "Medium",
+      "priority": 75
+    },
+    {
+      "code": "B7",
+      "epic": "B",
+      "taskId": "61db1c6e-59a8-431c-813b-0d5a5a3c2f4c",
+      "title": "auth-guidance.ts: 4 shared formatter functions",
+      "context": "Upstream auth-guidance.ts exports 4 shared formatter functions used in CLI error messages. Absent in pi-zig.",
+      "definitionOfDone": "Helper functions ported with byte-exact strings; reused from auth + cli_runtime error paths; unit tests pin the exact strings.",
+      "requirements": [
+        "Byte-exact upstream strings"
+      ],
+      "dependencies": [
+        "B1"
+      ],
+      "upstream": "packages/coding-agent/src/core/auth-guidance.ts",
+      "pizigTarget": "src/pi/auth.zig",
+      "complexity": "Low",
+      "priority": 50
+    },
+    {
+      "code": "B8",
+      "epic": "B",
+      "taskId": "da78550e-6810-4bf1-9e03-47c19f8dec75",
+      "title": "diagnostics.ts schemas: ResourceCollision + ResourceDiagnostic",
+      "context": "Upstream diagnostics.ts defines two TypeBox schemas (ResourceCollision, ResourceDiagnostic) consumed by commands/themes. pi-zig emits a similar JSON but has no type/schema.",
+      "definitionOfDone": "src/pi/diagnostics.zig with the two structs + JSON serialization; commands.zig and themes.zig use them.",
+      "requirements": [
+        "Schema matches upstream field names"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/diagnostics.ts",
+      "pizigTarget": "NEW src/pi/diagnostics.zig",
+      "complexity": "Low",
+      "priority": 60
+    },
+    {
+      "code": "B9",
+      "epic": "B",
+      "taskId": "0caf7cef-efd5-4a30-8d0e-3dd2e2cce89b",
+      "title": "resolveConfigValue cache + resolveHeaders helper",
+      "context": "Upstream caches `!cmd` shell-resolved values; pi-zig re-runs the shell exec on every call. Upstream has a separate resolveHeaders that expands `!cmd` per-header.",
+      "definitionOfDone": "auth.zig adds a cache (TTL configurable) + resolveHeaders helper; unit test ensures cache hit on repeated read.",
+      "requirements": [
+        "TTL semantics",
+        "No stale tokens"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/resolve-config-value.ts",
+      "pizigTarget": "src/pi/auth.zig",
+      "complexity": "Low",
+      "priority": 55
+    },
+    {
+      "code": "B10",
+      "epic": "B",
+      "taskId": "ac483e5c-92de-44a4-89f4-7b6e8f91c33f",
+      "title": "Settings write-path per-field validation + clamping",
+      "context": "Settings READ-path validates but WRITE-path doesn't. Bad values land in settings.json silently.",
+      "definitionOfDone": "Each write path validates + clamps per upstream rules; bad input rejected with diagnostic; unit tests per field.",
+      "requirements": [
+        "Match upstream error strings"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/settings-manager.ts",
+      "pizigTarget": "src/pi/settings.zig",
+      "complexity": "Medium",
+      "priority": 50
+    },
+    {
+      "code": "C1",
+      "epic": "C",
+      "taskId": "1e02e47a-d627-48c1-a033-b097eab9a02d",
+      "title": "Compaction: findCutPoint + keepRecentTokens + split-turn",
+      "context": "Upstream compaction preserves a \"recent window\" and can split a turn boundary. pi-zig compacts the entire ring (no recent window) and never splits a turn.",
+      "definitionOfDone": "src/pi/compaction.zig with findCutPoint / keepRecentTokens / split-turn helpers; rpc.zig FLOW_E uses them; unit tests cover token-budget edge cases.",
+      "requirements": [
+        "Match upstream cut semantics byte-for-byte",
+        "Token budget from Usage"
+      ],
+      "dependencies": [
+        "H1",
+        "C3"
+      ],
+      "upstream": "packages/coding-agent/src/core/compaction/",
+      "pizigTarget": "NEW src/pi/compaction.zig",
+      "complexity": "High",
+      "priority": 85
+    },
+    {
+      "code": "C2",
+      "epic": "C",
+      "taskId": "67268a18-8cdc-4dae-a2fa-59beaf1a6463",
+      "title": "UPDATE_SUMMARIZATION_PROMPT + TURN_PREFIX_SUMMARIZATION_PROMPT",
+      "context": "Two summarization prompt constants used when re-summarizing on top of an existing compaction or prefixing a turn. Absent in pi-zig.",
+      "definitionOfDone": "Constants ported byte-exact; used by FLOW_E compaction code path.",
+      "requirements": [
+        "Byte-exact"
+      ],
+      "dependencies": [
+        "C1"
+      ],
+      "upstream": "packages/coding-agent/src/core/compaction/",
+      "pizigTarget": "src/pi/rpc.zig FLOW_E",
+      "complexity": "Low",
+      "priority": 70
+    },
+    {
+      "code": "C3",
+      "epic": "C",
+      "taskId": "5592cbea-b9eb-4a80-b8aa-0304bddcfb44",
+      "title": "estimateContextTokens from Usage",
+      "context": "pi-zig estimates tokens by chars/4. Upstream uses provider-reported Usage. Requires Usage in ChatCompletionResult.",
+      "definitionOfDone": "ChatCompletionResult carries Usage; compaction trigger reads it; unit tests check overflow trigger fires when usage exceeds budget.",
+      "requirements": [
+        "Per-provider usage parse"
+      ],
+      "dependencies": [
+        "H1"
+      ],
+      "upstream": "packages/coding-agent/src/core/compaction/",
+      "pizigTarget": "src/pi/ai_client.zig + src/pi/rpc.zig",
+      "complexity": "Medium",
+      "priority": 80
+    },
+    {
+      "code": "C4",
+      "epic": "C",
+      "taskId": "ad9dd14a-4d4b-482a-8ee9-1ab0e68bd2a3",
+      "title": "Fix firstKeptEntryId semantic (currently OPPOSITE of upstream)",
+      "context": "pi-zig sets firstKeptEntryId = messages[0].entryId() — the FIRST message. Upstream sets it to the first KEPT message after compaction (typically the last one before the cut). Reload misbehaves.",
+      "definitionOfDone": "Semantic corrected; reload tests pass; round-trip exercises pre/post-compaction state.",
+      "requirements": [
+        "Reload-stable"
+      ],
+      "dependencies": [
+        "C1"
+      ],
+      "upstream": "packages/coding-agent/src/core/compaction/",
+      "pizigTarget": "src/pi/rpc.zig FLOW_E",
+      "complexity": "Low",
+      "priority": 95
+    },
+    {
+      "code": "C5",
+      "epic": "C",
+      "taskId": "b4814613-d2f6-4e2e-89ac-eca87b9b1032",
+      "title": "parseStoredRole / loadSessionEntries: recognize branchSummary",
+      "context": "Upstream stores branch_summary as a role-tagged entry; on reload pi-zig's parseStoredRole DOES NOT recognize the branchSummary role, so branch_summary entries don't re-inject into in-memory context.",
+      "definitionOfDone": "parseStoredRole supports branchSummary; loadSessionEntries loads them; re-injects on reload; round-trip test.",
+      "requirements": [
+        "Round-trip stable"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/messages.ts",
+      "pizigTarget": "src/pi/rpc.zig",
+      "complexity": "Low",
+      "priority": 85
+    },
+    {
+      "code": "C6",
+      "epic": "C",
+      "taskId": "9884bb28-0bfb-4b43-a5b1-719886e0533e",
+      "title": "BRANCH_SUMMARY_PREFIX/SUFFIX constants + BranchSummaryDetails {readFiles, modifiedFiles, replaceInstructions, BRANCH_SUMMARY_PREAMBLE}",
+      "context": "Upstream wraps branch_summary entries in PREFIX/SUFFIX and carries file-ops details. Absent in pi-zig.",
+      "definitionOfDone": "Constants + struct ported; FLOW_G writes them; unit tests assert the on-disk JSONL shape.",
+      "requirements": [
+        "Byte-exact"
+      ],
+      "dependencies": [
+        "C5"
+      ],
+      "upstream": "packages/coding-agent/src/core/messages.ts + compaction/",
+      "pizigTarget": "src/pi/rpc.zig FLOW_G",
+      "complexity": "Medium",
+      "priority": 75
+    },
+    {
+      "code": "C7",
+      "epic": "C",
+      "taskId": "12667612-6d00-4ea7-b1cb-8662f443d4c8",
+      "title": "Wire remaining 9 of 21 builtin slash commands",
+      "context": "tui.zig:runCommand reports \"recognized but not yet wired\" for ~9 of 21 slash commands. The user demanded no stubs.",
+      "definitionOfDone": "Each remaining command is fully implemented (real handler, not \"not yet wired\"); per-command App-level unit test; smoke proves CLI-observable behavior where applicable.",
+      "requirements": [
+        "No \"not yet wired\" lines remain in tui.zig"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/slash-commands.ts",
+      "pizigTarget": "src/pi/tui.zig + src/pi/cli_runtime.zig",
+      "complexity": "High",
+      "priority": 90
+    },
+    {
+      "code": "C8",
+      "epic": "C",
+      "taskId": "26ad110b-4f2f-4c3f-bacf-7cfdede560d9",
+      "title": "KeybindingsManager: 43 ids + keybindings.json loader + KEYBINDING_NAME_MIGRATIONS + Windows special cases",
+      "context": "pi-zig covers ~12 of 43 upstream AppKeybindings ids; no keybindings.json loader, no migrations, no Windows differences.",
+      "definitionOfDone": "src/pi/keybindings.zig (new) with full id list + JSON loader + migrations table + Windows variants; unit tests per id.",
+      "requirements": [
+        "Migration table byte-exact"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/keybindings.ts",
+      "pizigTarget": "NEW src/pi/keybindings.zig",
+      "complexity": "High",
+      "priority": 75
+    },
+    {
+      "code": "C9",
+      "epic": "C",
+      "taskId": "65617492-091b-47e4-81b7-075efc6bdcba",
+      "title": "SessionManager: list / listAll / inMemory / continueRecent / createBranchedSession",
+      "context": "Upstream surfaces 5 session-level operations missing in pi-zig.",
+      "definitionOfDone": "Each function ported; unit tests + smoke; CLI `--resume` picker (D6) consumes list output.",
+      "requirements": [
+        "mtime-sorted",
+        "Cross-cwd safe"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/session-manager.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Medium",
+      "priority": 80
+    },
+    {
+      "code": "C10",
+      "epic": "C",
+      "taskId": "1900231c-016a-4e11-acd4-58ff5fe26a69",
+      "title": "LabelEntry: appendLabelChange + getLabel",
+      "context": "Upstream session JSONL supports LabelEntry rows; pi-zig has no such entry type.",
+      "definitionOfDone": "session.zig writes/reads LabelEntry; appendLabelChange/getLabel; round-trip test.",
+      "requirements": [
+        "JSONL schema matches upstream"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/session-manager.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Low",
+      "priority": 50
+    },
+    {
+      "code": "C11",
+      "epic": "C",
+      "taskId": "bc33b53f-2f30-4297-9bab-e5ed0158102b",
+      "title": "Fix hardcoded session-header cwd=\".\" and timestamp=\"local-foundation\"",
+      "context": "session.zig:108 writes `\"cwd\":\".\"`; timestamp is a placeholder string. Upstream writes the real absolute cwd + ISO timestamp.",
+      "definitionOfDone": "Real cwd + ISO timestamp; backward-load is tolerant of legacy values; smoke verifies fresh session header.",
+      "requirements": [
+        "ISO 8601 timestamp",
+        "Absolute cwd"
+      ],
+      "dependencies": [
+        "B5"
+      ],
+      "upstream": "packages/coding-agent/src/core/session-manager.ts + session-cwd.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Low",
+      "priority": 75
+    },
+    {
+      "code": "C12",
+      "epic": "C",
+      "taskId": "c8a19689-d008-4b70-8cde-3a1f9b2bc63d",
+      "title": "Multi-version session loading (v1→v2, v2→v3 migrations)",
+      "context": "pi-zig rejects any session whose header is not version:3. Upstream migrates v1→v2 and v2→v3 on load.",
+      "definitionOfDone": "Migration functions ported; reload of legacy session works; round-trip test per migration.",
+      "requirements": [
+        "Lossless"
+      ],
+      "dependencies": [
+        "C11"
+      ],
+      "upstream": "packages/coding-agent/src/core/session-manager.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Medium",
+      "priority": 55
+    },
+    {
+      "code": "C13",
+      "epic": "C",
+      "taskId": "72bb7282-351e-4723-8aeb-049da439e261",
+      "title": "excludeFromContext (!! prefix) modeled in messages",
+      "context": "A user message starting with `!!` runs a bash but is NOT entered into the LLM context. Not modeled in pi-zig's messages.",
+      "definitionOfDone": "Message type carries excludeFromContext flag; provider history skips them; smoke shows the bash ran and the assistant didn't see the message.",
+      "requirements": [
+        "Flag persisted"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/messages.ts",
+      "pizigTarget": "src/pi/session.zig + src/pi/rpc.zig",
+      "complexity": "Medium",
+      "priority": 60
+    },
+    {
+      "code": "C14",
+      "epic": "C",
+      "taskId": "8afbffd8-39de-4f60-95dc-ceaa7e68c616",
+      "title": "CustomMessage.details + image-block content persisted",
+      "context": "CustomMessage.details (free-form JSON) and image-block content are NOT persisted by pi-zig's appendCustomMessage.",
+      "definitionOfDone": "JSONL carries details + image parts; reload restores them; unit test round-trip.",
+      "requirements": [
+        "Schema matches upstream"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/messages.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Low",
+      "priority": 55
+    },
+    {
+      "code": "C15",
+      "epic": "C",
+      "taskId": "7361375c-7005-45c8-9dc0-1e1c44ee8647",
+      "title": "Source-info: SourceScope / SourceOrigin / SourceInfo + createSourceInfo / createSyntheticSourceInfo",
+      "context": "Upstream models source-info as 3 typed scopes + factory functions. pi-zig only serializes JSON via writeSourceInfoWithOrigin; no types/factories.",
+      "definitionOfDone": "src/pi/source_info.zig with the 3 types + factory functions; commands.zig consumes them; unit tests.",
+      "requirements": [
+        "Type-safe"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/source-info.ts",
+      "pizigTarget": "NEW src/pi/source_info.zig",
+      "complexity": "Low",
+      "priority": 45
+    },
+    {
+      "code": "D1",
+      "epic": "D",
+      "taskId": "69c7ab02-b81c-4b0b-8ed0-fde5bf10bd2d",
+      "title": "Migrations: 5 missing (auth-to-json, sessions-from-agent-root, commands-to-prompts, tools-to-bin, keybindings-config-file)",
+      "context": "Upstream migrations.ts runs 5 one-shot migrations on first launch. pi-zig has 0% of this.",
+      "definitionOfDone": "src/pi/migrations.zig with all 5 migrations; idempotent; runs on cli_runtime entrypoint; unit tests verify each migration's before/after on a temp dir.",
+      "requirements": [
+        "Idempotent",
+        "Atomic"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/migrations.ts",
+      "pizigTarget": "NEW src/pi/migrations.zig",
+      "complexity": "Medium",
+      "priority": 75
+    },
+    {
+      "code": "D2",
+      "epic": "D",
+      "taskId": "34328cb2-1263-4504-9115-16ec02e89c59",
+      "title": "RpcClient programmatic API",
+      "context": "Upstream exports an RpcClient class for embedders (Node/TS callers). pi-zig has no equivalent — consumers must speak JSONL directly.",
+      "definitionOfDone": "src/pi/rpc_client.zig (Zig embedder API) + a frontend client wrapper if needed; smoke drives it.",
+      "requirements": [
+        "Type-safe wrappers per command"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/modes/rpc/rpc-client.ts",
+      "pizigTarget": "NEW src/pi/rpc_client.zig",
+      "complexity": "Medium",
+      "priority": 50
+    },
+    {
+      "code": "D3",
+      "epic": "D",
+      "taskId": "81d627ae-141f-40a6-89b3-9a3349703251",
+      "title": "utils/ closures: clipboard, image-resize, syntax-highlight, version-check, tools-manager, Windows self-update quarantine, changelog parser",
+      "context": "pi-zig's utils coverage is ~30%; 7 specific helpers missing.",
+      "definitionOfDone": "Each helper has a Zig port (or honest shell-out for image-resize); per-helper unit test.",
+      "requirements": [
+        "No PII",
+        "Cross-platform"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/utils/*",
+      "pizigTarget": "src/pi/cli_runtime.zig + new utils modules",
+      "complexity": "High",
+      "priority": 65
+    },
+    {
+      "code": "D4",
+      "epic": "D",
+      "taskId": "ede979cc-0d6a-450a-9409-886e34c1dbeb",
+      "title": "cli/ closures: selectConfig, selectSession, listModels text rendering, image-resize processFileArguments",
+      "context": "pi-zig's cli/ coverage is ~40%.",
+      "definitionOfDone": "Each function ported; smoke verifies CLI-observable text output.",
+      "requirements": [
+        "Byte-exact upstream output where applicable"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/cli/*",
+      "pizigTarget": "src/pi/cli.zig + src/pi/cli_runtime.zig",
+      "complexity": "Medium",
+      "priority": 60
+    },
+    {
+      "code": "D5",
+      "epic": "D",
+      "taskId": "291c2c0a-2e6a-4d2d-9d04-aa449858deca",
+      "title": "`pi config` TUI",
+      "context": "Upstream `pi config` opens a TUI for resource enable/disable. pi-zig has no such command.",
+      "definitionOfDone": "New subcommand `pi-zig config` opens a TUI dialog (via tui_selector) to toggle resources; persisted to settings.",
+      "requirements": [
+        "Live reflect to settings.json"
+      ],
+      "dependencies": [
+        "E1"
+      ],
+      "upstream": "packages/coding-agent/src/cli/config-selector.ts",
+      "pizigTarget": "src/pi/cli_runtime.zig + new tui module",
+      "complexity": "High",
+      "priority": 60
+    },
+    {
+      "code": "D6",
+      "epic": "D",
+      "taskId": "a2e8ea81-7e38-4745-afd8-0cd1ec77aa69",
+      "title": "`--resume` session picker UI",
+      "context": "pi-zig opens the newest session directly. Upstream offers a picker UI.",
+      "definitionOfDone": "TUI picker built on tui_selector; smoke drives selection by index.",
+      "requirements": [
+        "Sorted mtime",
+        "Cross-cwd"
+      ],
+      "dependencies": [
+        "E1",
+        "C9"
+      ],
+      "upstream": "packages/coding-agent/src/cli/session-selector",
+      "pizigTarget": "src/pi/cli_runtime.zig",
+      "complexity": "Medium",
+      "priority": 60
+    },
+    {
+      "code": "D7",
+      "epic": "D",
+      "taskId": "226ace2e-131f-48c5-bd8d-92ddf824e53a",
+      "title": "`--session` cross-project global prompt",
+      "context": "Upstream supports a cross-project session prompt. pi-zig is project-local.",
+      "definitionOfDone": "--session can target any cwd; safety: refuse if cwd missing; unit test.",
+      "requirements": [
+        "Refuse missing cwd"
+      ],
+      "dependencies": [
+        "B5"
+      ],
+      "upstream": "packages/coding-agent/src/cli/args.ts",
+      "pizigTarget": "src/pi/cli_runtime.zig",
+      "complexity": "Low",
+      "priority": 45
+    },
+    {
+      "code": "D8",
+      "epic": "D",
+      "taskId": "97751ad1-35b2-4300-ad19-dd834b1294e2",
+      "title": "`--api-key` without `--model` diagnostic",
+      "context": "Upstream emits a specific error when --api-key is supplied without --model. pi-zig silently ignores.",
+      "definitionOfDone": "Exact upstream diagnostic emitted; unit test pins the string.",
+      "requirements": [
+        "Byte-exact"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/cli/args.ts",
+      "pizigTarget": "src/pi/cli.zig",
+      "complexity": "Low",
+      "priority": 40
+    },
+    {
+      "code": "D9",
+      "epic": "D",
+      "taskId": "cf9ca2bf-b4d5-44db-a4bd-588daabf0a4f",
+      "title": "`queue_update` RPC event",
+      "context": "Upstream emits queue_update events whenever steering/follow-up queue changes. pi-zig requires clients to poll.",
+      "definitionOfDone": "rpc.zig emits queue_update on every change; smoke asserts events flow.",
+      "requirements": [
+        "Wire shape matches upstream"
+      ],
+      "dependencies": [
+        "A6"
+      ],
+      "upstream": "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+      "pizigTarget": "src/pi/rpc.zig",
+      "complexity": "Low",
+      "priority": 70
+    },
+    {
+      "code": "D10",
+      "epic": "D",
+      "taskId": "41d03dea-8dae-4140-8054-34666605f23c",
+      "title": "Multi-message print mode (loop)",
+      "context": "Upstream `for (const message of messages) await session.prompt(message)`; pi-zig folds multiple messages into one.",
+      "definitionOfDone": "Print-mode loops per-message; smoke proves N messages produce N assistant turns.",
+      "requirements": [
+        "Order preserved"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/modes/print-mode.ts",
+      "pizigTarget": "src/pi/cli_runtime.zig",
+      "complexity": "Low",
+      "priority": 55
+    },
+    {
+      "code": "D11",
+      "epic": "D",
+      "taskId": "bf75cda5-7dd7-4978-88a2-d41f2148088b",
+      "title": "`--list-models` text rendering",
+      "context": "pi-zig emits JSON only; upstream has a tabular text mode (default).",
+      "definitionOfDone": "Default text rendering; --json keeps JSON output; unit test.",
+      "requirements": [
+        "Match upstream column layout"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/cli/list-models.ts",
+      "pizigTarget": "src/pi/cli_runtime.zig",
+      "complexity": "Low",
+      "priority": 35
+    },
+    {
+      "code": "E1",
+      "epic": "E",
+      "taskId": "2f47bc7b-e688-40f5-ac94-db512b0efbe1",
+      "title": "Wire orphan tui_markdown / tui_footer / tui_messages / tui_theme / tui_selector into tui.zig + index.zig",
+      "context": "These modules exist with passing unit tests but are NOT imported by tui.zig and NOT exported from src/pi/index.zig — dead code. The live binary never paints them.",
+      "definitionOfDone": "tui.zig:buildScreen routes user/assistant/tool/bash entries through tui_messages; transcript text routes through tui_markdown; bottom strip uses tui_footer; theme palette derived via tui_theme; overlay selectors use tui_selector; pty harness + browser screenshots show the live difference.",
+      "requirements": [
+        "No dead modules",
+        "Each integration has at least one smoke assertion that the new render reaches stdout"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/modes/interactive/components/* + packages/tui/src/components/markdown.ts",
+      "pizigTarget": "src/pi/tui.zig + src/pi/index.zig",
+      "complexity": "Medium",
+      "priority": 100
+    },
+    {
+      "code": "E2",
+      "epic": "E",
+      "taskId": "832b9012-e6d7-4ae9-afec-4fb466c9089c",
+      "title": "Port 24 missing interactive components",
+      "context": "24 of 35 upstream components have NO equivalent: login-dialog, oauth-selector, session-selector, session-selector-search, tree-selector, settings-selector, scoped-models-selector, extension-editor, extension-input, extension-selector, config-selector, custom-editor, theme-selector, thinking-selector, show-images-selector, user-message-selector, dynamic-border, bordered-loader, custom-message, branch-summary-message, compaction-summary-message, skill-invocation-message, tool-execution, image.",
+      "definitionOfDone": "Each component has a Zig module + unit tests + integration smoke proving live render.",
+      "requirements": [
+        "Box-drawing matches upstream square corners (not arc)"
+      ],
+      "dependencies": [
+        "E1",
+        "J4"
+      ],
+      "upstream": "packages/coding-agent/src/modes/interactive/components/*",
+      "pizigTarget": "NEW src/pi/tui_components/*.zig",
+      "complexity": "High",
+      "priority": 95
+    },
+    {
+      "code": "E3",
+      "epic": "E",
+      "taskId": "d449b989-c0ab-4e89-97bb-f67276ba2d12",
+      "title": "Theme: full 49-token palette, truecolor, file watcher, COLORFGBG/OSC 11 detection, theme reload, markdown/syntax themes, /theme builtin",
+      "context": "pi-zig consumes 6 of 49 upstream theme tokens; no truecolor; no watcher; no COLORFGBG/OSC 11 detection; /theme not even in builtin_commands.",
+      "definitionOfDone": "tui_theme.zig consumes all 49 tokens, truecolor support, file watcher reloads, COLORFGBG/OSC 11 read at startup, /theme command opens a theme selector; per-token unit tests.",
+      "requirements": [
+        "Truecolor + 256-color fallback"
+      ],
+      "dependencies": [
+        "E1"
+      ],
+      "upstream": "packages/coding-agent/src/modes/interactive/theme/theme.ts",
+      "pizigTarget": "src/pi/tui_theme.zig",
+      "complexity": "High",
+      "priority": 80
+    },
+    {
+      "code": "E4",
+      "epic": "E",
+      "taskId": "f1843ffa-ad84-4271-acd1-74be3e4eb155",
+      "title": "InteractiveMode controller: port remaining ~125 of 150 methods",
+      "context": "Upstream's InteractiveMode (5564 LoC) has ~150 methods. pi-zig has ≤25. Missing entire subsystems: extension UI, message queueing/steering/follow-up, double-key timing, compaction/retry state, event-driven handleEvent (15-arm switch).",
+      "definitionOfDone": "Each missing subsystem ported with App-level unit tests + integration smoke; documented per-method coverage.",
+      "requirements": [
+        "Behaviorally faithful"
+      ],
+      "dependencies": [
+        "E1",
+        "E2",
+        "A6"
+      ],
+      "upstream": "packages/coding-agent/src/modes/interactive/interactive-mode.ts",
+      "pizigTarget": "src/pi/tui.zig + src/pi/cli_runtime.zig",
+      "complexity": "High",
+      "priority": 90
+    },
+    {
+      "code": "E5",
+      "epic": "E",
+      "taskId": "a2fceb08-d51d-4e72-932a-5e2ae5d83da1",
+      "title": "Animated spinner (replace static \"[working...]\")",
+      "context": "pi-zig shows \"[working... press Esc to abort]\" static. Upstream animates a spinner.",
+      "definitionOfDone": "Spinner cycles per render; smoke captures multiple frames.",
+      "requirements": [
+        "Frame-rate stable"
+      ],
+      "dependencies": [
+        "E1"
+      ],
+      "upstream": "packages/coding-agent/src/modes/interactive/components/bordered-loader.ts + loader.ts",
+      "pizigTarget": "src/pi/tui.zig",
+      "complexity": "Low",
+      "priority": 55
+    },
+    {
+      "code": "E6",
+      "epic": "E",
+      "taskId": "f7229b49-ea2b-41e3-9779-54a95dc1eb5e",
+      "title": "Terminal-width dynamic dividers",
+      "context": "Dividers are hardcoded 80 cells. Upstream scales to terminal width.",
+      "definitionOfDone": "Read columns via TIOCGWINSZ; divider auto-fits; SIGWINCH triggers reflow.",
+      "requirements": [
+        "SIGWINCH handler"
+      ],
+      "dependencies": [
+        "E1",
+        "J6"
+      ],
+      "upstream": "packages/tui/src/terminal.ts",
+      "pizigTarget": "src/pi/tui.zig + src/pi/tui_terminal.zig",
+      "complexity": "Medium",
+      "priority": 55
+    },
+    {
+      "code": "E7",
+      "epic": "E",
+      "taskId": "4e233308-e956-4916-a8e6-0466f53140b8",
+      "title": "OSC 133 zone codes + OSC 9;4 progress",
+      "context": "Modern terminals (iTerm2, WezTerm, kitty) honor OSC 133 (semantic prompt zones) and OSC 9;4 (progress bar). Both absent.",
+      "definitionOfDone": "Emit OSC 133 around prompt/output zones; OSC 9;4 progress around active tool runs; smoke captures escape sequences in stdout.",
+      "requirements": [
+        "No terminal harm without support"
+      ],
+      "dependencies": [
+        "E1"
+      ],
+      "upstream": "packages/tui/src/terminal.ts",
+      "pizigTarget": "src/pi/tui.zig",
+      "complexity": "Low",
+      "priority": 45
+    },
+    {
+      "code": "E8",
+      "epic": "E",
+      "taskId": "fe4d66f9-b456-4cce-adec-2d8e2530d6ac",
+      "title": "Earendil-announcement / armin / daxnuts easter eggs",
+      "context": "Three small visual easter-eggs present upstream; absent in pi-zig.",
+      "definitionOfDone": "Each rendered when triggered; smoke proves activation paths.",
+      "requirements": [
+        "Opt-in only"
+      ],
+      "dependencies": [
+        "E1"
+      ],
+      "upstream": "packages/coding-agent/src/modes/interactive/components/{earendil-announcement,armin,daxnuts}.ts",
+      "pizigTarget": "src/pi/tui.zig",
+      "complexity": "Low",
+      "priority": 20
+    },
+    {
+      "code": "E9",
+      "epic": "E",
+      "taskId": "cdd1c08f-6002-46b0-8a46-cb686a3b1b79",
+      "title": "Switch box-drawing arc corners ╭╮╰╯ → square ┌┐└┘ (or expose as theme)",
+      "context": "pi-zig uses arc corners; upstream uses square. Visual divergence.",
+      "definitionOfDone": "Default is square (matching upstream); theme can override.",
+      "requirements": [
+        "No regression in unit tests asserting specific glyphs"
+      ],
+      "dependencies": [
+        "E1"
+      ],
+      "upstream": "packages/coding-agent/src/modes/interactive/components/*",
+      "pizigTarget": "src/pi/tui_messages.zig + tui_footer.zig",
+      "complexity": "Low",
+      "priority": 40
+    },
+    {
+      "code": "E10",
+      "epic": "E",
+      "taskId": "e92c2e4d-1bc0-4b56-ac79-fbf5d52277a0",
+      "title": "Update Available banner with real version-check HTTP probe",
+      "context": "Currently gated on PI_ZIG_NEW_VERSION env; no real version check.",
+      "definitionOfDone": "Background HTTP probe of pi.dev/api/latest-version (configurable); banner shows when newer is available; cached for N hours.",
+      "requirements": [
+        "No blocking startup",
+        "Honor PI_OFFLINE"
+      ],
+      "dependencies": [
+        "E1"
+      ],
+      "upstream": "packages/coding-agent/src/modes/interactive/components/footer.ts",
+      "pizigTarget": "src/pi/tui_footer.zig",
+      "complexity": "Medium",
+      "priority": 50
+    },
+    {
+      "code": "F1",
+      "epic": "F",
+      "taskId": "aa17b607-e284-46f9-be03-89924783e72e",
+      "title": "Embeddable Agent / AgentHarness classes",
+      "context": "Upstream exports Agent + AgentHarness classes for library consumers. pi-zig's code is process-coupled.",
+      "definitionOfDone": "src/pi/agent_harness.zig provides a stable embedder API; sample embedder demo; unit tests.",
+      "requirements": [
+        "No global state"
+      ],
+      "dependencies": [
+        "A8"
+      ],
+      "upstream": "packages/agent/src/agent.ts + agent-harness.ts",
+      "pizigTarget": "NEW src/pi/agent_harness.zig",
+      "complexity": "High",
+      "priority": 60
+    },
+    {
+      "code": "F2",
+      "epic": "F",
+      "taskId": "0c79fc02-5982-45b4-9a1b-8098f4e3553c",
+      "title": "Pluggable StreamFn",
+      "context": "Provider is hardcoded in ai_client.zig. Upstream allows a StreamFn override.",
+      "definitionOfDone": "agent.zig accepts a stream callback; existing providers wrap it; unit test with a fake StreamFn.",
+      "requirements": [
+        "Cancellation propagated"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/agent.ts",
+      "pizigTarget": "src/pi/agent.zig",
+      "complexity": "Medium",
+      "priority": 55
+    },
+    {
+      "code": "F3",
+      "epic": "F",
+      "taskId": "ce02ee90-e172-4b21-9d9d-faf52eeee4d7",
+      "title": "Parallel tool execution + executionMode",
+      "context": "Upstream supports parallel tool execution per-turn. pi-zig is sequential.",
+      "definitionOfDone": "agent.zig executes independent tool calls in parallel when executionMode=parallel; per-tool isolation; unit test counts wall-clock vs serial.",
+      "requirements": [
+        "No tool cross-talk",
+        "Cancellation per-tool"
+      ],
+      "dependencies": [
+        "F2"
+      ],
+      "upstream": "packages/agent/src/agent.ts",
+      "pizigTarget": "src/pi/agent.zig",
+      "complexity": "High",
+      "priority": 65
+    },
+    {
+      "code": "F4",
+      "epic": "F",
+      "taskId": "4e464e88-5189-4e20-956d-8445e4784e8f",
+      "title": "transformContext / convertToLlm callbacks",
+      "context": "Upstream hooks to transform context + convert to LLM format. pi-zig has no such seam.",
+      "definitionOfDone": "Hooks added to RunOptions; unit tests cover transform + convert.",
+      "requirements": [
+        "Type-safe"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/agent.ts",
+      "pizigTarget": "src/pi/agent.zig",
+      "complexity": "Medium",
+      "priority": 50
+    },
+    {
+      "code": "F5",
+      "epic": "F",
+      "taskId": "42c66748-ca02-4acb-8092-ca8ea1626d34",
+      "title": "ExecutionEnv abstraction",
+      "context": "Upstream tools call through an ExecutionEnv; pi-zig calls std.fs / std.process directly. Hard to mock.",
+      "definitionOfDone": "ExecutionEnv interface added; tools refactored to call it; mock-env tests.",
+      "requirements": [
+        "Backwards-compat default"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/exec-env.ts",
+      "pizigTarget": "src/pi/tools.zig + src/pi/agent.zig",
+      "complexity": "High",
+      "priority": 55
+    },
+    {
+      "code": "F6",
+      "epic": "F",
+      "taskId": "13cae2e1-22ea-42b5-b0f4-e2cbd91fd492",
+      "title": "Result<T,E> model + stable error-code classes",
+      "context": "Upstream uses a Result pattern with classified errors; pi-zig uses Zig error union with coarse names.",
+      "definitionOfDone": "Wrap public APIs in Result-equivalent; map upstream error codes 1:1; consumer-friendly.",
+      "requirements": [
+        "Error mapping table"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/result.ts",
+      "pizigTarget": "src/pi/agent.zig + src/pi/rpc.zig",
+      "complexity": "Medium",
+      "priority": 45
+    },
+    {
+      "code": "F7",
+      "epic": "F",
+      "taskId": "17674512-07be-4da9-bad4-bb48bf5dd923",
+      "title": "streamProxy",
+      "context": "Upstream's streamProxy multiplexes provider streams; absent in pi-zig.",
+      "definitionOfDone": "streamProxy ported; smoke proves dual-consumer scenario.",
+      "requirements": [
+        "Backpressure-safe"
+      ],
+      "dependencies": [
+        "F2"
+      ],
+      "upstream": "packages/agent/src/stream-proxy.ts",
+      "pizigTarget": "src/pi/agent.zig",
+      "complexity": "Medium",
+      "priority": 35
+    },
+    {
+      "code": "F8",
+      "epic": "F",
+      "taskId": "908f42db-ff03-42c6-a8f9-38d6f961a847",
+      "title": "In-memory session backend",
+      "context": "Upstream supports an in-memory session backend for tests/ephemeral runs.",
+      "definitionOfDone": "src/pi/session_repo.zig with an InMemory backend selectable via RunOptions; unit test exercises both backends.",
+      "requirements": [
+        "No disk writes when in-memory"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/in-memory-session.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Medium",
+      "priority": 45
+    },
+    {
+      "code": "F9",
+      "epic": "F",
+      "taskId": "32a261a0-13bd-41ee-8595-ebaf97415914",
+      "title": "JsonlSessionRepo class + cwd-indexed dirs + encodeCwd",
+      "context": "Upstream organizes session JSONLs in cwd-indexed dirs via encodeCwd helper. pi-zig uses a single sessions dir.",
+      "definitionOfDone": "JsonlSessionRepo with cwd-encoded subdirs; encodeCwd helper byte-exact; smoke verifies dir layout.",
+      "requirements": [
+        "Byte-exact encodeCwd"
+      ],
+      "dependencies": [
+        "F8"
+      ],
+      "upstream": "packages/agent/src/jsonl-session-repo.ts",
+      "pizigTarget": "NEW src/pi/session_repo.zig",
+      "complexity": "Medium",
+      "priority": 60
+    },
+    {
+      "code": "F10",
+      "epic": "F",
+      "taskId": "5d39d21e-20a0-4a73-a025-3fe545447b15",
+      "title": "UUID v7",
+      "context": "Upstream uses UUID v7 for run ids; pi-zig uses ad-hoc ids.",
+      "definitionOfDone": "src/pi/uuid.zig with v7 generator; unit tests verify time-ordered uniqueness.",
+      "requirements": [
+        "RFC9562 v7"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/uuid.ts",
+      "pizigTarget": "NEW src/pi/uuid.zig",
+      "complexity": "Low",
+      "priority": 50
+    },
+    {
+      "code": "F11",
+      "epic": "F",
+      "taskId": "c7d8a7b8-78d7-4cc4-9ca9-ea133d9945b4",
+      "title": "Outer follow-up replay (single agent loop drains batches)",
+      "context": "RPC currently re-invokes runPrompt per drained batch. Upstream's agent loop drains internally.",
+      "definitionOfDone": "agent.zig loops over queue; rpc.zig dispatches once; unit test exercises multi-batch drain.",
+      "requirements": [
+        "Cancellation semantics preserved"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/agent.ts",
+      "pizigTarget": "src/pi/agent.zig + src/pi/rpc.zig",
+      "complexity": "High",
+      "priority": 60
+    },
+    {
+      "code": "F12",
+      "epic": "F",
+      "taskId": "02c0b44c-195f-4ae9-b0dc-b77637e2cecb",
+      "title": "prepareNextTurn: replace context/messages/tools/thinkingLevel",
+      "context": "pi-zig can swap only system_prompt/provider/model/api_key. Upstream's hook can replace context/messages/tools/thinkingLevel.",
+      "definitionOfDone": "Hook signature extended; unit tests cover each replacement field.",
+      "requirements": [
+        "Backwards-compat default"
+      ],
+      "dependencies": [
+        "F4"
+      ],
+      "upstream": "packages/agent/src/agent.ts",
+      "pizigTarget": "src/pi/agent.zig",
+      "complexity": "Medium",
+      "priority": 55
+    },
+    {
+      "code": "F13",
+      "epic": "F",
+      "taskId": "3307e61b-d4c3-4b10-ac57-5cd3a68ba3cc",
+      "title": "Tool hook fields: signal / args(validated) / context / details",
+      "context": "Before/after tool hooks miss the upstream-shaped fields (validated args, cancellation signal, ambient context, run details).",
+      "definitionOfDone": "Hook signature extended; each field test-asserted; extensions can read all four.",
+      "requirements": [
+        "ABI-stable"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/agent.ts",
+      "pizigTarget": "src/pi/agent.zig + src/pi/extension_runner.zig",
+      "complexity": "Medium",
+      "priority": 65
+    },
+    {
+      "code": "F14",
+      "epic": "F",
+      "taskId": "649ee549-e0e5-41ae-a1cd-0a2aade8cc9f",
+      "title": "agentLoopContinue + listener-signal propagation",
+      "context": "Upstream's agentLoopContinue lets a hook abort or chain; signal propagates to listeners.",
+      "definitionOfDone": "Function + signal wired; unit test triggers continue/abort from a hook.",
+      "requirements": [
+        "Signal-safe"
+      ],
+      "dependencies": [
+        "F13"
+      ],
+      "upstream": "packages/agent/src/agent.ts",
+      "pizigTarget": "src/pi/agent.zig",
+      "complexity": "Medium",
+      "priority": 45
+    },
+    {
+      "code": "F15",
+      "epic": "F",
+      "taskId": "15759e9c-41ea-4989-a7c2-99f5b662f075",
+      "title": "File-ops tracking (readFiles / modifiedFiles summary blocks)",
+      "context": "Tool runs that touch files surface readFiles/modifiedFiles in turn summaries upstream; absent in pi-zig.",
+      "definitionOfDone": "tools.zig records file ops; agent.zig surfaces them in turn summary; smoke shows the lists.",
+      "requirements": [
+        "No false positives"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/tool-ops.ts",
+      "pizigTarget": "src/pi/tools.zig + src/pi/agent.zig",
+      "complexity": "Medium",
+      "priority": 55
+    },
+    {
+      "code": "F16",
+      "epic": "F",
+      "taskId": "c18c5a32-84aa-47ef-8299-9c26a2c6061f",
+      "title": "BUG: bash full-output path collides on concurrent runs",
+      "context": "tools.zig writes shell full-output to fixed zig-out/pi-zig-bash-full-output.log. Two concurrent bash tools clobber each other.",
+      "definitionOfDone": "Per-run temp file via ExecutionEnv.createTempFile; concurrent-run test passes.",
+      "requirements": [
+        "Cleanup on success and failure"
+      ],
+      "dependencies": [
+        "F5"
+      ],
+      "upstream": "packages/agent/src/exec-env.ts (createTempFile)",
+      "pizigTarget": "src/pi/tools.zig",
+      "complexity": "Low",
+      "priority": 95
+    },
+    {
+      "code": "F17",
+      "epic": "F",
+      "taskId": "2bfa4ada-8aa9-49bc-b764-cb78d892f057",
+      "title": "getEntriesToFork \"at\" mode",
+      "context": "Upstream supports forking AT a specific entry; pi-zig's fork is \"from leaf\" only.",
+      "definitionOfDone": "API supports both modes; smoke proves each.",
+      "requirements": [
+        "Round-trip stable"
+      ],
+      "dependencies": [],
+      "upstream": "packages/agent/src/session-fork.ts",
+      "pizigTarget": "src/pi/session.zig",
+      "complexity": "Low",
+      "priority": 40
+    },
+    {
+      "code": "G1",
+      "epic": "G",
+      "taskId": "65cca12e-9dfd-46dc-a714-a0f0a4d1ab95",
+      "title": "Codex Responses transport (entirely missing)",
+      "context": "Catalog lists openai-codex-responses models; dispatcher routes them through chat/completions — INCOMPATIBLE shape. No SSE, no responses_websockets=2026-02-06, no chatgpt-account-id header, no retry-after-ms, no plan-aware errors, no session connection cache, no previous_response_id delta-context.",
+      "definitionOfDone": "ai_client.zig dispatches openai-codex-responses to chatgpt.com/backend-api/codex/responses with SSE + all required headers + retry-after parsing + previous_response_id chaining; smoke proves end-to-end.",
+      "requirements": [
+        "No secrets logged",
+        "Fake server smoke"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/providers/openai-codex-responses.ts",
+      "pizigTarget": "src/pi/ai_client.zig",
+      "complexity": "High",
+      "priority": 95
+    },
+    {
+      "code": "G2",
+      "epic": "G",
+      "taskId": "73eae4ba-3606-441b-a87c-c7689af1661b",
+      "title": "detectCompat 14-field per-provider compat (20+ providers)",
+      "context": "pi-zig sends one fixed shape with tool_choice:\"auto\". Upstream's detectCompat (line 1070, openai-completions.ts) has 14 fields covering 20+ providers (Cerebras, x.ai, Together, chutes.ai, DeepSeek, z.ai, Moonshot, Cloudflare Workers AI/AI Gateway, GitHub Copilot, OpenRouter, Vercel AI Gateway, Anthropic-via-OpenRouter).",
+      "definitionOfDone": "detectCompat ported with all 14 fields + 20+ providers; smoke tests per provider hit a fake server with the right shape.",
+      "requirements": [
+        "Match upstream regex byte-for-byte"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/providers/openai-completions.ts:detectCompat",
+      "pizigTarget": "src/pi/ai_client.zig",
+      "complexity": "High",
+      "priority": 90
+    },
+    {
+      "code": "G3",
+      "epic": "G",
+      "taskId": "bfc4cdd8-48d7-4e91-af15-3ad009c155a0",
+      "title": "Interactive OAuth login (PKCE + callback + device-code)",
+      "context": "Refresh works for all 3 providers; login requires manual `auth set-oauth <…>`. No PKCE, no callback server, no device-code, no manual-paste race.",
+      "definitionOfDone": "`pi-zig auth login <provider>` runs the full PKCE/device-code flow; live cred opt-in; never prints secrets; fake-endpoint smoke.",
+      "requirements": [
+        "No secrets logged",
+        "Cross-platform browser launch"
+      ],
+      "dependencies": [
+        "B2"
+      ],
+      "upstream": "packages/ai/src/utils/oauth/*",
+      "pizigTarget": "src/pi/auth.zig + src/pi/auth_login.zig",
+      "complexity": "High",
+      "priority": 85
+    },
+    {
+      "code": "G4",
+      "epic": "G",
+      "taskId": "a35fa493-5249-4ba0-959d-89e6785e8e34",
+      "title": "Anthropic Messages depth: cache_control / thinking / OAuth tool-name remap / eager_input_streaming / redacted_thinking / x-session-affinity / dynamic max_tokens",
+      "context": "pi-zig's Anthropic transport is shallow: max_tokens hardcoded 4096; no cache_control ephemeral blocks; no thinking/output_config.effort; no OAuth tool-name remap (16 canonical names); no eager_input_streaming; no redacted_thinking round-trip; no aborted-thinking-signature downgrade; no x-session-affinity.",
+      "definitionOfDone": "Each feature wired with smoke + unit; OAuth tool-name remap table byte-exact.",
+      "requirements": [
+        "No regression in fake-server smoke"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/providers/anthropic.ts",
+      "pizigTarget": "src/pi/ai_client.zig",
+      "complexity": "High",
+      "priority": 85
+    },
+    {
+      "code": "G5",
+      "epic": "G",
+      "taskId": "6503fb82-94b6-4bd9-bc2e-2016e84205f6",
+      "title": "Bedrock depth: cache points / reasoningContent.signature / additionalModelRequestFields / requestMetadata / GovCloud strip / exception-name map / ~/.aws/credentials profile / IMDS chain",
+      "context": "SigV4 signer verified vs AWS get-vanilla; missing all the cache and reasoning features.",
+      "definitionOfDone": "Each feature ported with unit test; profile + IMDS chain end-to-end smoke.",
+      "requirements": [
+        "No live AWS contact"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/providers/amazon-bedrock.ts",
+      "pizigTarget": "src/pi/ai_client.zig + src/pi/auth.zig",
+      "complexity": "High",
+      "priority": 75
+    },
+    {
+      "code": "G6",
+      "epic": "G",
+      "taskId": "b1dff166-0678-4323-8cb5-0fdc7a59e050",
+      "title": "Missing helpers: transform-messages.ts / cloudflare.ts / github-copilot-headers.ts / openai-prompt-cache.ts / simple-options.ts (reasoning plumbing)",
+      "context": "Several cross-provider helpers absent; their consumers degrade silently.",
+      "definitionOfDone": "Each helper ported with unit tests + consumed by providers that need it.",
+      "requirements": [
+        "Match upstream functions byte-for-byte"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/providers/*.ts shared helpers",
+      "pizigTarget": "src/pi/ai_client.zig",
+      "complexity": "Medium",
+      "priority": 70
+    },
+    {
+      "code": "G7",
+      "epic": "G",
+      "taskId": "b3237782-c705-4c5b-9cc4-60a275a3bc95",
+      "title": "Wire 15+ unwired OpenAI-compatible providers in endpointForProvider",
+      "context": "Only 7 providers wired in endpointForProvider; 15+ in the catalog have no endpoint mapping → 404 on use.",
+      "definitionOfDone": "Each catalog provider has a mapped endpoint; smoke per provider against a fake server.",
+      "requirements": [
+        "Per-provider auth header"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/providers/*.ts",
+      "pizigTarget": "src/pi/ai_client.zig",
+      "complexity": "Medium",
+      "priority": 80
+    },
+    {
+      "code": "H1",
+      "epic": "H",
+      "taskId": "991a9b7d-3d7d-44be-baa8-b0015b0f059f",
+      "title": "Usage tracking in ChatCompletionResult + calculateCost",
+      "context": "No Usage struct anywhere; no per-token cost calculation. Compaction triggers can't use real tokens; footer can't show cost.",
+      "definitionOfDone": "ChatCompletionResult carries Usage {prompt_tokens, completion_tokens, cache_read, cache_write}; calculateCost computes from model costs; unit tests cover each provider's usage parse.",
+      "requirements": [
+        "Per-provider usage parse exact"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/usage.ts + per-provider parsing",
+      "pizigTarget": "src/pi/ai_client.zig + NEW src/pi/usage.zig",
+      "complexity": "High",
+      "priority": 90
+    },
+    {
+      "code": "H2",
+      "epic": "H",
+      "taskId": "dc233833-a176-4e65-a229-9e48b2d0c8b9",
+      "title": "api-registry: provider registration + custom-provider extension API landing",
+      "context": "Provider dispatch is a hardcoded switch in streamChatTurnData. Extension API pi.registerProvider has nowhere to land.",
+      "definitionOfDone": "src/pi/api_registry.zig with a registry; built-in providers register at startup; extensions can dynamically register; smoke proves a custom-provider extension dispatches.",
+      "requirements": [
+        "No global state hazards"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/api-registry.ts",
+      "pizigTarget": "NEW src/pi/api_registry.zig",
+      "complexity": "High",
+      "priority": 85
+    },
+    {
+      "code": "H3",
+      "epic": "H",
+      "taskId": "2310e8df-d4e3-4d71-a711-0535553835ae",
+      "title": "AssistantMessageEventStream + 13-arm typed event union",
+      "context": "pi-zig uses scattered callbacks. Upstream has a typed 13-arm event union streamed during a turn.",
+      "definitionOfDone": "src/pi/assistant_event_stream.zig with the union; agent.zig emits via it; CLI/RPC consumers re-emit.",
+      "requirements": [
+        "Backwards-compat with callbacks"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/assistant-event-stream.ts",
+      "pizigTarget": "NEW src/pi/assistant_event_stream.zig",
+      "complexity": "High",
+      "priority": 70
+    },
+    {
+      "code": "H4",
+      "epic": "H",
+      "taskId": "58a17357-b4a0-43bc-9be2-7ef757178eff",
+      "title": "utils/json-parse.ts: repair + streaming-JSON tolerance",
+      "context": "Provider responses occasionally have malformed JSON or interleaved control sequences. Upstream repairs; pi-zig errors out.",
+      "definitionOfDone": "src/pi/json_parse.zig with repair + partial-token tolerance; unit tests cover common malformations.",
+      "requirements": [
+        "No false repairs of structurally bad input"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/utils/json-parse.ts",
+      "pizigTarget": "NEW src/pi/json_parse.zig",
+      "complexity": "Medium",
+      "priority": 65
+    },
+    {
+      "code": "H5",
+      "epic": "H",
+      "taskId": "e476f4f0-377f-42ff-94b9-db9419214384",
+      "title": "utils/node-http-proxy.ts: HTTP_PROXY / HTTPS_PROXY / no_proxy",
+      "context": "pi-zig ignores all proxy env vars.",
+      "definitionOfDone": "src/pi/http_proxy.zig parses env, wires std.http.Client proxy; smoke verifies routing through a fake proxy.",
+      "requirements": [
+        "no_proxy honored"
+      ],
+      "dependencies": [
+        "B4"
+      ],
+      "upstream": "packages/ai/src/utils/node-http-proxy.ts",
+      "pizigTarget": "NEW src/pi/http_proxy.zig",
+      "complexity": "Medium",
+      "priority": 75
+    },
+    {
+      "code": "H6",
+      "epic": "H",
+      "taskId": "4cd9c971-e11e-4fb3-9aa5-283369c52edd",
+      "title": "utils/sanitize-unicode.ts, diagnostics.ts, validation.ts, typebox-helpers.ts, hash.ts",
+      "context": "Five shared utilities absent. Some are nice-to-have (diagnostics, validation); sanitize-unicode is load-bearing (prevents homograph attacks in CLI output).",
+      "definitionOfDone": "Each ported with unit tests.",
+      "requirements": [
+        "Hash impl uses std.crypto"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/utils/*.ts",
+      "pizigTarget": "src/pi/ai_client.zig + new utility modules",
+      "complexity": "Medium",
+      "priority": 55
+    },
+    {
+      "code": "H7",
+      "epic": "H",
+      "taskId": "22b29768-1435-4c2e-ada0-6995ff7be779",
+      "title": "Image-models catalog (not just inline openrouter)",
+      "context": "Only one image provider is inline-wired; upstream has a catalog.",
+      "definitionOfDone": "Image-models catalog generator; multiple image providers; smoke per provider.",
+      "requirements": [
+        "Provider parity"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/models/images.ts",
+      "pizigTarget": "src/pi/ai_client.zig + src/pi/models.zig",
+      "complexity": "Medium",
+      "priority": 55
+    },
+    {
+      "code": "H8",
+      "epic": "H",
+      "taskId": "58e02d8e-64cf-4491-943a-94a8a55ddf2a",
+      "title": "Compat overrides on ModelEntry (OpenAICompletionsCompat / OpenAIResponsesCompat / AnthropicMessagesCompat)",
+      "context": "ModelEntry has no per-model compat overrides upstream; pi-zig has none either, but consumers depend on it for openRouterRouting/vercelGatewayRouting.",
+      "definitionOfDone": "ModelEntry gains an optional compat struct; per-provider serializers read it; smoke per override.",
+      "requirements": [
+        "Backwards-compat default"
+      ],
+      "dependencies": [],
+      "upstream": "packages/ai/src/models/*.ts",
+      "pizigTarget": "src/pi/models.zig + src/pi/ai_client.zig",
+      "complexity": "Medium",
+      "priority": 60
+    },
+    {
+      "code": "I1",
+      "epic": "I",
+      "taskId": "305c39a4-b59f-4634-be38-7daae1a99aed",
+      "title": "pi.* API: 14 missing methods",
+      "context": "Extension API surface is 8/22 wired. Missing: registerShortcut, registerMessageRenderer, registerProvider, unregisterProvider, setSessionName, getSessionName, setLabel, exec, getActiveTools, getAllTools, setActiveTools, getCommands, setModel, getThinkingLevel, setThinkingLevel.",
+      "definitionOfDone": "Each method wired in extension_runner.zig; pi.* shim exposes them; per-method smoke runs an extension calling the method and asserts the effect.",
+      "requirements": [
+        "Type-safe",
+        "Async-safe"
+      ],
+      "dependencies": [
+        "A6",
+        "H2"
+      ],
+      "upstream": "packages/coding-agent/src/core/extensions/*",
+      "pizigTarget": "src/pi/extension_runner.zig",
+      "complexity": "High",
+      "priority": 90
+    },
+    {
+      "code": "I2",
+      "epic": "I",
+      "taskId": "36c3637a-5695-4ae0-a85d-ee2559e94dfe",
+      "title": "Dispatch 17 currently-unfired lifecycle events",
+      "context": "Events context / before_agent_start / model_select / thinking_level_select / input / session_before_* / session_compact / session_shutdown / tool_execution_start/update/end / message_update / resources_discover are NEVER dispatched in production code.",
+      "definitionOfDone": "Each event has a dispatch site; per-event smoke asserts the extension handler observes it.",
+      "requirements": [
+        "Match upstream emission order"
+      ],
+      "dependencies": [
+        "A6"
+      ],
+      "upstream": "packages/coding-agent/src/core/extensions/*",
+      "pizigTarget": "src/pi/rpc.zig + src/pi/agent.zig",
+      "complexity": "High",
+      "priority": 90
+    },
+    {
+      "code": "I3",
+      "epic": "I",
+      "taskId": "694f728c-db2e-46b5-9341-00853508fd6e",
+      "title": "Honor return values of 9 fire-and-forget lifecycle events",
+      "context": "session_start / before_provider_request / after_provider_response / agent_start/end / turn_start/end / message_start/end / user_bash fire but DISCARD return values. RuntimeLifecycleEmitContext.emit explicitly drops them (rpc.zig:3834-3842).",
+      "definitionOfDone": "Each event's return value is applied per upstream semantics (transform-chain or short-circuit); per-event smoke proves the effect.",
+      "requirements": [
+        "Backwards-compat with extensions that return undefined"
+      ],
+      "dependencies": [
+        "A6"
+      ],
+      "upstream": "packages/coding-agent/src/core/extensions/*",
+      "pizigTarget": "src/pi/rpc.zig + src/pi/extension_runner.zig",
+      "complexity": "High",
+      "priority": 90
+    },
+    {
+      "code": "I4",
+      "epic": "I",
+      "taskId": "9119cd04-8706-4abb-a588-39c946cf8c89",
+      "title": "Provider display names: 28-entry map",
+      "context": "pi-zig surfaces raw provider ids (google-vertex) instead of display names (Google Vertex AI).",
+      "definitionOfDone": "src/pi/provider_display.zig with the 28-entry map; commands/themes/RPC use it; smoke asserts UI shows display names.",
+      "requirements": [
+        "Map matches upstream byte-for-byte"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/provider-display-names.ts",
+      "pizigTarget": "NEW src/pi/provider_display.zig",
+      "complexity": "Low",
+      "priority": 45
+    },
+    {
+      "code": "I5",
+      "epic": "I",
+      "taskId": "f12ba434-a70f-4bb8-aa8a-4c11333888a9",
+      "title": "Models.json: ~/.pi/models.json loading + schema validation + applyModelOverride + mergeCompat + per-model headers",
+      "context": "Custom model registry: users put models in ~/.pi/models.json and pi-zig should load + validate + merge. None of this exists.",
+      "definitionOfDone": "src/pi/custom_models.zig loads + validates + merges; openRouterRouting / vercelGatewayRouting helpers; per-model headers passed to ai_client; smoke uses a temp models.json.",
+      "requirements": [
+        "Schema validation strict"
+      ],
+      "dependencies": [
+        "H8"
+      ],
+      "upstream": "packages/coding-agent/src/core/model-registry.ts + model-resolver.ts",
+      "pizigTarget": "NEW src/pi/custom_models.zig",
+      "complexity": "High",
+      "priority": 65
+    },
+    {
+      "code": "I6",
+      "epic": "I",
+      "taskId": "fe2f1b88-71cd-4d05-8c39-22901d4ad131",
+      "title": "HTML export: marked.min.js + highlight.min.js vendored + ansi-to-html + ToolHtmlRenderer + 5-mode sidebar filter + branch-tree sidebar",
+      "context": "Server-side rendering works; the interactive SPA chrome is absent.",
+      "definitionOfDone": "Vendor marked + highlight at build (in repo); ansi-to-html.zig converter; ToolHtmlRenderer interface; 5-mode filter UI; branch-tree sidebar with active-path markers; smoke loads the HTML in headless Chrome and asserts each element.",
+      "requirements": [
+        "Self-contained (no CDN)"
+      ],
+      "dependencies": [],
+      "upstream": "packages/coding-agent/src/core/export-html/*",
+      "pizigTarget": "src/pi/html_export.zig",
+      "complexity": "High",
+      "priority": 60
+    },
+    {
+      "code": "I7",
+      "epic": "I",
+      "taskId": "e517f3dc-4cb1-40bd-8854-f7e606e23cb6",
+      "title": "Built-in tool *Operations seams + withFileMutationQueue + BashSpawnHook + image auto-resize + macOS read-path fallbacks + edit-tool diff/patch/firstChangedLine + prepareArguments legacy migration",
+      "context": "Tool execution is at parity; the customization seams + macOS fallbacks + ANSI-to-HTML + image worker are absent.",
+      "definitionOfDone": "Each seam implemented; macOS read-path variant fallback table ported; edit-tool result carries details.diff + patch + firstChangedLine; smoke proves each seam.",
+      "requirements": [
+        "Backwards-compat"
+      ],
+      "dependencies": [
+        "F5"
+      ],
+      "upstream": "packages/coding-agent/src/core/tools/*",
+      "pizigTarget": "src/pi/tools.zig",
+      "complexity": "High",
+      "priority": 70
+    },
+    {
+      "code": "J1",
+      "epic": "J",
+      "taskId": "6d57c7a0-1063-4ced-ab36-0677e8960838",
+      "title": "keys.ts: Kitty + modifyOtherKeys + non-Latin-layout + Apple-Terminal + Windows-Terminal CSI-u (~900 LoC)",
+      "context": "pi-zig's tui_keys.zig handles legacy non-Kitty sequences; misses Kitty key protocol, modifyOtherKeys, non-Latin keyboard layouts, Apple Terminal CSI-u quirks, Windows Terminal CSI-u.",
+      "definitionOfDone": "tui_keys.zig fully ported; per-protocol unit tests; pty harness covers a Kitty terminal handshake.",
+      "requirements": [
+        "No misclassification of legacy sequences"
+      ],
+      "dependencies": [],
+      "upstream": "packages/tui/src/keys.ts",
+      "pizigTarget": "src/pi/tui_keys.zig",
+      "complexity": "High",
+      "priority": 80
+    },
+    {
+      "code": "J2",
+      "epic": "J",
+      "taskId": "d7cba399-5749-4907-898c-e8ab3077a3d3",
+      "title": "utils.ts: visible-width / ANSI-aware wrap / grapheme segmentation (~1100 LoC)",
+      "context": "pi-zig is byte-based throughout. Emoji, accented Latin, combining marks all break.",
+      "definitionOfDone": "src/pi/tui_text.zig with width / wrap / grapheme APIs based on Unicode UCD tables; unit tests for emoji + combining marks + accented Latin + ZWJ.",
+      "requirements": [
+        "Width 0 for combining marks",
+        "Width 2 for wide chars"
+      ],
+      "dependencies": [],
+      "upstream": "packages/tui/src/utils.ts",
+      "pizigTarget": "NEW src/pi/tui_text.zig",
+      "complexity": "High",
+      "priority": 90
+    },
+    {
+      "code": "J3",
+      "epic": "J",
+      "taskId": "bbad7556-cc63-432a-9e3e-723be53de475",
+      "title": "terminal-image.ts + components/image.ts (~580 LoC)",
+      "context": "Zero image support. No kitty graphics, no iTerm2 inline images, no SIXEL.",
+      "definitionOfDone": "tui_image.zig with kitty + iTerm2 image protocols; smoke renders a tiny PNG and detects the escape.",
+      "requirements": [
+        "Detect protocol support"
+      ],
+      "dependencies": [],
+      "upstream": "packages/tui/src/terminal-image.ts + components/image.ts",
+      "pizigTarget": "NEW src/pi/tui_image.zig",
+      "complexity": "High",
+      "priority": 65
+    },
+    {
+      "code": "J4",
+      "epic": "J",
+      "taskId": "d9e16a3e-ab6b-40ae-a138-14e8a94485e2",
+      "title": "Components: input / settings-list / box / loader / cancellable-loader / text / spacer / truncated-text",
+      "context": "8 small but load-bearing layout components entirely missing.",
+      "definitionOfDone": "Each component has a Zig module + unit tests; used by tui_messages and tui_footer.",
+      "requirements": [
+        "Style-token aware"
+      ],
+      "dependencies": [
+        "J2"
+      ],
+      "upstream": "packages/tui/src/components/{input,settings-list,box,loader,cancellable-loader,text,spacer,truncated-text}.ts",
+      "pizigTarget": "NEW src/pi/tui_components/*.zig",
+      "complexity": "High",
+      "priority": 75
+    },
+    {
+      "code": "J5",
+      "epic": "J",
+      "taskId": "8d97b37a-d40e-4000-9ba3-de1651bb605a",
+      "title": "tui.ts: overlay compositor + IME CURSOR_MARKER + viewport + synchronized output + Kitty image lifecycle",
+      "context": "pi-zig's differential renderer doesn't composite overlays, has no IME cursor marker, no viewport math, no \\x1b[?2026h/l synchronized output, no Kitty image lifecycle.",
+      "definitionOfDone": "tui.zig / tui_render.zig extended; each feature has a per-feature snapshot test.",
+      "requirements": [
+        "No flicker"
+      ],
+      "dependencies": [],
+      "upstream": "packages/tui/src/tui.ts",
+      "pizigTarget": "src/pi/tui.zig + src/pi/tui_render.zig",
+      "complexity": "High",
+      "priority": 80
+    },
+    {
+      "code": "J6",
+      "epic": "J",
+      "taskId": "3d45d470-efb8-4394-bf11-36bfe9f8b96f",
+      "title": "terminal.ts: bracketed paste / Kitty probe / drain / setTitle / setProgress / SIGWINCH / Windows console mode",
+      "context": "tui_terminal.zig has the basics; missing 7 specific behaviors.",
+      "definitionOfDone": "Each ported with smoke (where observable in stdout) or unit test.",
+      "requirements": [
+        "Cross-platform"
+      ],
+      "dependencies": [],
+      "upstream": "packages/tui/src/terminal.ts",
+      "pizigTarget": "src/pi/tui_terminal.zig",
+      "complexity": "Medium",
+      "priority": 70
+    },
+    {
+      "code": "J7",
+      "epic": "J",
+      "taskId": "9544f852-d16f-42cb-b32e-e05c1429fa0d",
+      "title": "autocomplete.ts: @-path completion + fd-based fuzzy file walk",
+      "context": "No autocomplete in the composer. Upstream has @<partial-path> file fuzzy.",
+      "definitionOfDone": "tui_autocomplete.zig with fd-based walk + fuzzy match; integrated into editor; unit + smoke.",
+      "requirements": [
+        "Ignore .gitignore"
+      ],
+      "dependencies": [],
+      "upstream": "packages/tui/src/autocomplete.ts",
+      "pizigTarget": "NEW src/pi/tui_autocomplete.zig",
+      "complexity": "High",
+      "priority": 60
+    },
+    {
+      "code": "J8",
+      "epic": "J",
+      "taskId": "11d5d492-4de2-44bf-87be-ec9d092b78ec",
+      "title": "stdin-buffer.ts: OSC/APC/DCS accumulator + bracketed-paste + 10ms partial-sequence flush + WezTerm escape fixup",
+      "context": "pi-zig reads stdin raw and parses each chunk synchronously. Long OSC/APC/DCS sequences can be split across reads and get mis-parsed.",
+      "definitionOfDone": "tui_stdin_buffer.zig accumulates partial sequences with a 10ms flush; bracketed-paste assembly; smoke pipes a split OSC sequence and asserts correct assembly.",
+      "requirements": [
+        "No loss on partial reads"
+      ],
+      "dependencies": [
+        "J1"
+      ],
+      "upstream": "packages/tui/src/stdin-buffer.ts",
+      "pizigTarget": "NEW src/pi/tui_stdin_buffer.zig",
+      "complexity": "High",
+      "priority": 75
+    },
+    {
+      "code": "J9",
+      "epic": "J",
+      "taskId": "1395c074-3604-4152-a8fd-023784c8a366",
+      "title": "Editor: paste-marker system + visual-line nav + sticky preferred column + grapheme-aware cursor + jumpToChar + pageScroll + multi-level undo + autocomplete UI + bordered render",
+      "context": "tui_editor.zig has byte-based logic. Missing 9 specific editor features.",
+      "definitionOfDone": "Each feature added with unit tests + at least one pty smoke step.",
+      "requirements": [
+        "Undo depth ≥ 100"
+      ],
+      "dependencies": [
+        "J2",
+        "J7"
+      ],
+      "upstream": "packages/tui/src/components/editor.ts",
+      "pizigTarget": "src/pi/tui_editor.zig",
+      "complexity": "High",
+      "priority": 75
+    }
+  ]
+}
