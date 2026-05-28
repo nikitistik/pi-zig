@@ -26,6 +26,26 @@ const config = @import("config.zig");
 // Read-only use: the model selector cycles/sets models via models.zig (no edits to models.zig).
 const models = @import("models.zig");
 
+// ANSI styling primitives used by the rich-render layer (status bar, themed
+// banner, inline markdown). Each open MUST be closed on the same line because
+// the differential renderer compares lines literally; spilling SGR state
+// across rows would corrupt subsequent rewrites.
+pub const sgr = struct {
+    pub const reset = "\x1b[0m";
+    pub const dim = "\x1b[2m";
+    pub const bold = "\x1b[1m";
+    pub const italic = "\x1b[3m";
+    pub const inverse = "\x1b[7m";
+    // Theme-equivalent foreground colors (ANSI 256-color), tuned to look
+    // reasonable on a dark terminal without depending on the user's palette.
+    pub const accent = "\x1b[38;5;208m"; // orange — provider/model
+    pub const branch = "\x1b[38;5;111m"; // teal/blue — git branch
+    pub const muted = "\x1b[38;5;240m"; // grey — timers / dividers
+    pub const good = "\x1b[38;5;82m"; // green — good state
+    pub const warn = "\x1b[38;5;214m"; // amber — update banner
+    pub const code_bg = "\x1b[48;5;236m"; // dim background — inline `code`
+};
+
 pub const BuiltinCommand = struct {
     name: []const u8,
     description: []const u8,
@@ -237,7 +257,25 @@ pub const App = struct {
     /// null selects the first catalog entry. Cycled via models.next.
     selected_model: ?*const models.ModelEntry = null,
 
+    // -- Status-bar state ----------------------------------------------
+    /// Wall-clock nanoseconds at App init; used to render the session-elapsed timer.
+    session_start_ns: i128 = 0,
+    /// Cached git branch label, resolved lazily on the first render. When the
+    /// resolution fails (not a git repo, missing git binary, etc.) `git_branch_len`
+    /// stays 0 and the status bar omits the branch slot.
+    git_branch_buf: [128]u8 = undefined,
+    git_branch_len: usize = 0,
+    git_branch_resolved: bool = false,
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !App {
+        // Read the wall clock once; `std.Io.Clock.real.now` will panic if `io`
+        // is `undefined` (test paths pass `undefined` deliberately), so guard.
+        const session_start_ns: i128 = blk: {
+            if (options.interactive) {
+                break :blk std.Io.Clock.real.now(io).nanoseconds;
+            }
+            break :blk 0;
+        };
         return .{
             .allocator = allocator,
             .io = io,
@@ -247,6 +285,7 @@ pub const App = struct {
             .messages = .empty,
             .transcript = .empty,
             .streaming = .empty,
+            .session_start_ns = session_start_ns,
         };
     }
 
@@ -376,7 +415,109 @@ pub const App = struct {
             try self.renderPalette(&lines);
         }
 
+        // Bottom status bar: divider + one row carrying branch · provider/model
+        // · thinking · session-elapsed. Mirrors the upstream pi-mono TUI's
+        // bottom strip. Skipped in non-interactive/test paths so unit tests
+        // keep deterministic line counts.
+        if (self.options.interactive) {
+            try self.renderStatusBar(&lines);
+        }
+
         return lines;
+    }
+
+    /// Append a divider + bottom status row carrying:
+    ///   `<branch>   <provider> | <model> · <thinking>   session <elapsed>`
+    /// All ANSI styling is opened+closed on the same line so the differential
+    /// renderer's line-level diff stays correct.
+    fn renderStatusBar(self: *App, lines: *std.ArrayList([]u8)) !void {
+        // Divider: a dim horizontal rule, length-capped so we don't paint past
+        // typical terminal widths. The renderer wraps if needed.
+        const divider_segment = "\xe2\x94\x80"; // U+2500 BOX DRAWINGS LIGHT HORIZONTAL (UTF-8: e2 94 80)
+        var divider: std.ArrayList(u8) = .empty;
+        defer divider.deinit(self.allocator);
+        try divider.appendSlice(self.allocator, sgr.muted);
+        var i: usize = 0;
+        while (i < 80) : (i += 1) try divider.appendSlice(self.allocator, divider_segment);
+        try divider.appendSlice(self.allocator, sgr.reset);
+        try lines.append(self.allocator, try divider.toOwnedSlice(self.allocator));
+
+        // Resolve the branch label once (best-effort; staying null on failure).
+        if (!self.git_branch_resolved) self.resolveGitBranch();
+
+        // Compose the status row.
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(self.allocator);
+
+        if (self.git_branch_len > 0) {
+            try row.appendSlice(self.allocator, sgr.branch);
+            try row.appendSlice(self.allocator, " "); // small left pad
+            try row.appendSlice(self.allocator, self.git_branch_buf[0..self.git_branch_len]);
+            try row.appendSlice(self.allocator, sgr.reset);
+            try row.appendSlice(self.allocator, "   ");
+        }
+
+        // Provider | Model · thinking
+        const provider = self.options.provider orelse "(no provider)";
+        const model_name = if (self.selected_model) |m| m.id else (self.options.model orelse "(no model)");
+        try row.appendSlice(self.allocator, sgr.accent);
+        try row.appendSlice(self.allocator, provider);
+        try row.appendSlice(self.allocator, sgr.reset);
+        try row.appendSlice(self.allocator, sgr.muted);
+        try row.appendSlice(self.allocator, " | ");
+        try row.appendSlice(self.allocator, sgr.reset);
+        try row.appendSlice(self.allocator, sgr.accent);
+        try row.appendSlice(self.allocator, model_name);
+        try row.appendSlice(self.allocator, sgr.reset);
+
+        // Session-elapsed timer (`session 0m 12s`). When the wall clock isn't
+        // available (test path, options.interactive=false) we already skipped
+        // this whole call.
+        if (self.session_start_ns != 0) {
+            const now_ns = std.Io.Clock.real.now(self.io).nanoseconds;
+            const elapsed_ns: i128 = now_ns - self.session_start_ns;
+            const elapsed_s: u64 = if (elapsed_ns > 0) @intCast(@divTrunc(elapsed_ns, std.time.ns_per_s)) else 0;
+            const hours = elapsed_s / 3600;
+            const minutes = (elapsed_s % 3600) / 60;
+            const seconds = elapsed_s % 60;
+            try row.appendSlice(self.allocator, sgr.muted);
+            try row.appendSlice(self.allocator, "   session ");
+            const timer_text = if (hours > 0)
+                try std.fmt.allocPrint(self.allocator, "{d}h{d:0>2}m{d:0>2}s", .{ hours, minutes, seconds })
+            else if (minutes > 0)
+                try std.fmt.allocPrint(self.allocator, "{d}m{d:0>2}s", .{ minutes, seconds })
+            else
+                try std.fmt.allocPrint(self.allocator, "{d}s", .{seconds});
+            defer self.allocator.free(timer_text);
+            try row.appendSlice(self.allocator, timer_text);
+            try row.appendSlice(self.allocator, sgr.reset);
+        }
+
+        try lines.append(self.allocator, try row.toOwnedSlice(self.allocator));
+    }
+
+    /// Best-effort one-shot resolution of the current git branch via
+    /// `git symbolic-ref --short HEAD`. Failures (no git, no repo) leave the
+    /// branch label empty so the status bar simply omits the branch slot.
+    fn resolveGitBranch(self: *App) void {
+        self.git_branch_resolved = true;
+        const argv = [_][]const u8{ "git", "symbolic-ref", "--short", "HEAD" };
+        const result = std.process.run(self.allocator, self.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(256),
+            .stderr_limit = .limited(0),
+            .expand_arg0 = .expand,
+        }) catch return;
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code != 0) return,
+            else => return,
+        }
+        const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > self.git_branch_buf.len) return;
+        @memcpy(self.git_branch_buf[0..trimmed.len], trimmed);
+        self.git_branch_len = trimmed.len;
     }
 
     /// Append the command-palette rows (ranked fuzzy matches) to the screen, marking the
@@ -983,13 +1124,34 @@ pub const App = struct {
     }
 
     fn printBanner(self: *App) !void {
-        try self.appendTranscript("pi-zig interactive mode");
+        // Bold, accent-colored masthead so the first paint signals "this is a
+        // real TUI" rather than a bare prompt. Each line keeps ANSI state
+        // self-contained per the line-diff renderer's invariants.
+        const masthead = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}π pi-zig{s}{s}  interactive mode{s}",
+            .{ sgr.bold, sgr.accent, sgr.reset, sgr.muted, sgr.reset },
+        );
+        defer self.allocator.free(masthead);
+        try self.appendTranscript(masthead);
+
         const provider = self.options.provider orelse "(none)";
         const model = self.options.model orelse "(none)";
-        const line = try std.fmt.allocPrint(self.allocator, "provider: {s}  model: {s}", .{ provider, model });
-        defer self.allocator.free(line);
-        try self.appendTranscript(line);
-        try self.appendTranscript("Type a message and press Enter. Slash commands: /help /model /session /new /quit. Ctrl+D to exit.");
+        const meta = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}provider:{s} {s}{s}{s}   {s}model:{s} {s}{s}{s}",
+            .{ sgr.muted, sgr.reset, sgr.accent, provider, sgr.reset, sgr.muted, sgr.reset, sgr.accent, model, sgr.reset },
+        );
+        defer self.allocator.free(meta);
+        try self.appendTranscript(meta);
+
+        const hint = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}Type a message and press Enter. Slash: {s}/help /model /session /new /quit{s}. Ctrl+D to exit.{s}",
+            .{ sgr.muted, sgr.accent, sgr.muted, sgr.reset },
+        );
+        defer self.allocator.free(hint);
+        try self.appendTranscript(hint);
         try self.appendTranscript("");
     }
 
