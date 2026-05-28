@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-05-28T09:46:51.989Z",
+  "generatedAt": "2026-05-28T10:14:21.909Z",
   "transport": "ndjson-stdio",
   "launch": [
     "bin/pi-zig",
@@ -18,7 +18,7 @@
   ],
   "transcript": [
     {
-      "t": 1779961611306,
+      "t": 1779963261272,
       "kind": "bundle",
       "payload": {
         "indexHtml": true,
@@ -28,7 +28,7 @@
       }
     },
     {
-      "t": 1779961611319,
+      "t": 1779963261284,
       "kind": "send",
       "payload": {
         "type": "get_state",
@@ -36,7 +36,7 @@
       }
     },
     {
-      "t": 1779961611496,
+      "t": 1779963261455,
       "kind": "recv",
       "payload": {
         "id": "c-1",
@@ -52,7 +52,7 @@
           "isCompacting": false,
           "steeringMode": "all",
           "followUpMode": "one-at-a-time",
-          "sessionId": "pi-zig-1779961611335447000",
+          "sessionId": "pi-zig-1779963261298631000",
           "sessionFile": "/Users/keer/projects/pi-zig/zig-out/packaged-smoke-session.jsonl",
           "autoCompactionEnabled": false,
           "autoCompactionReserveTokens": 16384,
@@ -70,7 +70,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261455,
       "kind": "send",
       "payload": {
         "type": "set_model",
@@ -80,7 +80,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261456,
       "kind": "recv",
       "payload": {
         "id": "c-2",
@@ -113,7 +113,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261456,
       "kind": "send",
       "payload": {
         "type": "set_auto_retry",
@@ -124,7 +124,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261456,
       "kind": "recv",
       "payload": {
         "id": "c-3",
@@ -134,7 +134,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261456,
       "kind": "send",
       "payload": {
         "type": "set_steering_mode",
@@ -143,7 +143,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261456,
       "kind": "recv",
       "payload": {
         "id": "c-4",
@@ -153,7 +153,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261456,
       "kind": "send",
       "payload": {
         "type": "get_state",
@@ -161,7 +161,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261456,
       "kind": "recv",
       "payload": {
         "id": "c-5",
@@ -199,7 +199,7 @@
           "isCompacting": false,
           "steeringMode": "one-at-a-time",
           "followUpMode": "one-at-a-time",
-          "sessionId": "pi-zig-1779961611335447000",
+          "sessionId": "pi-zig-1779963261298631000",
           "sessionFile": "/Users/keer/projects/pi-zig/zig-out/packaged-smoke-session.jsonl",
           "autoCompactionEnabled": false,
           "autoCompactionReserveTokens": 16384,
@@ -217,7 +217,7 @@
       }
     },
     {
-      "t": 1779961611497,
+      "t": 1779963261456,
       "kind": "send",
       "payload": {
         "type": "get_commands",
@@ -225,7 +225,7 @@
       }
     },
     {
-      "t": 1779961611672,
+      "t": 1779963261614,
       "kind": "recv",
       "payload": {
         "id": "c-6",
@@ -983,7 +983,7 @@
       }
     },
     {
-      "t": 1779961611672,
+      "t": 1779963261614,
       "kind": "send",
       "payload": {
         "type": "prompt",
@@ -992,7 +992,7 @@
       }
     },
     {
-      "t": 1779961611679,
+      "t": 1779963261620,
       "kind": "recv",
       "payload": {
         "id": "c-7",
@@ -1034,7 +1034,7 @@
       }
     },
     {
-      "t": 1779961611679,
+      "t": 1779963261620,
       "kind": "send",
       "payload": {
         "type": "prompt",
@@ -1043,7 +1043,7 @@
       }
     },
     {
-      "t": 1779961611688,
+      "t": 1779963261628,
       "kind": "recv",
       "payload": {
         "id": "c-8",
@@ -1094,7 +1094,7 @@
       }
     },
     {
-      "t": 1779961611688,
+      "t": 1779963261628,
       "kind": "send",
       "payload": {
         "type": "get_messages",
@@ -1102,7 +1102,7 @@
       }
     },
     {
-      "t": 1779961611688,
+      "t": 1779963261628,
       "kind": "recv",
       "payload": {
         "id": "c-9",
@@ -1151,7 +1151,7 @@
       }
     },
     {
-      "t": 1779961611688,
+      "t": 1779963261628,
       "kind": "send",
       "payload": {
         "type": "prompt",
@@ -1160,7 +1160,7 @@
       }
     },
     {
-      "t": 1779961611690,
+      "t": 1779963261629,
       "kind": "recv",
       "payload": {
         "type": "agent_end",
@@ -1168,7 +1168,7 @@
       }
     },
     {
-      "t": 1779961611690,
+      "t": 1779963261629,
       "kind": "recv",
       "payload": {
         "type": "auto_retry_start",
@@ -1179,7 +1179,7 @@
       }
     },
     {
-      "t": 1779961611691,
+      "t": 1779963261630,
       "kind": "recv",
       "payload": {
         "type": "auto_retry_end",
@@ -1188,7 +1188,7 @@
       }
     },
     {
-      "t": 1779961611691,
+      "t": 1779963261630,
       "kind": "recv",
       "payload": {
         "type": "agent_end",
@@ -1196,7 +1196,7 @@
       }
     },
     {
-      "t": 1779961611691,
+      "t": 1779963261630,
       "kind": "recv",
       "payload": {
         "id": "c-10",
@@ -1238,7 +1238,7 @@
       }
     },
     {
-      "t": 1779961611691,
+      "t": 1779963261631,
       "kind": "send",
       "payload": {
         "type": "bash",
@@ -1248,7 +1248,7 @@
       }
     },
     {
-      "t": 1779961611691,
+      "t": 1779963261631,
       "kind": "send",
       "payload": {
         "type": "get_state",
@@ -1256,7 +1256,7 @@
       }
     },
     {
-      "t": 1779961611691,
+      "t": 1779963261631,
       "kind": "recv",
       "payload": {
         "id": "c-12",
@@ -1294,7 +1294,7 @@
           "isCompacting": false,
           "steeringMode": "one-at-a-time",
           "followUpMode": "one-at-a-time",
-          "sessionId": "pi-zig-1779961611335447000",
+          "sessionId": "pi-zig-1779963261298631000",
           "sessionFile": "/Users/keer/projects/pi-zig/zig-out/packaged-smoke-session.jsonl",
           "autoCompactionEnabled": false,
           "autoCompactionReserveTokens": 16384,
@@ -1312,7 +1312,7 @@
       }
     },
     {
-      "t": 1779961611691,
+      "t": 1779963261631,
       "kind": "send",
       "payload": {
         "type": "abort_bash",
@@ -1320,7 +1320,7 @@
       }
     },
     {
-      "t": 1779961611691,
+      "t": 1779963261631,
       "kind": "recv",
       "payload": {
         "id": "c-13",
@@ -1330,7 +1330,7 @@
       }
     },
     {
-      "t": 1779961611693,
+      "t": 1779963261632,
       "kind": "recv",
       "payload": {
         "id": "c-11",
@@ -1346,7 +1346,7 @@
       }
     },
     {
-      "t": 1779961611699,
+      "t": 1779963261637,
       "kind": "send",
       "payload": {
         "type": "set_model",
@@ -1356,7 +1356,7 @@
       }
     },
     {
-      "t": 1779961611868,
+      "t": 1779963261788,
       "kind": "recv",
       "payload": {
         "id": "c-1",
@@ -1389,7 +1389,7 @@
       }
     },
     {
-      "t": 1779961611868,
+      "t": 1779963261788,
       "kind": "send",
       "payload": {
         "type": "set_auto_retry",
@@ -1401,7 +1401,7 @@
       }
     },
     {
-      "t": 1779961611868,
+      "t": 1779963261788,
       "kind": "recv",
       "payload": {
         "id": "c-2",
@@ -1411,7 +1411,7 @@
       }
     },
     {
-      "t": 1779961611868,
+      "t": 1779963261788,
       "kind": "send",
       "payload": {
         "type": "prompt",
@@ -1420,7 +1420,7 @@
       }
     },
     {
-      "t": 1779961611871,
+      "t": 1779963261791,
       "kind": "recv",
       "payload": {
         "type": "agent_end",
@@ -1428,7 +1428,7 @@
       }
     },
     {
-      "t": 1779961611871,
+      "t": 1779963261791,
       "kind": "recv",
       "payload": {
         "type": "auto_retry_start",
@@ -1439,7 +1439,7 @@
       }
     },
     {
-      "t": 1779961611969,
+      "t": 1779963261889,
       "kind": "send",
       "payload": {
         "type": "abort",
@@ -1447,7 +1447,7 @@
       }
     },
     {
-      "t": 1779961611969,
+      "t": 1779963261889,
       "kind": "recv",
       "payload": {
         "id": "c-4",
@@ -1457,7 +1457,7 @@
       }
     },
     {
-      "t": 1779961611984,
+      "t": 1779963261904,
       "kind": "recv",
       "payload": {
         "type": "auto_retry_end",
@@ -1467,7 +1467,7 @@
       }
     },
     {
-      "t": 1779961611984,
+      "t": 1779963261904,
       "kind": "recv",
       "payload": {
         "id": "c-3",
@@ -1478,7 +1478,7 @@
       }
     },
     {
-      "t": 1779961611984,
+      "t": 1779963261904,
       "kind": "abort-prompt-result",
       "payload": {
         "id": "c-3",
@@ -1489,7 +1489,7 @@
       }
     },
     {
-      "t": 1779961611984,
+      "t": 1779963261904,
       "kind": "send",
       "payload": {
         "type": "get_state",
@@ -1497,7 +1497,7 @@
       }
     },
     {
-      "t": 1779961611985,
+      "t": 1779963261904,
       "kind": "recv",
       "payload": {
         "id": "c-5",
@@ -1535,7 +1535,7 @@
           "isCompacting": false,
           "steeringMode": "all",
           "followUpMode": "one-at-a-time",
-          "sessionId": "pi-zig-1779961611706124000",
+          "sessionId": "pi-zig-1779963261643463000",
           "sessionFile": "/Users/keer/projects/pi-zig/zig-out/packaged-smoke-abort-session.jsonl",
           "autoCompactionEnabled": false,
           "autoCompactionReserveTokens": 16384,

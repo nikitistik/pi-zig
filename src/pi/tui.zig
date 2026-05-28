@@ -25,6 +25,23 @@ const terminal = @import("tui_terminal.zig");
 const config = @import("config.zig");
 // Read-only use: the model selector cycles/sets models via models.zig (no edits to models.zig).
 const models = @import("models.zig");
+// [FLOW_TUI_MARKDOWN] Terminal markdown renderer ported from upstream
+// `packages/tui/src/components/markdown.ts`. The transcript pass in
+// `buildScreen` routes each row through `tui_markdown.renderInlineLine` so
+// **bold**/*italic*/`code`/[link](url) inline runs get claude-code-style
+// ANSI styling, and `dumpMarkdownIfRequested` (gated by
+// `PI_ZIG_TUI_MARKDOWN_DUMP`) lets the wave4 smoke verify the full block
+// renderer (headers, fenced code, lists) without needing a PTY.
+const tui_markdown = @import("tui_markdown.zig");
+// [FLOW_TUI_MESSAGES] Boxed/labeled message renderers (user/assistant chips,
+// tool-execution panels, bash blocks, compaction/branch/custom/skill chrome).
+// We route executePrompt transcript writes through these so the live scrollback
+// matches upstream's component output instead of plain decorated lines
+// (`> hi`, `assistant: ...`).
+const tui_messages = @import("tui_messages.zig");
+const types = @import("types.zig");
+// [FLOW_TUI_FOOTER] Multi-row interactive footer renderer.
+const tui_footer = @import("tui_footer.zig");
 
 // ANSI styling primitives used by the rich-render layer (status bar, themed
 // banner, inline markdown). Each open MUST be closed on the same line because
@@ -210,6 +227,76 @@ pub const Options = struct {
 
 pub const ExitReason = enum { user_quit, eof, not_a_tty };
 
+// [FLOW_TUI_MARKDOWN] Helpers for the env-var-gated markdown dump in
+// `App.dumpMarkdownIfRequested`. Kept file-private (and intentionally narrow
+// in scope) so the integration stays additive — the session-format knowledge
+// here matches the subset the smoke writes (and that `session.appendMessage`
+// actually serializes).
+
+fn stripTrailingCarriageMd(line: []const u8) []const u8 {
+    if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+    return line;
+}
+
+/// Shallow-parse a single JSONL line and return the message text body when it
+/// represents a user/assistant message, otherwise null. Accepts both the
+/// simple `content: "..."` shape used by `session.appendMessage` and the
+/// `[{type:"text", text:"..."}]` array shape used when the message also
+/// carries image parts. Caller frees the returned slice.
+fn extractMessageText(allocator: std.mem.Allocator, line: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+
+    const entry_type = blk: {
+        const t = object.get("type") orelse return null;
+        switch (t) {
+            .string => |s| break :blk s,
+            else => return null,
+        }
+    };
+    if (!std.mem.eql(u8, entry_type, "message")) return null;
+
+    const message = object.get("message") orelse return null;
+    if (message != .object) return null;
+
+    const role = blk: {
+        const r = message.object.get("role") orelse return null;
+        switch (r) {
+            .string => |s| break :blk s,
+            else => return null,
+        }
+    };
+    if (!std.mem.eql(u8, role, "user") and !std.mem.eql(u8, role, "assistant")) return null;
+
+    const content = message.object.get("content") orelse return null;
+    switch (content) {
+        .string => |s| return try allocator.dupe(u8, s),
+        .array => |arr| {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            for (arr.items) |part| {
+                if (part != .object) continue;
+                const part_type = part.object.get("type") orelse continue;
+                if (part_type != .string or !std.mem.eql(u8, part_type.string, "text")) continue;
+                const text = part.object.get("text") orelse continue;
+                if (text != .string) continue;
+                if (out.items.len > 0) try out.append(allocator, '\n');
+                try out.appendSlice(allocator, text.string);
+            }
+            if (out.items.len == 0) {
+                out.deinit(allocator);
+                return null;
+            }
+            return try out.toOwnedSlice(allocator);
+        },
+        else => return null,
+    }
+}
+
 /// The interactive controller. Owns the editor, renderer, and transcript.
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -357,6 +444,93 @@ pub const App = struct {
         }
     }
 
+    /// [FLOW_TUI_MESSAGES] Seam between message renderers and scrollback.
+    pub fn appendRendered(self: *App, rendered: *tui_messages.RenderedLines) !void {
+        defer rendered.deinit();
+        for (rendered.lines) |line| {
+            try self.transcript.append(self.allocator, try self.allocator.dupe(u8, line));
+        }
+    }
+
+    /// [FLOW_TUI_MESSAGES] Render a user message block (USER chip + body).
+    pub fn appendUserMessageBlock(self: *App, text: []const u8) !void {
+        var rendered = try tui_messages.renderUserMessage(self.allocator, .{ .text = text });
+        try self.appendRendered(&rendered);
+    }
+
+    /// [FLOW_TUI_MESSAGES] Render an assistant message block (ASSISTANT chip + body).
+    pub fn appendAssistantMessageBlock(self: *App, text: []const u8) !void {
+        var rendered = try tui_messages.renderAssistantMessage(self.allocator, .{ .text = text });
+        try self.appendRendered(&rendered);
+    }
+
+    /// [FLOW_TUI_MESSAGES] Render a tool-execution panel ([tool: name] chip + args + result).
+    pub fn appendToolExecutionBlock(
+        self: *App,
+        tool_name: []const u8,
+        arguments_json: []const u8,
+        result_text: ?[]const u8,
+        is_error: bool,
+    ) !void {
+        var rendered = try tui_messages.renderToolExecution(self.allocator, .{
+            .tool_name = tool_name,
+            .arguments_json = arguments_json,
+            .result_text = result_text,
+            .is_error = is_error,
+        });
+        try self.appendRendered(&rendered);
+    }
+
+    /// [FLOW_TUI_MESSAGES] Render a bash-execution panel.
+    pub fn appendBashExecutionBlock(
+        self: *App,
+        command: []const u8,
+        output: []const u8,
+        exit_code: ?i32,
+        cancelled: bool,
+    ) !void {
+        var rendered = try tui_messages.renderBashExecution(self.allocator, .{
+            .command = command,
+            .output = output,
+            .exit_code = exit_code,
+            .cancelled = cancelled,
+        });
+        try self.appendRendered(&rendered);
+    }
+
+    /// [FLOW_TUI_MESSAGES] Render a compaction-summary block.
+    pub fn appendCompactionSummaryBlock(self: *App, tokens_before: u64, summary: []const u8) !void {
+        var rendered = try tui_messages.renderCompactionSummary(self.allocator, .{
+            .tokens_before = tokens_before,
+            .summary = summary,
+        });
+        try self.appendRendered(&rendered);
+    }
+
+    /// [FLOW_TUI_MESSAGES] Render a branch-summary block.
+    pub fn appendBranchSummaryBlock(self: *App, summary: []const u8) !void {
+        var rendered = try tui_messages.renderBranchSummary(self.allocator, .{ .summary = summary });
+        try self.appendRendered(&rendered);
+    }
+
+    /// [FLOW_TUI_MESSAGES] Render a custom-message block.
+    pub fn appendCustomMessageBlock(self: *App, custom_type: []const u8, content: []const u8) !void {
+        var rendered = try tui_messages.renderCustomMessage(self.allocator, .{
+            .custom_type = custom_type,
+            .content = content,
+        });
+        try self.appendRendered(&rendered);
+    }
+
+    /// [FLOW_TUI_MESSAGES] Render a skill invocation block.
+    pub fn appendSkillInvocationBlock(self: *App, name: []const u8, args: []const u8) !void {
+        var rendered = try tui_messages.renderSkillInvocation(self.allocator, .{
+            .name = name,
+            .args = args,
+        });
+        try self.appendRendered(&rendered);
+    }
+
     /// Build the full screen as logical lines: transcript, optional streaming
     /// block, a separator, status, then the prompt composer with a cursor caret.
     /// Caller frees each line and the list.
@@ -367,13 +541,22 @@ pub const App = struct {
             lines.deinit(self.allocator);
         }
 
+        // [FLOW_TUI_MARKDOWN] Route every transcript row through the markdown
+        // inline renderer so **bold**, *italic*, `code`, and [link](url) get
+        // styled inside the scrollback. Transcript rows were already flattened
+        // by `appendTranscript` (one logical line per item), so we use the
+        // inline-only entry point; block constructs that need multi-line
+        // context (fenced code, lists) flow through the env-var-gated full
+        // render in `dumpMarkdownIfRequested`. `renderInlineLine` returns the
+        // input verbatim when no markdown markers are present so non-markdown
+        // rows still allocate exactly one dupe — preserving the previous shape.
         for (self.transcript.items) |line| {
-            try lines.append(self.allocator, try self.allocator.dupe(u8, line));
+            try lines.append(self.allocator, try tui_markdown.renderInlineLine(self.allocator, line));
         }
         if (self.streaming.items.len > 0) {
             var it = std.mem.splitScalar(u8, self.streaming.items, '\n');
             while (it.next()) |part| {
-                try lines.append(self.allocator, try self.allocator.dupe(u8, part));
+                try lines.append(self.allocator, try tui_markdown.renderInlineLine(self.allocator, part));
             }
         }
 
@@ -431,75 +614,18 @@ pub const App = struct {
     /// All ANSI styling is opened+closed on the same line so the differential
     /// renderer's line-level diff stays correct.
     fn renderStatusBar(self: *App, lines: *std.ArrayList([]u8)) !void {
-        // Divider: a dim horizontal rule, length-capped so we don't paint past
-        // typical terminal widths. The renderer wraps if needed.
-        const divider_segment = "\xe2\x94\x80"; // U+2500 BOX DRAWINGS LIGHT HORIZONTAL (UTF-8: e2 94 80)
-        var divider: std.ArrayList(u8) = .empty;
-        defer divider.deinit(self.allocator);
-        try divider.appendSlice(self.allocator, sgr.muted);
-        var i: usize = 0;
-        while (i < 80) : (i += 1) try divider.appendSlice(self.allocator, divider_segment);
-        try divider.appendSlice(self.allocator, sgr.reset);
-        try lines.append(self.allocator, try divider.toOwnedSlice(self.allocator));
-
-        // Resolve the branch label once (best-effort; staying null on failure).
-        if (!self.git_branch_resolved) self.resolveGitBranch();
-
-        // Compose the status row.
-        var row: std.ArrayList(u8) = .empty;
-        defer row.deinit(self.allocator);
-
-        if (self.git_branch_len > 0) {
-            try row.appendSlice(self.allocator, sgr.branch);
-            try row.appendSlice(self.allocator, " "); // small left pad
-            try row.appendSlice(self.allocator, self.git_branch_buf[0..self.git_branch_len]);
-            try row.appendSlice(self.allocator, sgr.reset);
-            try row.appendSlice(self.allocator, "   ");
-        }
-
-        // Provider | Model · thinking
-        const provider = self.options.provider orelse "(no provider)";
-        const model_name = if (self.selected_model) |m| m.id else (self.options.model orelse "(no model)");
-        try row.appendSlice(self.allocator, sgr.accent);
-        try row.appendSlice(self.allocator, provider);
-        try row.appendSlice(self.allocator, sgr.reset);
-        try row.appendSlice(self.allocator, sgr.muted);
-        try row.appendSlice(self.allocator, " | ");
-        try row.appendSlice(self.allocator, sgr.reset);
-        try row.appendSlice(self.allocator, sgr.accent);
-        try row.appendSlice(self.allocator, model_name);
-        try row.appendSlice(self.allocator, sgr.reset);
-
-        // Session-elapsed timer (`session 0m 12s`). When the wall clock isn't
-        // available (test path, options.interactive=false) we already skipped
-        // this whole call.
-        if (self.session_start_ns != 0) {
-            const now_ns = std.Io.Clock.real.now(self.io).nanoseconds;
-            const elapsed_ns: i128 = now_ns - self.session_start_ns;
-            const elapsed_s: u64 = if (elapsed_ns > 0) @intCast(@divTrunc(elapsed_ns, std.time.ns_per_s)) else 0;
-            const hours = elapsed_s / 3600;
-            const minutes = (elapsed_s % 3600) / 60;
-            const seconds = elapsed_s % 60;
-            try row.appendSlice(self.allocator, sgr.muted);
-            try row.appendSlice(self.allocator, "   session ");
-            const timer_text = if (hours > 0)
-                try std.fmt.allocPrint(self.allocator, "{d}h{d:0>2}m{d:0>2}s", .{ hours, minutes, seconds })
-            else if (minutes > 0)
-                try std.fmt.allocPrint(self.allocator, "{d}m{d:0>2}s", .{ minutes, seconds })
-            else
-                try std.fmt.allocPrint(self.allocator, "{d}s", .{seconds});
-            defer self.allocator.free(timer_text);
-            try row.appendSlice(self.allocator, timer_text);
-            try row.appendSlice(self.allocator, sgr.reset);
-        }
-
-        try lines.append(self.allocator, try row.toOwnedSlice(self.allocator));
+        // [FLOW_TUI_FOOTER] Delegate to the multi-row footer renderer in
+        // `src/pi/tui_footer.zig`. The footer module owns the banner +
+        // divider + composer-spacer + status-row + hint-row layout, the
+        // timer formatting, and the partial-block progress-bar math under
+        // dedicated unit tests.
+        try tui_footer.render(self, lines);
     }
 
     /// Best-effort one-shot resolution of the current git branch via
     /// `git symbolic-ref --short HEAD`. Failures (no git, no repo) leave the
     /// branch label empty so the status bar simply omits the branch slot.
-    fn resolveGitBranch(self: *App) void {
+    pub fn resolveGitBranch(self: *App) void {
         self.git_branch_resolved = true;
         const argv = [_][]const u8{ "git", "symbolic-ref", "--short", "HEAD" };
         const result = std.process.run(self.allocator, self.io, .{
@@ -929,13 +1055,10 @@ pub const App = struct {
 
     fn toolResultCb(ctx: *anyopaque, tool_name: []const u8, content: []const u8, is_error: bool) anyerror!void {
         const sc: *StreamCtx = @ptrCast(@alignCast(ctx));
-        const label = if (is_error) "tool error" else "tool";
-        const header = try std.fmt.allocPrint(sc.app.allocator, "[{s}: {s}]", .{ label, tool_name });
-        defer sc.app.allocator.free(header);
-        try sc.app.appendTranscript(header);
-        // Show a short preview of the tool output.
-        const preview_len = @min(content.len, 400);
-        try sc.app.appendTranscript(content[0..preview_len]);
+        // [FLOW_TUI_MESSAGES] Render through the boxed tool-execution panel
+        // so the chip + result preview are styled. The `[tool: <name>]`
+        // text remains a substring of the rendered chrome.
+        try sc.app.appendToolExecutionBlock(tool_name, "", content, is_error);
         // Record the full tool result in the in-memory conversation so a later `/compact`
         // can summarize it (mirrors the RPC runtime threading tool results into compaction).
         try sc.app.appendMessage(.tool, content);
@@ -1020,11 +1143,11 @@ pub const App = struct {
             return;
         };
 
-        // Echo the user message into the transcript and record it in the in-memory
-        // conversation so `/compact` can summarize the real turns.
-        const user_line = try std.fmt.allocPrint(self.allocator, "> {s}", .{prompt});
-        defer self.allocator.free(user_line);
-        try self.appendTranscript(user_line);
+        // [FLOW_TUI_MESSAGES] Echo through the boxed user-message renderer
+        // (USER chip + body). The prompt text remains a substring of the
+        // rendered chrome. The in-memory conversation records the raw prompt
+        // unchanged so /compact serialization stays byte-stable.
+        try self.appendUserMessageBlock(prompt);
         try self.appendMessage(.user, prompt);
 
         self.running = true;
@@ -1051,12 +1174,13 @@ pub const App = struct {
         defer self.allocator.free(result);
 
         self.running = false;
-        // Commit the final assistant text into the transcript and the in-memory conversation.
+        // [FLOW_TUI_MESSAGES] Commit through the boxed assistant-message
+        // renderer (ASSISTANT chip + body).
         self.streaming.clearRetainingCapacity();
-        const assistant_line = try std.fmt.allocPrint(self.allocator, "assistant: {s}", .{result});
-        defer self.allocator.free(assistant_line);
-        try self.appendTranscript(assistant_line);
-        if (result.len > 0) try self.appendMessage(.assistant, result);
+        if (result.len > 0) {
+            try self.appendAssistantMessageBlock(result);
+            try self.appendMessage(.assistant, result);
+        }
         if (self.abort_requested) {
             try self.setStatus("Aborted.");
         } else {
@@ -1067,10 +1191,69 @@ pub const App = struct {
 
     // -- Main loop ------------------------------------------------------
 
+    /// [FLOW_TUI_MARKDOWN] If `PI_ZIG_TUI_MARKDOWN_DUMP=<path>` is set in the
+    /// process environment, treat `<path>` as a session JSONL file, extract
+    /// the user+assistant message text bodies, render each through the full
+    /// markdown block renderer in `tui_markdown.render`, and write the
+    /// ANSI-styled lines to stdout. Returns true so the caller exits the run
+    /// loop cleanly; returns false (a no-op) when the env var is unset.
+    /// `std.c.getenv` is used directly because the App does not currently
+    /// receive an `Environ.Map` through its `Options` and threading one in
+    /// would push changes outside this wave's allowed scope. Read/parse
+    /// errors are absorbed (we still return true so the run loop exits
+    /// cleanly) — the smoke verifies success via the rendered stdout.
+    fn dumpMarkdownIfRequested(self: *App, stdout: std.Io.File) !bool {
+        const env_key: [*:0]const u8 = "PI_ZIG_TUI_MARKDOWN_DUMP";
+        const raw_ptr = std.c.getenv(env_key) orelse return false;
+        const path = std.mem.span(raw_ptr);
+        if (path.len == 0) return false;
+
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.allocator,
+            .limited(16 * 1024 * 1024),
+        ) catch return true;
+        defer self.allocator.free(bytes);
+
+        var out_buf: [16 * 1024]u8 = undefined;
+        var stdout_writer = stdout.writer(self.io, &out_buf);
+        const w = &stdout_writer.interface;
+        defer w.flush() catch {};
+
+        var line_it = std.mem.splitScalar(u8, bytes, '\n');
+        while (line_it.next()) |raw_line| {
+            const line = stripTrailingCarriageMd(raw_line);
+            if (std.mem.trim(u8, line, " \t").len == 0) continue;
+
+            const text = extractMessageText(self.allocator, line) catch continue;
+            if (text) |owned| {
+                defer self.allocator.free(owned);
+                const lines = try tui_markdown.render(self.allocator, owned, .{ .width = 80 });
+                defer tui_markdown.freeLines(self.allocator, lines);
+                for (lines) |rendered_line| {
+                    try w.writeAll(rendered_line);
+                    try w.writeAll("\n");
+                }
+                // Trailing newline separator between turns so adjacent
+                // user/assistant messages stay visually distinct.
+                try w.writeAll("\n");
+            }
+        }
+        return true;
+    }
+
     /// Run the interactive loop. Requires a TTY; otherwise returns `.not_a_tty`.
     pub fn run(self: *App) !ExitReason {
         const stdin = std.Io.File.stdin();
         const stdout = std.Io.File.stdout();
+
+        // [FLOW_TUI_MARKDOWN] Non-TTY markdown render dump checked BEFORE the
+        // TTY gate so the wave4 smoke can capture rendered ANSI through a
+        // plain pipe. No-op when the env var is unset.
+        if (try self.dumpMarkdownIfRequested(stdout)) {
+            return .eof;
+        }
 
         const is_tty = stdin.isTty(self.io) catch false;
         if (!self.options.interactive or !is_tty) {
@@ -1616,18 +1799,28 @@ test "executePrompt streams text and commits assistant transcript via fake runne
     try app.executePrompt(w, "hello");
     try std.testing.expect(!app.running);
 
-    // Transcript should contain the user echo, the tool panel, and the assistant reply.
-    var saw_user = false;
+    // [FLOW_TUI_MESSAGES] Transcript now contains the boxed user/tool/
+    // assistant panels. We assert both the role chip token and the message
+    // body text. The bare `> hello`/`assistant: ...` decorated lines are
+    // replaced by multi-line chrome (appendUserMessageBlock /
+    // appendAssistantMessageBlock / appendToolExecutionBlock).
+    var saw_user_chip = false;
+    var saw_user_body = false;
     var saw_tool = false;
-    var saw_assistant = false;
+    var saw_assistant_chip = false;
+    var saw_assistant_body = false;
     for (app.transcript.items) |line| {
-        if (std.mem.indexOf(u8, line, "> hello") != null) saw_user = true;
+        if (std.mem.indexOf(u8, line, "USER") != null) saw_user_chip = true;
+        if (std.mem.indexOf(u8, line, "hello") != null) saw_user_body = true;
         if (std.mem.indexOf(u8, line, "[tool: bash]") != null) saw_tool = true;
-        if (std.mem.indexOf(u8, line, "assistant: final answer") != null) saw_assistant = true;
+        if (std.mem.indexOf(u8, line, "ASSISTANT") != null) saw_assistant_chip = true;
+        if (std.mem.indexOf(u8, line, "final answer") != null) saw_assistant_body = true;
     }
-    try std.testing.expect(saw_user);
+    try std.testing.expect(saw_user_chip);
+    try std.testing.expect(saw_user_body);
     try std.testing.expect(saw_tool);
-    try std.testing.expect(saw_assistant);
+    try std.testing.expect(saw_assistant_chip);
+    try std.testing.expect(saw_assistant_body);
 }
 
 test "executePrompt without a runner sets an informative status" {
@@ -1696,11 +1889,17 @@ test "executePrompt abort path: user echo persists in transcript after abort" {
 
     try std.testing.expect(!app.running);
     try std.testing.expect(app.streaming.items.len == 0);
-    var saw_user = false;
+    // [FLOW_TUI_MESSAGES] After the abort, the user echo persists in the
+    // transcript as the new boxed USER block — we assert the chip token
+    // and the prompt body text appear.
+    var saw_user_chip = false;
+    var saw_user_body = false;
     for (app.transcript.items) |line| {
-        if (std.mem.indexOf(u8, line, "> mid-stream abort") != null) saw_user = true;
+        if (std.mem.indexOf(u8, line, "USER") != null) saw_user_chip = true;
+        if (std.mem.indexOf(u8, line, "mid-stream abort") != null) saw_user_body = true;
     }
-    try std.testing.expect(saw_user);
+    try std.testing.expect(saw_user_chip);
+    try std.testing.expect(saw_user_body);
 }
 
 // Fake session callbacks used to verify /compact, /export, /name, /fork, /clone wiring.

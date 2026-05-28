@@ -20,10 +20,14 @@ pub const themes = @import("themes.zig");
 pub const tools = @import("tools.zig");
 pub const tui = @import("tui.zig");
 pub const tui_editor = @import("tui_editor.zig");
+pub const tui_footer = @import("tui_footer.zig");
 pub const tui_fuzzy = @import("tui_fuzzy.zig");
 pub const tui_keys = @import("tui_keys.zig");
+pub const tui_messages = @import("tui_messages.zig");
 pub const tui_render = @import("tui_render.zig");
+pub const tui_selector = @import("tui_selector.zig");
 pub const tui_terminal = @import("tui_terminal.zig");
+pub const tui_theme = @import("tui_theme.zig");
 pub const types = @import("types.zig");
 pub const upstream = @import("upstream.zig");
 
@@ -50,10 +54,14 @@ test {
     _ = tools;
     _ = tui;
     _ = tui_editor;
+    _ = tui_footer;
     _ = tui_fuzzy;
     _ = tui_keys;
+    _ = tui_messages;
     _ = tui_render;
+    _ = tui_selector;
     _ = tui_terminal;
+    _ = tui_theme;
     _ = types;
     _ = upstream;
 }

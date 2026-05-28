@@ -1051,6 +1051,15 @@ fn builtinBytes(name: []const u8) ?[]const u8 {
     return null;
 }
 
+// [FLOW_TUI_THEME] Public accessor for built-in theme JSON bytes. Used by
+// `tui_theme.zig` to derive ANSI palette escapes from the active theme at TUI
+// startup without re-embedding the JSON. Returns null when `name` is not a
+// built-in (the TUI palette then falls back to the static `tui.sgr.*`
+// constants), so callers don't need to allocate or read the filesystem.
+pub fn builtinThemeBytes(name: []const u8) ?[]const u8 {
+    return builtinBytes(name);
+}
+
 fn agentDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
     if (env.get("PI_CODING_AGENT_DIR")) |value| {
         return expandMaybeTilde(allocator, env, value);
