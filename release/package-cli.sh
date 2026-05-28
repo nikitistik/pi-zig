@@ -26,11 +26,19 @@ RELEASE_DIR="${RELEASE_CLI_DIR:-${REPO_ROOT}/zig-out/release-cli}"
 
 log() { printf '[release-cli] %s\n' "$*"; }
 
-# --- 1. Build the binary if it isn't already present. -----------------------
-if [ ! -x "${REPO_ROOT}/zig-out/bin/pi-zig" ]; then
-  log "binary missing — running zig build"
-  (cd "${REPO_ROOT}" && zig build) || { echo "zig build failed" >&2; exit 1; }
-fi
+# --- 1. Build the binary with the same optimize mode as release/package.sh
+#       (ReleaseSafe by default) so BOTH distributable bundles ship the same
+#       artifact. Override via --optimize <mode>.
+OPTIMIZE="ReleaseSafe"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --optimize) OPTIMIZE="${2:?--optimize needs a value}"; shift 2 ;;
+    -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+log "building backend (-Doptimize=${OPTIMIZE})"
+(cd "${REPO_ROOT}" && zig build -Doptimize="${OPTIMIZE}") || { echo "zig build failed" >&2; exit 1; }
 
 # --- 2. Stage the CLI release dir. ------------------------------------------
 log "staging standalone CLI release into ${RELEASE_DIR}"
