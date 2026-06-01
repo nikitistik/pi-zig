@@ -99,14 +99,3 @@ npm run test
 npm run build
 ```
 
-## Prin7r Integration Target
-
-After standalone parity is real, inject this project into:
-
-```text
-/Users/keer/projects/prin7r-openwork-zero_native
-```
-
-Integration must include backend wiring, Preact app wiring, navigation/app
-registry exposure, full frontend/backend builds, the packaged macOS app rebuild,
-launch verification, and screenshots.
