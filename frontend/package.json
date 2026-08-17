@@ -12,10 +12,10 @@
     "fake-provider": "node fake-provider.mjs"
   },
   "dependencies": {
-    "@preact/preset-vite": "2.10.2",
+    "@preact/preset-vite": "2.10.6",
     "preact": "10.29.2",
     "typescript": "6.0.3",
-    "vite": "6.4.2"
+    "vite": "8.2.1"
   },
   "devDependencies": {
     "ws": "8.18.0"
