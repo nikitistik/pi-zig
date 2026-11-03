@@ -15,7 +15,7 @@
     "@preact/preset-vite": "2.10.2",
     "preact": "10.29.2",
     "typescript": "6.0.3",
-    "vite": "6.4.2"
+    "vite": "6.4.5"
   },
   "devDependencies": {
     "ws": "8.18.0"
